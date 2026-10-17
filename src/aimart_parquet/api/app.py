@@ -33,13 +33,25 @@ from aimart_parquet.api.middleware import (
     BodyLimitMiddleware,
     RateLimitMiddleware,
 )
-from aimart_parquet.api.schemas import ConvertBody, PreviewBody, QueryBody, SourceBody
+from aimart_parquet.api.schemas import (
+    ConvertBody,
+    PortfolioBody,
+    PreviewBody,
+    QuantumCompressBody,
+    QueryBody,
+    SourceBody,
+    VerifyBody,
+)
 from aimart_parquet.artifacts import ArtifactStore, build_store
 from aimart_parquet.config import Settings, get_settings
 from aimart_parquet.engine.models import ConvertOptions, ConvertResult, InspectResult, TabularResult
 from aimart_parquet.errors import AimartError, ArtifactNotFound, InputTooLarge, InvalidRequest
 from aimart_parquet.logs import configure as configure_logging
 from aimart_parquet.mcp.server import build_mcp
+from aimart_parquet.payments.pricing import BY_KEY
+from aimart_parquet.provenance import Signer
+from aimart_parquet.quantum import available as quantum_available
+from aimart_parquet.quantum.models import PortfolioResult, QuantumCompressResult
 from aimart_parquet.service import Service, SourceRef
 
 if TYPE_CHECKING:
@@ -69,11 +81,29 @@ def create_app(
     settings = settings or get_settings()
     configure_logging(settings.log_level, json_logs=settings.log_json)
     store = build_store(settings)
-    service = Service(settings, store, local_mode=False)
+    signer = Signer.from_b64(
+        settings.signing_key_mldsa.get_secret_value() if settings.signing_key_mldsa else None
+    )
+    service = Service(settings, store, local_mode=False, signer=signer)
+
+    def paid(key: str) -> dict[str, Any]:
+        """OpenAPI x-payment-info: how x402scan and agents learn the price from the schema."""
+        price = BY_KEY[key].price(settings).removeprefix("$")
+        return {
+            "x-payment-info": {
+                "price": {"mode": "fixed", "currency": "USD", "amount": price},
+                "protocols": [{"x402": {"version": 2}}],
+            },
+            "responses": {
+                "402": {"description": "Payment Required: see the PAYMENT-REQUIRED header."}
+            },
+        }
+
+    free: dict[str, Any] = {"security": []}
 
     pay: Payments | None = None
     if payments is None and settings.payments_enabled:
-        from aimart_parquet.payments import Payments as _Payments
+        from aimart_parquet.payments import Payments as _Payments  # noqa: PLC0415 - x402 is heavy; skip when unpaid
 
         pay = _Payments.from_settings(settings)
     elif payments:
@@ -168,9 +198,26 @@ def create_app(
         return discovery.mcp_server_card(settings)
 
     @app.get(
+        "/.well-known/aimart-signing-key",
+        summary="Post-quantum (ML-DSA-65) public key for artifact provenance (free)",
+        openapi_extra=free,
+    )
+    async def signing_key() -> dict[str, Any]:
+        return signer.public_document(settings.public_base_url)
+
+    @app.post(
+        "/v1/verify", summary="Verify an artifact's provenance signature (free)", openapi_extra=free
+    )
+    async def verify(body: VerifyBody) -> dict[str, Any]:
+        return await service.verify_provenance(
+            body.manifest, body.signature, artifact_id=body.artifact_id
+        )
+
+    @app.get(
         "/v1/artifacts/{artifact_id}/{filename}",
         summary="Download a converted Parquet file (free, signed link)",
         response_class=FileResponse,
+        openapi_extra=free,
     )
     async def download(
         artifact_id: str,
@@ -190,6 +237,7 @@ def create_app(
         "/v1/convert",
         summary="Convert a file (URL or base64) to Parquet",
         response_model=ConvertResult,
+        openapi_extra=paid("convert"),
     )
     async def convert(body: ConvertBody) -> ConvertResult:
         return await service.convert(body.source(), body.options)
@@ -198,6 +246,7 @@ def create_app(
         "/v1/convert/upload",
         summary="Convert an uploaded file to Parquet",
         response_model=ConvertResult,
+        openapi_extra=paid("convert_upload"),
     )
     async def convert_upload(
         file: Annotated[UploadFile, File(description="The data file.")],
@@ -227,11 +276,17 @@ def create_app(
         "/v1/inspect",
         summary="Describe a Parquet file without reading rows",
         response_model=InspectResult,
+        openapi_extra=paid("inspect"),
     )
     async def inspect(body: SourceBody) -> InspectResult:
         return await service.inspect(body.source())
 
-    @app.post("/v1/preview", summary="Return a slice of Parquet rows", response_model=TabularResult)
+    @app.post(
+        "/v1/preview",
+        summary="Return a slice of Parquet rows",
+        response_model=TabularResult,
+        openapi_extra=paid("preview"),
+    )
     async def preview(body: PreviewBody) -> TabularResult:
         return await service.preview(
             body.source(),
@@ -245,11 +300,32 @@ def create_app(
         "/v1/query",
         summary="Run one read-only SQL SELECT over a Parquet file",
         response_model=TabularResult,
+        openapi_extra=paid("query"),
     )
     async def query(body: QueryBody) -> TabularResult:
         return await service.query(
             {"data": body.source()}, body.sql, limit=body.limit, fmt=body.format
         )
+
+    if quantum_available():  # keep in step with pricing.active_operations()
+
+        @app.post(
+            "/v1/quantum/compress",
+            summary="Premium: quantum-kernel PCA with a classical PCA baseline (simulated)",
+            response_model=QuantumCompressResult,
+            openapi_extra=paid("quantum_compress"),
+        )
+        async def quantum_compress(body: QuantumCompressBody) -> QuantumCompressResult:
+            return await service.quantum_compress(body.source(), body.options)
+
+        @app.post(
+            "/v1/quantum/portfolio",
+            summary="Premium: QAOA portfolio selection verified by an exact classical solver (simulated)",
+            response_model=PortfolioResult,
+            openapi_extra=paid("quantum_portfolio"),
+        )
+        async def quantum_portfolio(body: PortfolioBody) -> PortfolioResult:
+            return await service.quantum_portfolio(body.source(), body.options)
 
     if pay is not None:
         app.middleware("http")(pay.http_middleware())

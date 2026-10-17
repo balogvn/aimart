@@ -166,6 +166,15 @@ class ConversionReport(BaseModel):
     )
 
 
+class Provenance(BaseModel):
+    algorithm: str = Field(description="ML-DSA-65 (NIST FIPS 204), a post-quantum signature.")
+    manifest: dict[str, Any] = Field(
+        description="Signed facts: sha256, size, operation, time, service version."
+    )
+    signature: str = Field(description="Base64 signature over the canonical JSON of the manifest.")
+    public_key_url: str = Field(description="Where to fetch the verification key.")
+
+
 class ArtifactRef(BaseModel):
     id: str = Field(description="Pass as artifact_id to inspect/preview/query without re-upload.")
     filename: str
@@ -176,11 +185,18 @@ class ArtifactRef(BaseModel):
         default=None, description="Signed HTTPS link to the Parquet file, valid until expiry."
     )
     path: str | None = Field(default=None, description="Local file path (local mode only).")
+    provenance: Provenance | None = Field(
+        default=None,
+        description="Post-quantum signature proving this file came unaltered from this service.",
+    )
 
 
 class ConvertResult(BaseModel):
     artifact: ArtifactRef
     report: ConversionReport
+    hint: str | None = Field(
+        default=None, description="Pointer to premium features (local mode only)."
+    )
 
 
 class ColumnStats(BaseModel):

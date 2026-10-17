@@ -22,6 +22,7 @@ class Operation:
     path: str
     price_setting: str
     summary: str
+    requires: str | None = None  # optional extra the operation needs ("quantum")
 
     def price(self, settings: Settings) -> str:
         return str(getattr(settings, self.price_setting))
@@ -72,11 +73,43 @@ OPERATIONS: tuple[Operation, ...] = (
         "price_query",
         "Run one read-only DuckDB SELECT over a Parquet file (table `data`).",
     ),
+    Operation(
+        "quantum_compress",
+        "quantum_compress_features",
+        "POST",
+        "/v1/quantum/compress",
+        "price_quantum_compress",
+        "Premium: quantum-kernel PCA (PennyLane, simulated) with a classical PCA baseline.",
+        requires="quantum",
+    ),
+    Operation(
+        "quantum_portfolio",
+        "quantum_optimize_portfolio",
+        "POST",
+        "/v1/quantum/portfolio",
+        "price_quantum_portfolio",
+        "Premium: QAOA portfolio selection (PennyLane, simulated) verified by an exact classical solver.",
+        requires="quantum",
+    ),
 )
+
+
+def active_operations() -> tuple[Operation, ...]:
+    """Operations this installation can actually serve — what we advertise and charge for.
+
+    Advertising a premium tool whose extra is not installed would take a verification, fail
+    the call, and teach agents that the listing lies.
+    """
+    from aimart_parquet import quantum  # noqa: PLC0415 - keeps pricing import-light
+
+    has_quantum = quantum.available()
+    return tuple(op for op in OPERATIONS if op.requires != "quantum" or has_quantum)
+
 
 BY_TOOL: dict[str, Operation] = {}
 for _op in OPERATIONS:
     BY_TOOL.setdefault(_op.tool, _op)
+BY_KEY: dict[str, Operation] = {op.key: op for op in OPERATIONS}
 
 
 def usd_to_atomic(price: str, decimals: int = 6) -> int:

@@ -229,11 +229,12 @@ class TypeInferrer:
         style: str | None = None
         if "plain" in full:
             style = "plain"
+        elif full and "eu" in full and "us" in full:
+            style = (
+                "eu" if self.prefer_decimal_comma else "us"
+            )  # '1,234' fits both: dialect decides
         elif full:
-            if "eu" in full and "us" in full:
-                style = "eu" if self.prefer_decimal_comma else "us"
-            else:
-                style = full[0]
+            style = full[0]
         elif tolerant:
             best_style, best_fit = max(candidates, key=lambda c: c[1])
             if best_fit >= MIN_FIT * n:

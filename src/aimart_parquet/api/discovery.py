@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from aimart_parquet import __version__
 from aimart_parquet.engine.detect import SUPPORTED_EXTENSIONS
-from aimart_parquet.payments.pricing import OPERATIONS
+from aimart_parquet.payments.pricing import active_operations
 
 if TYPE_CHECKING:
     from aimart_parquet.config import Settings
@@ -21,6 +21,11 @@ DESCRIPTION = (
     "schema-validated, zstd-compressed Parquet — then inspects, previews and queries it with "
     "DuckDB SQL. Built for AI agents: no signup, pay per call in USDC via x402."
 )
+
+
+def _tools() -> list[str]:
+    """MCP tool names, from the same table that prices them."""
+    return list(dict.fromkeys(op.tool for op in active_operations()))
 
 
 def pricing(settings: Settings, networks: list[dict[str, str]]) -> dict[str, Any]:
@@ -38,7 +43,7 @@ def pricing(settings: Settings, networks: list[dict[str, str]]) -> dict[str, Any
                 "price": op.price(settings),
                 "summary": op.summary,
             }
-            for op in OPERATIONS
+            for op in active_operations()
         ],
         "free": [
             "GET /",
@@ -82,7 +87,7 @@ def llms_txt(settings: Settings) -> str:
         "",
         "## Use it",
         "",
-        f"- [MCP server (Streamable HTTP)]({base}/mcp): tools convert_to_parquet, inspect_parquet, preview_parquet, query_parquet",
+        f"- [MCP server (Streamable HTTP)]({base}/mcp): tools {', '.join(_tools())}",
         f"- [OpenAPI]({base}/openapi.json): REST endpoints under /v1",
         f"- [Pricing]({base}/pricing): per-call prices in USDC",
         f"- [x402 discovery]({base}/.well-known/x402): payable resources",
@@ -90,7 +95,7 @@ def llms_txt(settings: Settings) -> str:
         "## Operations",
         "",
     ]
-    lines += [f"- `{op.route}` ({op.price(settings)}): {op.summary}" for op in OPERATIONS]
+    lines += [f"- `{op.route}` ({op.price(settings)}): {op.summary}" for op in active_operations()]
     lines += [
         "",
         "## Notes",
@@ -124,7 +129,7 @@ def mcp_server_card(settings: Settings) -> dict[str, Any]:
         },
         "tools": [
             {"name": op.tool, "description": op.summary, "price": op.price(settings)}
-            for op in OPERATIONS
+            for op in active_operations()
             if op.key != "convert_upload"
         ],
     }

@@ -108,4 +108,58 @@ EXAMPLES: dict[str, dict[str, Any]] = {
             "truncated": False,
         },
     },
+    "quantum_compress": {
+        "input": {
+            "artifact_id": "Zx3k9Qm2Lr8Tf1Hc5Vb7Nd",
+            "options": {"components": 3, "keep_columns": ["customer_id"]},
+        },
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "artifact_id": _SOURCE_PROPS["artifact_id"],
+                "url": _SOURCE_PROPS["url"],
+                "options": {
+                    "type": "object",
+                    "description": "QuantumCompressOptions; see /openapi.json.",
+                    "properties": {
+                        "components": {"type": "integer", "minimum": 1, "maximum": 8},
+                        "keep_columns": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+        },
+        "output": {
+            "artifact": {"id": "Qk3k9Qm2Lr8Tf1Hc5Vb7Nd", "filename": "features_qpca.parquet"},
+            "quantum_explained_variance": [0.24, 0.09, 0.08],
+            "classical_explained_variance": [0.41, 0.29, 0.22],
+            "neighbor_preservation_quantum": 0.26,
+            "neighbor_preservation_classical": 0.77,
+        },
+    },
+    "quantum_portfolio": {
+        "input": {
+            "artifact_id": "Zx3k9Qm2Lr8Tf1Hc5Vb7Nd",
+            "options": {"budget": 3, "risk_aversion": 0.5},
+        },
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "artifact_id": _SOURCE_PROPS["artifact_id"],
+                "url": _SOURCE_PROPS["url"],
+                "options": {
+                    "type": "object",
+                    "description": "PortfolioOptions; see /openapi.json.",
+                    "properties": {
+                        "budget": {"type": "integer", "minimum": 1},
+                        "risk_aversion": {"type": "number", "minimum": 0},
+                    },
+                },
+            },
+        },
+        "output": {
+            "quantum": {"assets": ["A2", "A4", "A7"], "objective": -0.0039, "probability": 0.18},
+            "classical_optimum": {"assets": ["A2", "A4", "A7"], "objective": -0.0039},
+            "approximation_ratio": 1.0,
+        },
+    },
 }

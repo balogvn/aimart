@@ -26,10 +26,13 @@ from aimart_parquet.engine.models import (
     ConvertOptions,
     ConvertResult,
     InspectResult,
+    Provenance,
     TabularResult,
 )
 from aimart_parquet.engine.tabular import OutputFormat, preview, query
-from aimart_parquet.errors import Busy, InvalidRequest, Timeout
+from aimart_parquet.errors import AimartError, Busy, InvalidRequest, Timeout
+from aimart_parquet.provenance import ALGORITHM, build_manifest
+from aimart_parquet.provenance import verify as verify_signature
 from aimart_parquet.sources import decode_base64, fetch_url, safe_filename
 
 if TYPE_CHECKING:
@@ -37,9 +40,21 @@ if TYPE_CHECKING:
 
     from aimart_parquet.artifacts import ArtifactStore
     from aimart_parquet.config import Settings
+    from aimart_parquet.provenance import Signer
+    from aimart_parquet.quantum.models import (
+        PortfolioOptions,
+        PortfolioResult,
+        QuantumCompressOptions,
+        QuantumCompressResult,
+    )
 
 T = TypeVar("T")
 _QUEUE_FACTOR = 4  # callers allowed to wait per worker slot before we answer "busy"
+
+
+class QuantumUnavailable(AimartError):
+    code = "quantum_unavailable"
+    http_status = 501
 
 
 @dataclass(frozen=True)
@@ -63,11 +78,17 @@ class SourceRef:
 
 class Service:
     def __init__(
-        self, settings: Settings, store: ArtifactStore, *, local_mode: bool = False
+        self,
+        settings: Settings,
+        store: ArtifactStore,
+        *,
+        local_mode: bool = False,
+        signer: Signer | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.local_mode = local_mode
+        self.signer = signer
         self.limits = Limits.from_settings(settings)
         self._limiter = anyio.CapacityLimiter(max(1, settings.max_concurrent_jobs))
         self._workroot = settings.artifact_dir / ".work"
@@ -170,31 +191,58 @@ class Service:
                 isolate=self.settings.isolate_jobs,
             )
             stem = Path(name).name.split(".")[0] if name else "data"
-            filename = safe_filename(f"{stem or 'data'}.parquet")
-            if self.local_mode:
-                target = self._local_target(src, output_path, filename)
-                shutil.move(out, target)
-                ref = ArtifactRef(
-                    id="local",
-                    filename=target.name,
-                    size_bytes=target.stat().st_size,
-                    sha256="",
-                    expires_at="never",
-                    path=str(target),
+            ref = self._publish(src, out, f"{stem or 'data'}.parquet", "convert", output_path)
+            hint = None
+            if self.local_mode and self.settings.hosted_url:
+                hint = (
+                    f"Premium tools (quantum_compress_features, quantum_optimize_portfolio) and "
+                    f"hosted conversion with signed provenance: {self.settings.hosted_url}"
                 )
-                return ConvertResult(artifact=ref, report=report)
-            art = self.store.put(out, filename)
-            ref = ArtifactRef(
-                id=art.id,
-                filename=art.filename,
-                size_bytes=art.size_bytes,
-                sha256=art.sha256,
-                expires_at=art.expires_iso,
-                download_url=self.store.download_url(self.settings.public_base_url, art),
-            )
-            return ConvertResult(artifact=ref, report=report)
+            return ConvertResult(artifact=ref, report=report, hint=hint)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    def _publish(
+        self, src: SourceRef, out: Path, filename: str, operation: str, output_path: str | None
+    ) -> ArtifactRef:
+        """Store (or, locally, place) an output file and describe it. One path for every tool."""
+        filename = safe_filename(filename)
+        if self.local_mode:
+            target = self._local_target(src, output_path, filename)
+            shutil.move(out, target)
+            return ArtifactRef(
+                id="local",
+                filename=target.name,
+                size_bytes=target.stat().st_size,
+                sha256="",
+                expires_at="never",
+                path=str(target),
+            )
+        art = self.store.put(out, filename)
+        provenance = None
+        if self.signer is not None:
+            manifest = build_manifest(
+                artifact_id=art.id,
+                sha256=art.sha256,
+                size_bytes=art.size_bytes,
+                filename=art.filename,
+                operation=operation,
+            )
+            provenance = Provenance(
+                algorithm=ALGORITHM,
+                manifest=manifest,
+                signature=self.signer.sign(manifest),
+                public_key_url=f"{self.settings.public_base_url}/.well-known/aimart-signing-key",
+            )
+        return ArtifactRef(
+            id=art.id,
+            filename=art.filename,
+            size_bytes=art.size_bytes,
+            sha256=art.sha256,
+            expires_at=art.expires_iso,
+            download_url=self.store.download_url(self.settings.public_base_url, art),
+            provenance=provenance,
+        )
 
     def _local_target(self, src: SourceRef, output_path: str | None, filename: str) -> Path:
         if output_path:
@@ -281,3 +329,96 @@ class Service:
             )
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    # ------------------------------------------------------------------ premium quantum tier
+    @staticmethod
+    def _require_quantum() -> None:
+        from aimart_parquet import quantum
+
+        if not quantum.available():
+            raise QuantumUnavailable(
+                "The quantum tier is not installed on this server.",
+                hint="Install the `quantum` extra (pip install 'aimart-parquet[quantum]').",
+            )
+
+    async def quantum_compress(
+        self, src: SourceRef, options: QuantumCompressOptions, *, output_path: str | None = None
+    ) -> QuantumCompressResult:
+        self._require_quantum()
+        from aimart_parquet.quantum.kernel_pca import compress
+        from aimart_parquet.quantum.models import SIMULATOR_NOTE, QuantumCompressResult
+
+        workdir = self._workdir()
+        try:
+            path, name = await self._materialize(src, workdir)
+            out = workdir / "quantum.parquet"
+            fields = await self._execute(
+                compress,
+                path,
+                out,
+                options,
+                timeout_s=self.settings.quantum_timeout_s,
+                isolate=self.settings.isolate_jobs,
+            )
+            stem = Path(name).name.split(".")[0] if name else "data"
+            ref = self._publish(
+                src, out, f"{stem or 'data'}_qpca.parquet", "quantum_compress", output_path
+            )
+            extra_notes = fields.pop("notes", [])
+            # The simulator disclaimer is part of the honesty contract: it is always first.
+            return QuantumCompressResult(
+                artifact=ref, **fields, notes=[SIMULATOR_NOTE, *extra_notes]
+            )
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    async def quantum_portfolio(self, src: SourceRef, options: PortfolioOptions) -> PortfolioResult:
+        self._require_quantum()
+        from aimart_parquet.quantum.models import SIMULATOR_NOTE, PortfolioResult
+        from aimart_parquet.quantum.portfolio import optimize
+
+        workdir = self._workdir()
+        try:
+            path, _ = await self._materialize(src, workdir)
+            fields = await self._execute(
+                optimize,
+                path,
+                options,
+                timeout_s=self.settings.quantum_timeout_s,
+                isolate=self.settings.isolate_jobs,
+            )
+            extra_notes = fields.pop("notes", [])
+            return PortfolioResult(**fields, notes=[SIMULATOR_NOTE, *extra_notes])
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    # ------------------------------------------------------------------ provenance
+    async def verify_provenance(
+        self, manifest: dict[str, Any], signature: str, *, artifact_id: str | None = None
+    ) -> dict[str, Any]:
+        """Free check: is this manifest signed by us, and (optionally) does the file match it?"""
+        if self.signer is None:
+            raise InvalidRequest(
+                "This server does not sign artifacts.", hint="Use the hosted service."
+            )
+        problems: list[str] = []
+        signature_valid = verify_signature(self.signer.public_key_b64(), manifest, signature)
+        if not signature_valid:
+            problems.append("signature does not match the manifest and this server's public key")
+        file_matches: bool | None = None
+        if artifact_id is not None:
+            art, _ = self.store.get(artifact_id)
+            file_matches = (
+                art.id == manifest.get("artifact_id")
+                and art.sha256 == manifest.get("sha256")
+                and art.size_bytes == manifest.get("size_bytes")
+            )
+            if not file_matches:
+                problems.append("the stored artifact's id, hash or size differs from the manifest")
+        return {
+            "valid": signature_valid and file_matches is not False,
+            "signature_valid": signature_valid,
+            "file_matches": file_matches,
+            "algorithm": ALGORITHM,
+            "problems": problems,
+        }

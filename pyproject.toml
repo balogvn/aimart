@@ -38,6 +38,9 @@ dependencies = [
 
 [project.optional-dependencies]
 gcs = ["google-cloud-storage>=3.4.0"]
+quantum = [
+    "pennylane>=0.45.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/balogvn/aimart"
@@ -54,6 +57,7 @@ dev = [
   "hypothesis>=6.169.0",
   "mutmut>=3.8.0",
   "mypy>=2.4.0",
+  "openpyxl>=3.1.5",
   "pip-audit>=2.10.1",
   "polars>=2.0.0",
   "pre-commit>=4.6.2",
@@ -105,8 +109,11 @@ max-line-length = 120  # the formatter wraps code at 100; this leaves room for l
 "tests/**" = ["S", "PLR0915", "PLC0415", "FBT003", "E501"]
 "src/aimart_parquet/cli.py" = ["PLC0415"]  # lazy imports keep `convert` from loading uvicorn
 # FastAPI and the MCP SDK read route/tool annotations at runtime: these imports must stay real.
-"src/aimart_parquet/api/app.py" = ["TC001", "TC002", "TC003"]
+"src/aimart_parquet/api/app.py" = ["TC001", "TC002", "TC003", "PLR0915"]  # one factory wires every route
 "src/aimart_parquet/artifacts.py" = ["PLC0415"]  # google-cloud-storage is an optional extra
+# PennyLane is an optional extra imported lazily; pydantic needs model types at runtime.
+"src/aimart_parquet/quantum/**" = ["PLC0415", "PLR0915", "TC001"]
+"src/aimart_parquet/service.py" = ["PLC0415"]
 # SQL here is built from ident()/literal()-escaped parts by design; nothing user-supplied is
 # concatenated raw. The tabular query path parses caller SQL and only runs a single SELECT.
 "src/aimart_parquet/engine/**" = ["S608"]
@@ -132,6 +139,15 @@ mypy_path = "src"
 [[tool.mypy.overrides]]
 module = ["pyarrow.*", "pyreadstat.*", "python_calamine.*", "json_repair.*", "duckdb.*", "x402.*", "charset_normalizer.*", "google.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["pennylane.*", "networkx.*"]
+ignore_missing_imports = true
+follow_untyped_imports = false
+
+[[tool.mypy.overrides]]
+module = ["aimart_parquet.quantum.*"]
+disallow_untyped_decorators = false  # PennyLane's @qnode is untyped
 
 [[tool.mypy.overrides]]
 module = ["tests.*"]

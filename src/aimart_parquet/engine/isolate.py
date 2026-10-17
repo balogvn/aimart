@@ -16,6 +16,7 @@ fork (milliseconds), not a fresh interpreter importing pyarrow and DuckDB.
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import signal
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -26,10 +27,33 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 
+# BLAS thread pools do not survive fork() everywhere: on macOS (Accelerate) the quantum kernel
+# PCA segfaulted in a worker on one input and not another — BLAS only goes multi-threaded above
+# a size threshold, so the crash depended on the data. Workers run one job on 1-2 vCPUs, so a
+# single BLAS thread costs nothing. Must be set before the forkserver (a fresh process) starts.
+for _var in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_var, "1")
+
 _METHOD = "forkserver" if "forkserver" in mp.get_all_start_methods() else "spawn"
 _CTX: Any = mp.get_context(_METHOD)
 if _METHOD == "forkserver":
-    _CTX.set_forkserver_preload(["aimart_parquet.engine.convert", "aimart_parquet.engine.tabular"])
+    # Preloading the quantum modules costs ~2.5 s once at forkserver start instead of on every
+    # premium call; a missing optional extra is skipped silently by multiprocessing.
+    _CTX.set_forkserver_preload(
+        [
+            "aimart_parquet.engine.convert",
+            "aimart_parquet.engine.tabular",
+            "aimart_parquet.quantum.kernel_pca",
+            "aimart_parquet.quantum.portfolio",
+            "pennylane",  # the quantum modules import it lazily; preload it explicitly
+        ]
+    )
 
 
 def _child(

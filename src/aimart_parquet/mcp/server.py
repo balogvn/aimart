@@ -25,6 +25,13 @@ from aimart_parquet import __version__
 from aimart_parquet.config import Settings
 from aimart_parquet.engine.models import ConvertOptions, ConvertResult, InspectResult, TabularResult
 from aimart_parquet.errors import AimartError
+from aimart_parquet.quantum import available as quantum_available
+from aimart_parquet.quantum.models import (
+    PortfolioOptions,
+    PortfolioResult,
+    QuantumCompressOptions,
+    QuantumCompressResult,
+)
 from aimart_parquet.service import Service, SourceRef
 
 PARQUET_MIME = "application/vnd.apache.parquet"
@@ -357,4 +364,164 @@ GROUP BY 1 ORDER BY 2 DESC. {note(settings.price_query)}"""
         ) -> Annotated[CallToolResult, TabularResult]:
             return await _query(SourceRef(artifact_id=artifact_id, url=url), sql, limit, format)
 
+    if quantum_available():  # keep in step with pricing.active_operations()
+        _register_quantum_tools(server, service, settings, local_mode=local_mode)
+    if not local_mode and service.signer is not None:
+        _register_verify_tool(server, service)
     return server
+
+
+QUANTUM_HONESTY = (
+    "Runs on a quantum circuit SIMULATOR (PennyLane); at this size that gives no speed or "
+    "accuracy advantage over classical methods, so a classical baseline is always returned too."
+)
+
+
+def _register_quantum_tools(
+    server: MCPServer, service: Service, settings: Settings, *, local_mode: bool
+) -> None:
+    def price(amount: str) -> str:
+        return _price_note(amount, local=local_mode)
+
+    compress_description = f"""Premium. Reduce many numeric columns to a few dimensions with \
+quantum-kernel PCA: rows are embedded by an entangling quantum feature map (IQPEmbedding), \
+compared by state fidelity, and decomposed in kernel space. Writes a new Parquet artifact with \
+qpc_1..k (quantum) and pc_1..k (classical PCA) side by side, plus a comparable \
+neighbor-preservation score for each so you can use whichever serves you better. \
+Input: artifact_id from convert_to_parquet (or a url to a .parquet). {QUANTUM_HONESTY} \
+{price(settings.price_quantum_compress)}"""
+    portfolio_description = f"""Premium. Pick `budget` of up to 14 assets minimizing \
+risk_aversion*variance - expected return, using QAOA (an XY-mixer quantum optimization \
+circuit) — and an exact classical exhaustive search, returned side by side with the \
+approximation ratio. Input: a Parquet artifact whose numeric columns are asset prices (or \
+returns with data_kind='returns'), rows in time order or with a date column. Use \
+classical_optimum when you only need the best basket. {QUANTUM_HONESTY} \
+{price(settings.price_quantum_portfolio)}"""
+    compute = ToolAnnotations(
+        read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True
+    )
+
+    async def compress(
+        src: SourceRef, options: QuantumCompressOptions | None, output_path: str | None
+    ) -> CallToolResult:
+        async def run() -> CallToolResult:
+            result = await service.quantum_compress(
+                src, options or QuantumCompressOptions(), output_path=output_path
+            )
+            extra: list[TextContent | ResourceLink] = []
+            if result.artifact.download_url:
+                extra.append(
+                    ResourceLink(
+                        type="resource_link",
+                        name=result.artifact.filename,
+                        uri=result.artifact.download_url,
+                        mime_type=PARQUET_MIME,
+                        size=result.artifact.size_bytes,
+                        description="Parquet with qpc_* (quantum) and pc_* (classical) components.",
+                    )
+                )
+            return _ok(result, extra)
+
+        return await _guard(run)
+
+    async def portfolio(src: SourceRef, options: PortfolioOptions | None) -> CallToolResult:
+        return await _guard(
+            lambda: _wrap(service.quantum_portfolio(src, options or PortfolioOptions()))
+        )
+
+    if local_mode:
+
+        @server.tool(
+            name="quantum_compress_features",
+            title="Quantum-kernel PCA (premium)",
+            description=compress_description,
+            annotations=compute,
+        )
+        async def compress_local(
+            path: PathArg = None,
+            url: UrlArg = None,
+            options: QuantumCompressOptions | None = None,
+            output_path: Annotated[
+                str | None, Field(description="Where to write the output Parquet.")
+            ] = None,
+        ) -> Annotated[CallToolResult, QuantumCompressResult]:
+            return await compress(SourceRef(path=path, url=url), options, output_path)
+
+        @server.tool(
+            name="quantum_optimize_portfolio",
+            title="QAOA portfolio optimization (premium)",
+            description=portfolio_description,
+            annotations=compute,
+        )
+        async def portfolio_local(
+            path: PathArg = None,
+            url: UrlArg = None,
+            options: PortfolioOptions | None = None,
+        ) -> Annotated[CallToolResult, PortfolioResult]:
+            return await portfolio(SourceRef(path=path, url=url), options)
+
+    else:
+
+        @server.tool(
+            name="quantum_compress_features",
+            title="Quantum-kernel PCA (premium)",
+            description=compress_description,
+            annotations=compute,
+        )
+        async def compress_remote(
+            artifact_id: ArtifactArg = None,
+            url: UrlArg = None,
+            options: QuantumCompressOptions | None = None,
+        ) -> Annotated[CallToolResult, QuantumCompressResult]:
+            return await compress(SourceRef(artifact_id=artifact_id, url=url), options, None)
+
+        @server.tool(
+            name="quantum_optimize_portfolio",
+            title="QAOA portfolio optimization (premium)",
+            description=portfolio_description,
+            annotations=compute,
+        )
+        async def portfolio_remote(
+            artifact_id: ArtifactArg = None,
+            url: UrlArg = None,
+            options: PortfolioOptions | None = None,
+        ) -> Annotated[CallToolResult, PortfolioResult]:
+            return await portfolio(SourceRef(artifact_id=artifact_id, url=url), options)
+
+
+class VerifyResult(BaseModel):
+    valid: bool
+    signature_valid: bool
+    file_matches: bool | None = None
+    algorithm: str
+    problems: list[str]
+
+
+def _register_verify_tool(server: MCPServer, service: Service) -> None:
+    @server.tool(
+        name="verify_provenance",
+        title="Verify artifact provenance (free)",
+        description="""Free. Check that a file this service produced is authentic and unaltered: \
+verifies the post-quantum ML-DSA-65 (NIST FIPS 204) signature in an artifact's `provenance`, and \
+with artifact_id also re-checks the stored file's hash and size against the signed manifest.""",
+        annotations=ToolAnnotations(
+            read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False
+        ),
+    )
+    async def verify_provenance(
+        manifest: Annotated[
+            dict[str, Any], Field(description="provenance.manifest exactly as received.")
+        ],
+        signature: Annotated[
+            str, Field(description="provenance.signature (base64).", max_length=8192)
+        ],
+        artifact_id: ArtifactArg = None,
+    ) -> Annotated[CallToolResult, VerifyResult]:
+        async def run() -> CallToolResult:
+            return _ok(
+                VerifyResult(
+                    **await service.verify_provenance(manifest, signature, artifact_id=artifact_id)
+                )
+            )
+
+        return await _guard(run)

@@ -243,7 +243,7 @@ class GcsArtifactStore(LocalArtifactStore):
         from google.auth.transport import requests as grequests
 
         credentials, _ = google.auth.default()
-        credentials.refresh(grequests.Request())
+        credentials.refresh(grequests.Request())  # type: ignore[no-untyped-call]
         blob = self._bucket.blob(self._key(art.id))
         return str(
             blob.generate_signed_url(

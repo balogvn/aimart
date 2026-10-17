@@ -27,7 +27,7 @@ from mcp_types import CallToolResult, TextContent
 from x402 import parse_payment_payload
 from x402.schemas import PaymentPayload
 
-from aimart_parquet.payments.pricing import OPERATIONS
+from aimart_parquet.payments.pricing import active_operations
 
 if TYPE_CHECKING:
     from x402.schemas import PaymentRequirements, ResourceInfo
@@ -57,7 +57,7 @@ class X402McpGate(Extension):
 
     def settings(self) -> dict[str, Any]:
         prices: dict[str, str] = {}
-        for op in OPERATIONS:
+        for op in active_operations():
             prices.setdefault(op.tool, op.price(self.payments.settings))
         return {
             "x402Version": 2,

@@ -30,7 +30,7 @@ from x402.schemas.config import ResourceConfig
 from aimart_parquet.config import NetworkMode, Settings
 from aimart_parquet.payments.bazaar import EXAMPLES
 from aimart_parquet.payments.mcp_gate import X402McpGate
-from aimart_parquet.payments.pricing import BY_TOOL, OPERATIONS, Operation, usd_to_atomic
+from aimart_parquet.payments.pricing import BY_TOOL, Operation, active_operations, usd_to_atomic
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -121,7 +121,7 @@ class Payments:
             floor = (kind.extra or {}).get("minPaymentAmountAtomic") if kind else None
             if not floor:
                 continue
-            for op in OPERATIONS:
+            for op in active_operations():
                 atomic = usd_to_atomic(op.price(self.settings))
                 if atomic < int(floor):
                     log.error(
@@ -159,7 +159,7 @@ class Payments:
     # ------------------------------------------------------------------ REST paywall
     def routes(self) -> dict[str, RouteConfig]:
         routes: dict[str, RouteConfig] = {}
-        for op in OPERATIONS:
+        for op in active_operations():
             example = EXAMPLES[op.key]
             routes[op.route] = RouteConfig(
                 accepts=[
@@ -197,7 +197,7 @@ class Payments:
         paid paths initialize here first; a facilitator outage becomes a 503 (nothing charged).
         """
         inner = payment_middleware(self.routes(), self.server, sync_facilitator_on_start=False)
-        paid = {(op.method, op.path) for op in OPERATIONS}
+        paid = {(op.method, op.path) for op in active_operations()}
 
         async def middleware(
             request: Request, call_next: Callable[[Request], Awaitable[Response]]
@@ -259,7 +259,7 @@ class Payments:
         """x402scan's /.well-known/x402 compatibility format (not part of the x402 spec)."""
         return {
             "version": 1,
-            "resources": [self.resource_url(op) for op in OPERATIONS],
+            "resources": [self.resource_url(op) for op in active_operations()],
             "instructions": (
                 "POST JSON (see /openapi.json). Unpaid requests get HTTP 402 with a base64 "
                 "PAYMENT-REQUIRED header; retry with PAYMENT-SIGNATURE. MCP: /mcp, pay per tool "

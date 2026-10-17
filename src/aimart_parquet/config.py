@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     price_inspect: str = "$0.002"
     price_preview: str = "$0.002"
     price_query: str = "$0.005"
+    price_quantum_compress: str = "$0.50"
+    price_quantum_portfolio: str = "$1.00"
     bazaar_tag: str | None = Field(
         default=None, description="Optional discovery tag placed in accepts[].extra.tag."
     )
@@ -106,6 +108,17 @@ class Settings(BaseSettings):
         description="HMAC key for download links. Random per boot unless set.",
     )
 
+    # ---------------------------------------------------------------- quantum + provenance
+    quantum_timeout_s: float = 90.0
+    signing_key_mldsa: SecretStr | None = Field(
+        default=None,
+        description="Base64 of a 32-byte ML-DSA-65 seed. Unset: ephemeral key per boot (dev only).",
+    )
+    hosted_url: str | None = Field(
+        default=None,
+        description="Local mode: URL of the hosted service, mentioned once in results for premium tools.",
+    )
+
     # ---------------------------------------------------------------- ops
     log_level: str = "INFO"
     log_json: bool = True
@@ -119,7 +132,14 @@ class Settings(BaseSettings):
         if self.pay_to_svm and not _SOLANA_ADDRESS.match(self.pay_to_svm):
             msg = "AIMART_PAY_TO_SVM must be a base58 Solana address"
             raise ValueError(msg)
-        for name in ("price_convert", "price_inspect", "price_preview", "price_query"):
+        for name in (
+            "price_convert",
+            "price_inspect",
+            "price_preview",
+            "price_query",
+            "price_quantum_compress",
+            "price_quantum_portfolio",
+        ):
             if not _PRICE.match(getattr(self, name)):
                 msg = f"AIMART_{name.upper()} must look like '$0.01'"
                 raise ValueError(msg)
