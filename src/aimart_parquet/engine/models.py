@@ -1,0 +1,215 @@
+"""Pydantic models shared by the engine, the REST API and the MCP tools.
+
+These are the public contract: field descriptions become OpenAPI and MCP JSON Schema text that
+LLMs read to decide how to call us, so they are written for that reader.
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class InputFormat(StrEnum):
+    CSV = "csv"
+    TSV = "tsv"
+    JSON = "json"
+    NDJSON = "ndjson"
+    XLSX = "xlsx"
+    XLS = "xls"
+    ODS = "ods"
+    SAV = "sav"
+    ZSAV = "zsav"
+    POR = "por"
+    DTA = "dta"
+    SAS7BDAT = "sas7bdat"
+    XPT = "xpt"
+    PARQUET = "parquet"
+
+
+class DateOrder(StrEnum):
+    AUTO = "auto"
+    DMY = "dmy"
+    MDY = "mdy"
+    YMD = "ymd"
+
+
+class ValueLabelMode(StrEnum):
+    METADATA = "metadata"
+    APPLY = "apply"
+    BOTH = "both"
+
+
+ColumnType = Literal[
+    "string", "int64", "float64", "bool", "date", "timestamp", "timestamptz", "decimal"
+]
+
+
+class ExpectedColumn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(description="Column name after normalization (snake_case by default).")
+    type: ColumnType
+    nullable: bool = True
+    precision: int | None = Field(default=None, ge=1, le=38, description="decimal only")
+    scale: int | None = Field(default=None, ge=0, le=38, description="decimal only")
+
+
+class ConvertOptions(BaseModel):
+    """How to read the input and shape the Parquet output. Every field is optional."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    format: InputFormat | None = Field(
+        default=None, description="Force the input format. Omit to auto-detect."
+    )
+    sheet: str | int | None = Field(
+        default=None,
+        description="Excel/ODS sheet name or 0-based index. Default: first non-empty sheet.",
+    )
+    delimiter: str | None = Field(
+        default=None, min_length=1, max_length=1, description="CSV delimiter. Omit to sniff."
+    )
+    header: bool | None = Field(
+        default=None, description="Whether the first row is a header. Omit to auto-detect."
+    )
+    encoding: str | None = Field(
+        default=None, description="Text encoding, e.g. 'latin-1'. Omit to auto-detect."
+    )
+    null_values: list[str] = Field(
+        default_factory=list,
+        max_length=50,
+        description="Extra tokens to treat as null, in addition to '', NA, N/A, null, None, -.",
+    )
+    normalize_column_names: bool = Field(
+        default=True, description="Rewrite column names to unique snake_case."
+    )
+    infer_types: bool = Field(
+        default=True,
+        description="Infer int/float/bool/date/timestamp columns from text. False keeps text.",
+    )
+    date_order: DateOrder = Field(
+        default=DateOrder.AUTO,
+        description="Order for ambiguous dates like 03/04/2025. auto assumes day-first.",
+    )
+    json_records_path: str | None = Field(
+        default=None,
+        max_length=200,
+        description="Dot path to the array of records inside a JSON document, e.g. 'data.items'.",
+    )
+    flatten_nested: bool = Field(
+        default=False,
+        description="Flatten nested JSON objects into parent__child columns; lists become JSON.",
+    )
+    value_labels: ValueLabelMode = Field(
+        default=ValueLabelMode.METADATA,
+        description=(
+            "SPSS/Stata/SAS value labels: 'metadata' keeps codes and stores labels in Parquet "
+            "metadata; 'apply' replaces codes with label text; 'both' adds <col>_label columns."
+        ),
+    )
+    expected_schema: list[ExpectedColumn] | None = Field(
+        default=None,
+        max_length=2000,
+        description="Validate and cast to this schema. Unknown columns are kept unless strict.",
+    )
+    strict: bool = Field(
+        default=False,
+        description="With expected_schema: fail on any value that does not fit, or extra columns.",
+    )
+    sort_by: list[str] | None = Field(
+        default=None,
+        max_length=8,
+        description="Sort rows by these columns so Parquet min/max stats prune well.",
+    )
+    compression: Literal["zstd", "snappy", "gzip", "none"] = "zstd"
+    row_group_size: int = Field(default=122_880, ge=1_000, le=10_000_000)
+
+
+class ColumnReport(BaseModel):
+    name: str
+    original_name: str
+    type: str = Field(description="Arrow type of the column in the output file.")
+    nullable: bool
+    null_count: int
+    inferred_from_text: bool = Field(
+        default=False, description="True when the type was inferred from text values."
+    )
+    rejected_count: int = Field(
+        default=0, description="Values that did not fit the chosen type and were set to null."
+    )
+    rejected_examples: list[str] = Field(default_factory=list, max_length=3)
+    label: str | None = Field(default=None, description="Variable label (SPSS/Stata/SAS).")
+    value_labels: dict[str, str] | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
+class ConversionReport(BaseModel):
+    source_format: InputFormat
+    source_bytes: int
+    output_bytes: int
+    rows: int
+    columns: list[ColumnReport]
+    encoding: str | None = None
+    delimiter: str | None = None
+    sheet: str | None = None
+    available_sheets: list[str] | None = None
+    warnings: list[str] = Field(default_factory=list)
+    duration_ms: int
+    estimated_tokens_raw: int = Field(
+        description="Rough LLM tokens to read the input as text (bytes / 4)."
+    )
+    estimated_tokens_schema: int = Field(
+        description="Rough LLM tokens to read this schema summary instead."
+    )
+
+
+class ArtifactRef(BaseModel):
+    id: str = Field(description="Pass as artifact_id to inspect/preview/query without re-upload.")
+    filename: str
+    size_bytes: int
+    sha256: str
+    expires_at: str = Field(description="RFC 3339 UTC time after which the artifact is deleted.")
+    download_url: str | None = Field(
+        default=None, description="Signed HTTPS link to the Parquet file, valid until expiry."
+    )
+    path: str | None = Field(default=None, description="Local file path (local mode only).")
+
+
+class ConvertResult(BaseModel):
+    artifact: ArtifactRef
+    report: ConversionReport
+
+
+class ColumnStats(BaseModel):
+    name: str
+    type: str
+    nullable: bool
+    null_count: int | None = None
+    min: Any = None
+    max: Any = None
+    label: str | None = None
+    value_labels: dict[str, str] | None = None
+
+
+class InspectResult(BaseModel):
+    rows: int
+    row_groups: int
+    columns: list[ColumnStats]
+    size_bytes: int
+    created_by: str | None = None
+    key_value_metadata: dict[str, str] = Field(
+        default_factory=dict, description="File-level metadata, long values truncated."
+    )
+
+
+class TabularResult(BaseModel):
+    columns: list[str]
+    types: list[str]
+    rows: list[list[Any]] | None = Field(default=None, description="Present when format=json.")
+    text: str | None = Field(default=None, description="Present when format=markdown or csv.")
+    row_count: int
+    truncated: bool = Field(description="True when more rows matched than were returned.")
+    total_rows: int | None = None

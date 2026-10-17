@@ -1,0 +1,172 @@
+[project]
+name = "aimart-parquet"
+version = "0.1.0"
+description = "Pay-per-call MCP server and API that turns messy CSV, JSON, Excel, SPSS, Stata and SAS files into clean, schema-validated, token-efficient Parquet. AI agents pay in USDC via x402."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Kayode Balogun", email = "balogvn@gmail.com" }]
+requires-python = ">=3.12"
+keywords = ["mcp", "parquet", "x402", "ai-agents", "duckdb", "csv", "spss", "stata", "sas", "data-conversion"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Database",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+  "Typing :: Typed",
+]
+dependencies = [
+  "charset-normalizer>=3.5.2",
+  "duckdb>=1.5.6",
+  "fastapi>=0.143.0",
+  "httpx>=0.28.1",
+  "json-repair>=0.64.0",
+  "mcp>=2.3.0,<3",
+  "pyarrow>=26.0.0",
+  "pydantic>=2.14.0",
+  "pydantic-settings>=2.15.0",
+  "pyreadstat>=1.3.6",
+  "python-calamine>=0.8.3",
+  "python-multipart>=0.0.20",
+  "uvicorn[standard]>=0.54.0",
+  "x402[evm,svm,extensions]>=2.25.0,<3",
+]
+
+[project.optional-dependencies]
+gcs = ["google-cloud-storage>=3.4.0"]
+
+[project.urls]
+Homepage = "https://github.com/balogvn/aimart"
+Repository = "https://github.com/balogvn/aimart"
+Issues = "https://github.com/balogvn/aimart/issues"
+Changelog = "https://github.com/balogvn/aimart/blob/main/CHANGELOG.md"
+
+[project.scripts]
+aimart-parquet = "aimart_parquet.cli:main"
+
+[dependency-groups]
+dev = [
+  "anyio>=4.6",
+  "hypothesis>=6.169.0",
+  "mutmut>=3.8.0",
+  "mypy>=2.4.0",
+  "pip-audit>=2.10.1",
+  "polars>=2.0.0",
+  "pre-commit>=4.6.2",
+  "pytest>=9.1.1",
+  "pytest-cov>=7.0.0",
+  "ruff>=0.17.0",
+  "schemathesis>=4.30.1",
+  "x402[httpx,mcp]>=2.25.0,<3",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aimart_parquet"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/aimart_parquet", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W", "F", "I", "B", "UP", "S", "N", "C4", "SIM", "RUF", "PT", "PTH",
+  "TID", "TC", "ASYNC", "BLE", "FBT003", "PIE", "RET", "ERA", "PL", "PERF", "LOG", "G",
+]
+ignore = [
+  "PLR0913",  # tool entry points legitimately take many keyword options
+  "PLR0917",  # the Reader protocol is positional by design: (con, path, workdir, options, fmt, limits)
+  "PLR0911",  # early returns read better than nesting in validation-heavy code
+  "PLR2004",  # magic values are fine in tests and limit tables
+  "S101",     # assert is how pytest works; production code does not use it for control flow
+  "N818",     # error names read as outcomes (InputTooLarge), not as "...Error"
+  "PLR0912",  # format dispatch and type ladders branch; splitting them hides the decision table
+]
+
+[tool.ruff.lint.pycodestyle]
+max-line-length = 120  # the formatter wraps code at 100; this leaves room for long messages
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "PLR0915", "PLC0415", "FBT003", "E501"]
+"src/aimart_parquet/cli.py" = ["PLC0415"]  # lazy imports keep `convert` from loading uvicorn
+# FastAPI and the MCP SDK read route/tool annotations at runtime: these imports must stay real.
+"src/aimart_parquet/api/app.py" = ["TC001", "TC002", "TC003"]
+"src/aimart_parquet/artifacts.py" = ["PLC0415"]  # google-cloud-storage is an optional extra
+# SQL here is built from ident()/literal()-escaped parts by design; nothing user-supplied is
+# concatenated raw. The tabular query path parses caller SQL and only runs a single SELECT.
+"src/aimart_parquet/engine/**" = ["S608"]
+"src/aimart_parquet/mcp/server.py" = ["S608", "N806", "E501"]
+"src/aimart_parquet/payments/bazaar.py" = ["E501"]
+"scripts/**" = ["T20", "S603", "S607"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# ---------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["pyarrow.*", "pyreadstat.*", "python_calamine.*", "json_repair.*", "duckdb.*", "x402.*", "charset_normalizer.*", "google.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config", "--import-mode=importlib"]
+xfail_strict = true
+filterwarnings = ["error", "ignore::DeprecationWarning:websockets.*", "ignore::DeprecationWarning:eth_.*"]
+markers = [
+  "slow: exercises large inputs (deselect with -m 'not slow')",
+  "network: needs real internet (never in default CI)",
+  "testnet: spends testnet USDC against a live facilitator",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["aimart_parquet"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@overload", "\\.\\.\\."]
+
+# ---------------------------------------------------------------- mutmut
+[tool.mutmut]
+paths_to_mutate = [
+  "src/aimart_parquet/payments/",
+  "src/aimart_parquet/sources.py",
+  "src/aimart_parquet/engine/safety.py",
+  "src/aimart_parquet/engine/query.py",
+]
+tests_dir = ["tests/"]

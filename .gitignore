@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+mutants/
+
+# Local state and secrets — never commit keys or wallets
+.env
+.env.*
+!.env.example
+.wallets/
+.local/
+*.pem
+*.key
+
+# Outputs
+*.parquet
+!tests/fixtures/**/*.parquet
+/tmp/
+
+.DS_Store
