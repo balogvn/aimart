@@ -4,6 +4,7 @@ DuckDB matches STRUCT field names case-insensitively, so ``{"a": {"k": 1, "K": 2
 maps, mixed ``ID``/``id``) failed its type detection with ``Duplicate name "K" in struct``, and
 with ``ignore_errors=true`` it silently kept ``k`` and lost every ``K`` value, on the fast path,
 the NDJSON path and the Python fallback alike. Top-level keys were already fine (``id``, ``id_1``).
+An empty nested key (``{"a": {"": 1}}``) failed the whole read with a bare DuckDB error.
 """
 
 from __future__ import annotations
