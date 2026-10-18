@@ -112,10 +112,12 @@ async def test_busy_when_the_queue_is_full(make_settings: Callable[..., Settings
         while service._limiter.statistics().tasks_waiting < 4:  # noqa: ASYNC110 - no event exists
             await anyio.sleep(0.001)
         with pytest.raises(Busy) as info:
-            await service._execute(lambda: 1, timeout_s=1, isolate=False)
+            async with service._job():
+                pytest.fail("a job slot was granted with the queue full")
         assert info.value.http_status == 503
         release.set()
-    assert await service._execute(lambda: 7, timeout_s=1, isolate=False) == 7
+    async with service._job():
+        assert await service._execute(lambda: 7, timeout_s=1, isolate=False) == 7
 
 
 async def test_in_process_deadline_is_a_timeout(settings: Settings) -> None:
