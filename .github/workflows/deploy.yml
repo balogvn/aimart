@@ -6,9 +6,10 @@
 #
 # Configuration lives in GitHub variables, not here (deploy/README.md, "GitHub configuration"):
 # non-secret values only. The secrets (two, plus an optional admin token) live in Google Secret
-# Manager and are referenced by name; neither GitHub nor this log ever holds them. Authentication is Workload Identity
-# Federation: this job's OIDC token is exchanged for a short-lived Google token, scoped by the
-# provider's attribute condition to this repository. There is no service-account key.
+# Manager and are referenced by name; neither GitHub nor this log ever holds them.
+# Authentication is Workload Identity Federation: this job's OIDC token is exchanged for a
+# short-lived Google token, scoped by the provider's attribute condition to this repository.
+# There is no service-account key.
 name: Deploy
 
 on:

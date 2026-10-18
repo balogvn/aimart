@@ -111,6 +111,50 @@ async def test_payments_page_samples_quote_and_settle_the_same_amount(
     assert documented["network"] == receipt["network"]
 
 
+# ------------------------------------------------------------------ README join shapes, on the wire
+INVOICES = b"order_id,total\n1,10\n2,20\n3,30\n"
+ORDERS = b"order_id,status\n1,paid\n2,open\n"
+
+
+def readme_join_examples() -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """The README's join SQL and its REST and MCP argument samples, parsed."""
+    text = read("README.md")
+    section_text = text[text.index("### Joins") : text.index("## Pricing")]
+    sql = re.search(r"With\s+`sql` = `([^`]+)`", section_text)
+    rest = re.search(r"^REST\s+POST /v1/query\s+(\{.*\})$", section_text, re.M)
+    mcp_args = re.search(r"^MCP\s+query_parquet\s+(\{.*\})$", section_text, re.M)
+    assert sql
+    assert rest
+    assert mcp_args
+    return sql.group(1), json.loads(rest.group(1)), json.loads(mcp_args.group(1))
+
+
+async def test_readme_join_shapes_work_over_rest_and_mcp(
+    make_settings: Callable[..., Settings],
+) -> None:
+    sql, rest, mcp_args = readme_join_examples()
+    async with kit.running_app(make_settings(), paid=False) as h:
+        ids = {}
+        for name, data in (("invoices", INVOICES), ("orders", ORDERS)):
+            r = await h.http.post(
+                "/v1/convert", json={"content_base64": kit.b64(data), "filename": f"{name}.csv"}
+            )
+            ids[f"<{name}_id>"] = r.json()["artifact"]["id"]
+
+        def fill(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {k: fill(v) for k, v in value.items()}
+            return sql if value == "..." else ids.get(value, value)
+
+        r = await h.http.post("/v1/query", json=fill(rest))
+        async with kit.mcp_over_http(h.app) as client:
+            result = await client.call_tool("query_parquet", fill(mcp_args))
+    assert r.status_code == 200, r.text
+    assert not result.is_error, result.content
+    assert sorted(r.json()["rows"]) == [[1, 10, "paid"], [2, 20, "open"]]
+    assert result.structured_content["rows"] == r.json()["rows"]  # same answer, both shapes
+
+
 # ------------------------------------------------------------------ economics.md arithmetic
 def session_revenue(s: Settings) -> Decimal:
     """The model's classical session: convert + inspect + preview + 2 queries."""

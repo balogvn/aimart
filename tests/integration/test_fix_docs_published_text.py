@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+import aimart_testkit as kit
 from aimart_parquet.api.discovery import DESCRIPTION, llms_txt, retention_policy
 from aimart_parquet.config import Settings
 from aimart_parquet.engine.detect import SUPPORTED_EXTENSIONS
@@ -130,6 +131,30 @@ def test_bazaar_query_schema_offers_tables_with_the_real_limit() -> None:
     props = EXAMPLES["query"]["input_schema"]["properties"]
     assert props["tables"]["maxProperties"] == EXTRA_TABLES
     assert "tables" in props["sql"]["description"]
+
+
+@pytest.mark.anyio
+async def test_served_discovery_text_mentions_pdfs_and_joins(paid_app: kit.AppHarness) -> None:
+    # What a crawler, a directory and a paying agent actually receive, not the source table.
+    convert_402 = kit.payment_required(await paid_app.http.post("/v1/convert", json={}))
+    query_402 = kit.payment_required(await paid_app.http.post("/v1/query", json={}))
+    pricing = {
+        o["operation"]: o for o in (await paid_app.http.get("/pricing")).json()["operations"]
+    }
+    card = (await paid_app.http.get("/.well-known/mcp/server-card.json")).json()
+    tools = {t["name"]: t for t in card["tools"]}
+    index = (await paid_app.http.get("/")).json()
+    assert PDF in convert_402["resource"]["description"]
+    assert f"join up to {EXTRA_TABLES} more" in query_402["resource"]["description"]
+    bazaar = json.dumps(query_402["extensions"])  # the catalog's input schema
+    assert f'"maxProperties": {EXTRA_TABLES}' in bazaar
+    assert PDF in pricing["convert"]["summary"]
+    assert "`tables`" in pricing["query"]["summary"]
+    assert PDF in tools["convert_to_parquet"]["description"]
+    assert "join" in tools["query_parquet"]["description"]
+    for description in (card["description"], index["description"]):
+        assert PDF in description
+        assert "join" in description
 
 
 def test_server_json_description_fits_and_prices_match_the_defaults() -> None:

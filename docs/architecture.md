@@ -72,6 +72,8 @@ flowchart LR
 6. **Artifact store.** The output goes to `LocalArtifactStore` (TTL disk, HMAC-signed links)
    or `GcsArtifactStore` (V4 signed URLs). The caller gets a reference (`artifact_id` and
    `download_url`), not the bytes ([ADR 0007](adr/0007-artifact-references-not-bytes.md)).
+   At the TTL an artifact becomes unreachable; a sweep on the request path deletes it soon
+   after ([privacy.md](privacy.md) has the retention promise and its worst case).
 7. **Provenance.** `Service._publish`, the single place every output passes through, signs a
    manifest with ML-DSA-65 ([ADR 0009](adr/0009-post-quantum-provenance.md)).
 8. **Settlement.** REST settles only after a response below 400. MCP settles only for a
