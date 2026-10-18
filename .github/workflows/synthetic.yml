@@ -1,0 +1,98 @@
+# Synthetic check: every 6 hours, decode production's live 402s and compare them with what the
+# deployer configured (payee, network, prices from /pricing, provenance key). A green deploy
+# proves the values were right at deploy time; this proves they are still right (a changed
+# variable, a facilitator outage, a rotated key, a revision someone deployed by hand).
+#
+# This is a check, not a keep-alive: scale-to-zero is the point (and the cost model), and four
+# cold starts a day keep nothing warm. Note that GitHub disables scheduled workflows in a public
+# repository after 60 days without repository activity; re-enable it from the Actions tab (a
+# commit also resets the clock). A disabled check fails silently, so look at the Actions tab.
+#
+# Enabled by setting the repository variable PRODUCTION_URL (deploy/README.md). On failure it
+# opens one issue labelled `synthetic-failure`, or comments on the one already open; when the
+# check passes again it comments and closes that issue.
+name: Synthetic check
+
+on:
+  schedule:
+    - cron: "17 */6 * * *" # 00:17, 06:17, 12:17, 18:17 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: synthetic
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: smoke production
+    if: vars.PRODUCTION_URL != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write # open/comment/close the incident issue
+    env:
+      LABEL: synthetic-failure
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.0"
+          python-version: "3.13"
+          enable-cache: false
+      - name: Smoke test production
+        id: smoke
+        env:
+          URL: ${{ vars.PRODUCTION_URL }}
+          AIMART_NETWORK_MODE: ${{ vars.AIMART_NETWORK_MODE }}
+          AIMART_PAY_TO_EVM: ${{ vars.AIMART_PAY_TO_EVM }}
+          AIMART_PAY_TO_SVM: ${{ vars.AIMART_PAY_TO_SVM }}
+          AIMART_PUBLIC_BASE_URL: ${{ vars.AIMART_PUBLIC_BASE_URL }}
+          SMOKE_SIGNING_KEY_SHA256: ${{ vars.SMOKE_SIGNING_KEY_SHA256 }}
+        run: |
+          set -euo pipefail
+          flags="$(deploy/smoke-flags.sh)" # a failure here stops the step (set -e)
+          args=()
+          while IFS= read -r flag; do args+=("$flag"); done <<< "$flags"
+          uv run --script scripts/smoke.py "${URL%/}" "${args[@]}" --wait 180
+
+      - name: Open or update the incident issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          URL: ${{ vars.PRODUCTION_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label "$LABEL" \
+            --json number --jq '.[0].number // empty')"
+          body="The synthetic check against ${URL} failed at $(date -u +%Y-%m-%dT%H:%M:%SZ): ${RUN_URL}
+          The failing checks are listed in that run's summary. Re-run with: Actions -> Synthetic check -> Run workflow."
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh label create "$LABEL" --repo "$GITHUB_REPOSITORY" --color B60205 \
+              --description "Production synthetic check is failing" --force
+            gh issue create --repo "$GITHUB_REPOSITORY" --label "$LABEL" \
+              --title "Production synthetic check failing" --body "$body"
+          fi
+
+      - name: Close the incident issue on recovery
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label "$LABEL" \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh issue close "$number" --repo "$GITHUB_REPOSITORY" --comment "Recovered: ${RUN_URL}"
+          fi

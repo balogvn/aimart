@@ -145,7 +145,7 @@ def _validate_url(url: str) -> None:
     if not parts.hostname:
         raise UrlNotAllowed("The URL has no host.", hint="Pass a full https:// URL.")
     try:
-        port = parts.port or (443 if parts.scheme == "https" else 80)
+        port = parts.port if parts.port is not None else (443 if parts.scheme == "https" else 80)
     except ValueError as exc:
         raise UrlNotAllowed("The URL has an invalid port.", hint="Check the URL.") from exc
     if port not in ALLOWED_PORTS:

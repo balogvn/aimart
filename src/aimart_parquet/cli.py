@@ -23,6 +23,7 @@ def _serve(args: argparse.Namespace) -> int:
     import uvicorn
 
     from aimart_parquet.api.app import create_app
+    from aimart_parquet.config import get_settings
 
     port = args.port or int(os.environ.get("PORT", "8000"))
     uvicorn.run(
@@ -30,11 +31,22 @@ def _serve(args: argparse.Namespace) -> int:
         host=args.host,
         port=port,
         proxy_headers=True,  # behind a TLS proxy the app must see https:// and the real host
-        forwarded_allow_ips=os.environ.get("FORWARDED_ALLOW_IPS", "*"),
+        forwarded_allow_ips=forwarded_allow_ips(get_settings().trust_forwarded_for),
         log_config=None,
         timeout_graceful_shutdown=10,
     )
     return 0
+
+
+def forwarded_allow_ips(trust_forwarded_for: bool) -> str:
+    """Which peers uvicorn may believe about X-Forwarded-*.
+
+    With "*", uvicorn rewrites the client address to the LEFTMOST X-Forwarded-For entry — the
+    one the caller wrote — so a caller could pick a fresh rate-limit bucket per request. Only
+    trust every peer when our own middleware reads the proxy-appended (rightmost) entries
+    instead (AIMART_TRUST_FORWARDED_FOR=true); otherwise keep uvicorn's local-only default.
+    """
+    return os.environ.get("FORWARDED_ALLOW_IPS", "*" if trust_forwarded_for else "127.0.0.1")
 
 
 def _local_service() -> object:

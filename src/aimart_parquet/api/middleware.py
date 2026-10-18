@@ -41,11 +41,19 @@ async def _send_json(
     await send({"type": "http.response.body", "body": payload})
 
 
-def client_ip(scope: Scope, *, trust_forwarded_for: bool) -> str:
+def client_ip(scope: Scope, *, trust_forwarded_for: bool, trusted_hops: int = 1) -> str:
+    """The caller's address for rate limiting.
+
+    Behind a proxy, only the entries the proxies themselves APPENDED to X-Forwarded-For are
+    trustworthy; everything to their left is whatever the client chose to send. So we count
+    ``trusted_hops`` from the right. Taking the first entry (as uvicorn does with
+    forwarded_allow_ips="*") let any caller dodge the limiter with a fresh fake IP per request.
+    """
     if trust_forwarded_for:
-        for key, value in scope.get("headers", []):
-            if key == b"x-forwarded-for":
-                return str(value.decode("latin-1").split(",")[0].strip())
+        values = [v for k, v in scope.get("headers", []) if k == b"x-forwarded-for"]
+        hops = [h.strip() for h in b",".join(values).decode("latin-1").split(",") if h.strip()]
+        if hops:
+            return hops[-min(max(1, trusted_hops), len(hops))]
     client = scope.get("client")
     return str(client[0]) if client else "unknown"
 
@@ -127,13 +135,18 @@ class BodyLimitMiddleware:
 
         response_started = False
 
-        async def tracking_send(message: Message) -> None:
+        async def guarded_send(message: Message) -> None:
             nonlocal response_started
+            # Once the body is over the limit, the app's reply to our disconnect (FastAPI's 400
+            # "error parsing the body") is dropped and the caller gets 413 instead — unless the
+            # app had already started its response, which can no longer be replaced.
+            if too_large and not response_started:
+                return
             if message["type"] == "http.response.start":
                 response_started = True
             await send(message)
 
-        await self.app(scope, limited, tracking_send)
+        await self.app(scope, limited, guarded_send)
         if too_large and not response_started:
             await _too_large(send, limit)
 
@@ -161,6 +174,7 @@ class RateLimitMiddleware:
         *,
         per_minute: int,
         trust_forwarded_for: bool,
+        trusted_hops: int = 1,
         exempt: tuple[str, ...] = ("/health",),
         max_clients: int = 50_000,
     ) -> None:
@@ -168,6 +182,7 @@ class RateLimitMiddleware:
         self.capacity = float(max(1, per_minute))
         self.rate = self.capacity / 60.0
         self.trust = trust_forwarded_for
+        self.trusted_hops = trusted_hops
         self.exempt = exempt
         self.max_clients = max_clients
         self.buckets: OrderedDict[str, tuple[float, float]] = OrderedDict()
@@ -189,7 +204,8 @@ class RateLimitMiddleware:
             await self.app(scope, receive, send)
             return
         allowed, retry = self.allow(
-            client_ip(scope, trust_forwarded_for=self.trust), time.monotonic()
+            client_ip(scope, trust_forwarded_for=self.trust, trusted_hops=self.trusted_hops),
+            time.monotonic(),
         )
         if not allowed:
             await _send_json(

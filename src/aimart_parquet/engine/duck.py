@@ -47,6 +47,8 @@ def connect(
         },
     )
     con.execute("SET TimeZone = 'UTC'")
+    # Off: it is printed to stdout, corrupting `convert | jq` output and server logs.
+    con.execute("SET enable_progress_bar = false")
     if temp_dir is not None:
         con.execute(f"SET temp_directory = {literal(str(temp_dir))}")
         con.execute("SET max_temp_directory_size = '2GB'")

@@ -1,0 +1,26 @@
+name: Feature request
+description: A new input format, tool, option or integration.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you (or your agent) trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would solve it
+      description: The tool, parameter or format you have in mind, and an example call if you can.
+  - type: dropdown
+    id: pay
+    attributes:
+      label: Would you pay per call for it?
+      options:
+        - "Yes, at the current price level"
+        - "Yes, it is worth more than that"
+        - "Only if it were free"
+        - "Not sure"

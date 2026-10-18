@@ -1,0 +1,31 @@
+# Every change needs the owner's review. The paths below are listed separately on purpose: they
+# are where a small diff can move money, open the network or overstate a result, so a future
+# co-maintainer is added to the general rule, not to these, until they have earned it.
+# Later lines take precedence over earlier ones.
+
+*                                       @balogvn
+
+# Money: prices, the x402 gate, settlement rules.
+/src/aimart_parquet/payments/           @balogvn
+/src/aimart_parquet/api/middleware.py   @balogvn
+/src/aimart_parquet/config.py           @balogvn
+
+# Security boundaries: SSRF-safe fetching, the DuckDB sandbox, decompression and parsing limits.
+/src/aimart_parquet/sources.py          @balogvn
+/src/aimart_parquet/engine/duck.py      @balogvn
+/src/aimart_parquet/engine/safety.py    @balogvn
+/src/aimart_parquet/engine/isolate.py   @balogvn
+
+# Quantum honesty contract and post-quantum provenance.
+/src/aimart_parquet/quantum/            @balogvn
+/src/aimart_parquet/provenance.py       @balogvn
+/docs/specs/quantum-premium.md          @balogvn
+
+# What runs with credentials: CI/CD, deploy, releases, discovery metadata.
+/.github/                               @balogvn
+/deploy/                                @balogvn
+/Dockerfile                             @balogvn
+/release-please-config.json             @balogvn
+/.release-please-manifest.json          @balogvn
+/server.json                            @balogvn
+/AGENTS.md                              @balogvn

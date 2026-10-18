@@ -1,0 +1,64 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.balogvn/aimart-parquet",
+  "title": "AImart Parquet",
+  "description": "Convert messy CSV, JSON, Excel, SPSS, Stata and SAS files to typed Parquet; inspect and query them.",
+  "version": "0.1.0",
+  "websiteUrl": "https://github.com/balogvn/aimart",
+  "repository": {
+    "url": "https://github.com/balogvn/aimart",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "aimart-parquet",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp",
+          "description": "Run the free local stdio MCP server (local file paths, no payments)."
+        }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://YOUR-SERVICE.run.app/mcp"
+    }
+  ],
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "x402": {
+        "protocol": "x402",
+        "x402Version": 2,
+        "scheme": "exact",
+        "asset": "USDC",
+        "transport": "MCP tools/call _meta['x402/payment']; REST PAYMENT-REQUIRED / PAYMENT-SIGNATURE headers",
+        "charged": "only on success (MCP isError=false, HTTP status < 400)",
+        "networks": {
+          "testnet": ["eip155:84532", "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"],
+          "mainnet": ["eip155:8453", "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"]
+        },
+        "prices": {
+          "convert_to_parquet": "$0.01",
+          "inspect_parquet": "$0.002",
+          "preview_parquet": "$0.002",
+          "query_parquet": "$0.005",
+          "quantum_compress_features": "$0.50",
+          "quantum_optimize_portfolio": "$1.00",
+          "verify_provenance": "free"
+        },
+        "free": ["initialize", "tools/list", "verify_provenance", "local stdio mode (uvx aimart-parquet mcp)"],
+        "notes": "Quantum tools run on a circuit simulator and always return a classical baseline. Hosted artifacts are signed with ML-DSA-65 (FIPS 204)."
+      }
+    }
+  }
+}

@@ -342,6 +342,7 @@ def create_app(
         RateLimitMiddleware,
         per_minute=settings.rate_limit_per_minute,
         trust_forwarded_for=settings.trust_forwarded_for,
+        trusted_hops=settings.trusted_proxy_hops,
     )
     app.add_middleware(AccessLogMiddleware)
     return app

@@ -21,6 +21,7 @@ classifiers = [
 ]
 dependencies = [
   "charset-normalizer>=3.5.2",
+  "cryptography>=48.0.0",  # ML-DSA (FIPS 204) ships in the standard wheels from 48
   "duckdb>=1.5.6",
   "fastapi>=0.143.0",
   "httpx>=0.28.1",
@@ -181,10 +182,13 @@ exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@overload", "
 
 # ---------------------------------------------------------------- mutmut
 [tool.mutmut]
-paths_to_mutate = [
+# Money and security paths: a surviving mutant here is a bug the suite cannot see.
+source_paths = [
   "src/aimart_parquet/payments/",
   "src/aimart_parquet/sources.py",
   "src/aimart_parquet/engine/safety.py",
-  "src/aimart_parquet/engine/query.py",
+  "src/aimart_parquet/engine/tabular.py",
+  "src/aimart_parquet/engine/duck.py",
 ]
-tests_dir = ["tests/"]
+pytest_add_cli_args = ["-m", "not slow and not network and not testnet", "-p", "no:cacheprovider"]
+pytest_add_cli_args_test_selection = ["tests/"]

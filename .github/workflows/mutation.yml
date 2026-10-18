@@ -1,0 +1,90 @@
+# Mutation testing of the money and security paths ([tool.mutmut] in pyproject.toml lists them).
+#
+# Coverage says a line ran; a mutation score says a test would notice if that line were wrong.
+# mutmut rewrites the code one small change at a time (`<` to `<=`, `True` to `False`, a dropped
+# call) and reruns the tests: a "survivor" is a change no test caught. On a payment path a
+# survivor is a bug that a green suite would ship.
+#
+# Weekly and on demand, never per PR: a full run takes a long time. It reports, it does not gate.
+# Results (stats, every survivor's diff) are uploaded as an artifact and summarised on the run.
+name: Mutation testing
+
+on:
+  schedule:
+    - cron: "37 2 * * 0" # Sundays 02:37 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: mutation
+  cancel-in-progress: true
+
+jobs:
+  mutmut:
+    name: mutmut
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.0"
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --all-extras --frozen
+      - name: Run mutmut
+        # The same entry point as `make mutate`.
+        run: make mutate RUN="uv run --frozen --no-sync"
+      - name: Collect results
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p mutation-report
+          uv run --frozen --no-sync mutmut export-cicd-stats
+          if [ -f mutants/mutmut-cicd-stats.json ]; then
+            cp mutants/mutmut-cicd-stats.json mutation-report/stats.json
+          fi
+          uv run --frozen --no-sync mutmut results > mutation-report/not-killed.txt || true
+          grep -E ': survived$' mutation-report/not-killed.txt | sed -E 's/^ +//; s/: survived$//' \
+            > mutation-report/survivors.txt || true
+          # Every survivor's diff, uncapped: the artifact is where a reviewer works from.
+          while read -r name; do
+            uv run --frozen --no-sync mutmut show "$name"
+            echo
+          done < mutation-report/survivors.txt > mutation-report/survivors.diff
+      - name: Summarise
+        if: always()
+        run: |
+          set -uo pipefail
+          stats=mutation-report/stats.json
+          {
+            echo "### Mutation testing"
+            if [ -f "$stats" ]; then
+              jq -r '"killed \(.killed) / total \(.total); survived \(.survived); no tests \(.no_tests); timeout \(.timeout); suspicious \(.suspicious); segfault \(.segfault); skipped \(.skipped)"' "$stats"
+              jq -r 'if (.killed + .survived) > 0 then "Mutation score (killed / (killed + survived)): \((.killed * 1000 / (.killed + .survived) | floor) / 10)%" else "No mutants were tested." end' "$stats"
+            else
+              echo "No statistics: mutmut did not finish. See the run log."
+            fi
+            count="$(wc -l < mutation-report/survivors.txt 2>/dev/null || echo 0)"
+            echo
+            echo "Survivors: ${count} (all listed below; diffs in the mutation-report artifact)"
+            echo '```'
+            cat mutation-report/survivors.txt 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: mutation-report
+          path: mutation-report/
+          if-no-files-found: warn
+          retention-days: 30

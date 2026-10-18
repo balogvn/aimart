@@ -62,7 +62,7 @@ class CompressMethod(BaseModel):
     qubits: int
     features_in: int
     pre_reduction: str | None = Field(
-        description="Classical step applied before the quantum feature map, if any."
+        default=None, description="Classical step applied before the quantum feature map, if any."
     )
     landmarks: int
     rows: int

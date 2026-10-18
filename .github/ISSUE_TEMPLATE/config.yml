@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/balogvn/aimart/security/advisories/new
+    about: Payment bypasses, SSRF, sandbox escapes or leaked secrets. Never in a public issue.
+  - name: Questions and ideas
+    url: https://github.com/balogvn/aimart/discussions
+    about: Usage questions and open-ended ideas.

@@ -87,7 +87,19 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 120
     trust_forwarded_for: bool = Field(
         default=False,
-        description="Trust the first X-Forwarded-For hop for rate limiting (only behind a proxy).",
+        description=(
+            "Behind a proxy (Cloud Run): read the client address from X-Forwarded-For, counting "
+            "trusted_proxy_hops entries from the right. Off: use the TCP peer."
+        ),
+    )
+    trusted_proxy_hops: int = Field(
+        default=1,
+        ge=1,
+        le=5,
+        description=(
+            "Proxies that append to X-Forwarded-For (Cloud Run's front end: 1; behind an extra "
+            "HTTPS load balancer: 2). The client address is read this many entries from the right."
+        ),
     )
     allow_private_urls: bool = Field(
         default=False, description="Test-only escape hatch for the SSRF guard. Never in prod."

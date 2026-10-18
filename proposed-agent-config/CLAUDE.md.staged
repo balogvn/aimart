@@ -1,0 +1,46 @@
+@AGENTS.md
+
+# Claude Code notes
+
+AGENTS.md (imported above) is the project guide for every agent. This file adds only what is
+specific to Claude Code.
+
+## Hooks (`.claude/settings.json`)
+
+- **Every Bash command** passes `.claude/hooks/guard_bash.py` first. It blocks env dumps,
+  secret files and secret-named variables, token-printing CLIs, the mainnet confirmation
+  sentence, wallet sends, force-pushes, `git clean -x` and recursive deletes outside temp
+  directories and gitignored build output. If it blocks you, do not hunt for another spelling:
+  tell the user what you wanted to run and why. Check a secret's presence by length
+  (`${#NAME}`), never by value.
+- **Every Edit/Write of a `.py` file** runs `.claude/hooks/format_python.py` (ruff fix + ruff
+  format on that file). If ruff still reports problems, they arrive as context after the edit:
+  fix them before moving on rather than leaving them for `make lint`.
+- Self-test after changing either hook: `bash .claude/hooks/test_hooks.sh`.
+
+## Subagents (`.claude/agents/`)
+
+Run the matching reviewer before calling a change done, and include its findings in your
+summary:
+
+- `payments-reviewer`: anything in `payments/`, `service.py`, paid routes or tools, prices.
+- `security-reviewer`: `sources.py`, `engine/`, `artifacts.py`, `api/`, `mcp/server.py` inputs.
+- `quantum-honesty-reviewer`: `quantum/`, `provenance.py`, and any text mentioning quantum.
+
+## Skills (`.claude/skills/`)
+
+`add-input-format`, `add-paid-operation`, `release-and-deploy`, `verify-payments`. They are
+plain checklists, so read the SKILL.md directly when a task matches its description.
+
+## MCP
+
+`.mcp.json` runs this repo's own free stdio server (`uv run --frozen aimart-parquet mcp`) so you
+can convert and inspect local files with the product while working on it. It reads local paths
+and spends nothing. `--frozen` keeps it from rewriting `uv.lock` when it starts.
+
+## Working habits here
+
+- Throwaway scripts and outputs go in the session scratchpad, never in the repo.
+- Scripts that trigger isolated jobs (any real conversion with `isolate_jobs=True`) need an
+  `if __name__ == "__main__":` guard: forkserver re-imports `__main__`.
+- Never commit, push, tag, publish or deploy unless the user asked in this session.

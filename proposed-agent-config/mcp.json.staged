@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "aimart-parquet": {
+      "command": "uv",
+      "args": ["run", "--frozen", "aimart-parquet", "mcp"]
+    }
+  }
+}

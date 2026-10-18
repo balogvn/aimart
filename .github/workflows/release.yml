@@ -1,0 +1,325 @@
+# Release: release-please keeps a release PR open; merging it tags vX.Y.Z and creates the GitHub
+# release, and only then do the publishing jobs run, in this order:
+#
+#   release-please -> build (sdist + wheel) -> pypi (Trusted Publishing, PEP 740 attestations)
+#                  -> image (amd64 + arm64 -> GHCR, SLSA provenance + SPDX SBOM attestations)
+#   pypi + image   -> mcp-registry (server.json stamped with the version, OIDC login)
+#   image          -> deploy (deploy.yml with the image DIGEST, never a tag)
+#
+# Everything publishes from one workflow run because a tag pushed with GITHUB_TOKEN does not
+# trigger other workflows. No long-lived credentials: PyPI, Sigstore, the MCP registry and Google
+# Cloud all accept this run's OIDC token, scoped per job by `id-token: write`.
+#
+# No dependency or build caches anywhere in this file: a cache written by a PR could otherwise
+# poison what we publish. Release builds are slower and come from clean inputs only.
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false # never interrupt a half-published release
+
+env:
+  UV_VERSION: "0.13.0"
+  IMAGE: ghcr.io/balogvn/aimart-parquet # GHCR names must be lowercase
+  SERVER_NAME: io.github.balogvn/aimart-parquet
+
+jobs:
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # tag + GitHub release + CHANGELOG commit on the release branch
+      pull-requests: write # open and update the release PR
+      issues: write # labels on the release PR ("autorelease: pending")
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      version: ${{ steps.rp.outputs.version }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+      sha: ${{ steps.rp.outputs.sha }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: rp
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          # A PR opened with GITHUB_TOKEN does not trigger CI, so the release PR would never get
+          # the required `ci-ok` check. RELEASE_PLEASE_TOKEN (a fine-grained PAT or GitHub App
+          # token: contents + pull requests read/write on this repo only) fixes that; without
+          # it, the built-in token still works but CI must be run on the release PR by hand.
+          # A repository secret: release-please runs on every push to main, and an environment
+          # would add a deployment record (or an approval) to each one.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }} # zizmor: ignore[secrets-outside-env]
+
+  build:
+    name: build (sdist + wheel)
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.sha }} # exactly the tagged commit
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+          enable-cache: false
+      # --no-sources: build exactly as a PyPI user's installer would, ignoring any local
+      # [tool.uv.sources] overrides.
+      - run: uv build --no-sources
+      - name: The built version is the released version
+        # The app reports importlib.metadata's version, so a wheel stamped with the wrong
+        # version would lie in /health, MCP initialize and every provenance manifest.
+        env:
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          ls -la dist
+          test -f "dist/aimart_parquet-${VERSION}-py3-none-any.whl"
+          test -f "dist/aimart_parquet-${VERSION}.tar.gz"
+          # Exactly these two distributions (uv also writes a dist/.gitignore, which is fine).
+          test "$(find dist -type f \( -name '*.whl' -o -name '*.tar.gz' \) | wc -l)" -eq 2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  pypi:
+    name: publish to PyPI
+    needs: [release-please, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/aimart-parquet/${{ needs.release-please.outputs.version }}/
+    permissions:
+      id-token: write # Trusted Publishing; no API token exists anywhere
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      # PEP 740 attestations are on by default in this action: each file is signed with this
+      # run's identity and the attestation is uploaded to PyPI alongside it.
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  image:
+    name: image (amd64 + arm64 -> GHCR)
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    # arm64 is built under QEMU emulation, which is slow (bytecode compilation of the whole
+    # venv). Native arm64 runners plus a manifest merge would be faster but is more moving parts.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      id-token: write # Sigstore signing for the attestations
+      attestations: write # store attestations in the repository
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.sha }}
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          # The MCP registry verifies OCI ownership by this annotation (and the Dockerfile's
+          # LABEL); put it on the index too, which is what a multi-arch reference resolves to.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ${{ env.IMAGE }}
+          # The release is created by release-please, not by a tag push, so semver tags are fed
+          # the version explicitly.
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release-please.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-please.outputs.version }}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest
+          annotations: |
+            io.modelcontextprotocol.server.name=${{ env.SERVER_NAME }}
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          # GitHub's Sigstore attestations below are the verifiable record
+          # (`gh attestation verify oci://...`); BuildKit's unsigned in-image ones would only add
+          # "unknown/unknown" platform entries to the index.
+          provenance: false
+          sbom: false
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Generate the SBOM (SPDX)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: true
+          upload-release-assets: false
+      # actions/attest-sbom is deprecated in favour of actions/attest with sbom-path (same
+      # inputs, same attestation); this is that successor.
+      - name: Attest the SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: true
+      - name: Summary
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### Image"
+            echo "Digest: \`${IMAGE}@${DIGEST}\`"
+            echo
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+            echo "Verify: \`gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${GITHUB_REPOSITORY}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  mcp-registry:
+    name: publish to the MCP Registry
+    # The registry validates that the PyPI version and the OCI image named in server.json exist
+    # and carry our server name, so both must be published first.
+    needs: [release-please, pypi, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # `mcp-publisher login github-oidc` proves we own io.github.balogvn/*
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.sha }}
+          persist-credentials: false
+      - name: Install mcp-publisher (pinned version, pinned checksum)
+        # The expected sha256 is pinned here, not only read from the release's checksums file:
+        # an attacker able to replace the release asset could replace that file as well. Both
+        # must agree. To upgrade, update both values together from the new release.
+        env:
+          MCP_PUBLISHER_VERSION: "1.8.1"
+          MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/mcp-publisher"
+          mkdir -p "$dir"
+          base="https://github.com/modelcontextprotocol/registry/releases/download/v${MCP_PUBLISHER_VERSION}"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$dir/mcp-publisher.tar.gz" "$base/mcp-publisher_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$dir/checksums.txt" "$base/registry_${MCP_PUBLISHER_VERSION}_checksums.txt"
+          echo "${MCP_PUBLISHER_SHA256}  $dir/mcp-publisher.tar.gz" | sha256sum --check --strict -
+          listed="$(awk '$2 == "mcp-publisher_linux_amd64.tar.gz" { print $1 }' "$dir/checksums.txt")"
+          if [ "$listed" != "$MCP_PUBLISHER_SHA256" ]; then
+            echo "::error::release checksums file lists '${listed}', pinned ${MCP_PUBLISHER_SHA256}"
+            exit 1
+          fi
+          tar -xzf "$dir/mcp-publisher.tar.gz" -C "$dir" mcp-publisher
+          echo "$dir" >> "$GITHUB_PATH"
+      - name: Stamp the release version and production URL into server.json
+        # PyPI packages carry a `version`; OCI packages carry the version as the image tag in
+        # `identifier` (registry schema 2025-12-11). The streamable-http remote is pointed at
+        # the production origin: the registry is where agents find the URL, so a placeholder
+        # there is an outage for every new client. It must never be published.
+        env:
+          VERSION: ${{ needs.release-please.outputs.version }}
+          PUBLIC_BASE_URL: ${{ vars.AIMART_PUBLIC_BASE_URL }}
+        run: |
+          set -euo pipefail
+          test -f server.json || { echo "::error::server.json is missing at the repo root"; exit 1; }
+          jq --arg v "$VERSION" --arg name "$SERVER_NAME" --arg base "${PUBLIC_BASE_URL%/}" '
+            if .name != $name then error("server.json name is \(.name), expected \($name)") else . end
+            | .version = $v
+            | .packages = ((.packages // []) | map(
+                if .registryType == "oci" then
+                  .identifier |= (sub("@sha256:[0-9a-f]+$"; "") | sub(":[^:/]+$"; "") + ":" + $v)
+                  | if has("version") then .version = $v else . end
+                else .version = $v end))
+            | if $base == "" then . else
+                .remotes = ((.remotes // []) | map(
+                  if .type == "streamable-http" then .url = $base + "/mcp" else . end))
+              end
+          ' server.json > "$RUNNER_TEMP/server.json"
+          mv "$RUNNER_TEMP/server.json" server.json
+          # Show the values the registry will receive, not just that jq exited 0.
+          jq '{name, version, packages: [.packages[] | {registryType, identifier, version}], remotes}' server.json
+          test "$(jq -r .version server.json)" = "$VERSION"
+          bad="$(jq -r '[.remotes[]?.url | select(test("YOUR-|example\\.|localhost|127\\.0\\.0\\.1") or (startswith("https://") | not))] | join(" ")' server.json)"
+          if [ -n "$bad" ]; then
+            echo "::error::server.json would publish placeholder or non-https remotes: ${bad}. Set the AIMART_PUBLIC_BASE_URL repository variable."
+            exit 1
+          fi
+      - name: Log in with GitHub OIDC
+        run: mcp-publisher login github-oidc
+      - name: Publish
+        # PyPI's JSON API can lag a fresh upload by a minute; retry rather than fail the release.
+        run: |
+          for attempt in 1 2 3 4; do
+            if mcp-publisher publish; then exit 0; fi
+            echo "::warning::publish attempt ${attempt} failed; retrying in 30 s"
+            sleep 30
+          done
+          echo "::error::mcp-publisher publish failed 4 times"
+          exit 1
+
+  deploy:
+    name: deploy
+    needs: [release-please, image]
+    permissions:
+      contents: read
+      id-token: write # Workload Identity Federation to Google Cloud
+    # The newer "$/..." self-repository form is what zizmor suggests, but actionlint 1.7.12 (the
+    # latest release) rejects it as an invalid reusable-workflow reference; switch once it parses.
+    uses: ./.github/workflows/deploy.yml # zizmor: ignore[self-repository]
+    with:
+      image_digest: ${{ needs.image.outputs.digest }}
+      version: ${{ needs.release-please.outputs.version }} # /health must then report it

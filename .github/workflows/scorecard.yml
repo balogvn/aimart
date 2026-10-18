@@ -1,0 +1,52 @@
+# OpenSSF Scorecard: scores this repository's supply-chain hygiene (pinned actions, token
+# permissions, branch protection, signed releases...) and publishes the result so the badge and
+# api.securityscorecards.dev show it.
+#
+# publish_results: true makes the Scorecard API verify this workflow before accepting results:
+# no top-level env or defaults, no write permissions at the top level, no containers or
+# services, hosted runner, and only allow-listed actions in the job (checkout, harden-runner,
+# scorecard, upload-artifact, upload-sarif). That is also why this file has no `run:` steps and
+# no concurrency block: keep it this plain or publishing fails.
+name: Scorecard
+
+# No concurrency block on purpose (see above); hence the concurrency-limits ignore.
+on: # zizmor: ignore[concurrency-limits]
+  branch_protection_rule: # re-score when protection changes
+  schedule:
+    - cron: "41 5 * * 2" # Tuesdays 05:41 UTC
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  analysis:
+    name: scorecard
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read # check out the repository being scored
+      actions: read # read workflow runs (the CI-Tests and Dangerous-Workflow checks)
+      security-events: write # upload SARIF to code scanning
+      id-token: write # sign the published results (keyless, Sigstore)
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scorecard-sarif
+          path: results.sarif
+          retention-days: 7
+      - uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: results.sarif

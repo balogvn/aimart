@@ -1,0 +1,88 @@
+# Dependabot: weekly, grouped, and with a cooldown.
+#
+# Grouped so a week's updates arrive as a few reviewable PRs, not twenty. The cooldown waits a
+# few days after an upstream release before proposing it: most malicious or broken releases are
+# yanked within that window, and nothing here needs a new version the hour it ships. Security
+# updates (Dependabot alerts) are not subject to the cooldown.
+#
+# Commit prefixes follow Conventional Commits so release-please reads them: runtime dependency
+# bumps are `fix(deps)` (they change what users install, so they produce a patch release),
+# development and CI bumps are `chore(...)` (no release).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore(ci)
+    labels: [dependencies, github-actions]
+
+  # uv.lock is first-class for Dependabot ("uv" ecosystem): it updates pyproject.toml and
+  # re-locks, so the lock and the declared ranges never drift apart.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+    groups:
+      runtime:
+        dependency-type: production
+        update-types: [minor, patch]
+      development:
+        dependency-type: development
+        update-types: [minor, patch]
+    # Majors stay one PR each: x402, mcp and pyarrow majors change wire formats or APIs, and
+    # deserve their own review (and their own failing test, if any).
+    commit-message:
+      prefix: fix(deps)
+      prefix-development: chore(deps-dev)
+    labels: [dependencies, python]
+    open-pull-requests-limit: 10
+
+  # The Dockerfile's FROM lines are digest-pinned; this proposes new digests as PRs.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 7
+    groups:
+      docker-base-images:
+        patterns: ["*"]
+    commit-message:
+      prefix: fix(docker)
+    labels: [dependencies, docker]
+
+  # .pre-commit-config.yaml hook revisions (SHA-pinned with `# frozen:` comments).
+  - package-ecosystem: pre-commit
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 7
+    groups:
+      pre-commit-hooks:
+        patterns: ["*"]
+    commit-message:
+      prefix: chore(pre-commit)
+    labels: [dependencies]

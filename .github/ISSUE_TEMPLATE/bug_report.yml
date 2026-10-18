@@ -1,0 +1,52 @@
+name: Bug report
+description: Something returned the wrong value, the wrong price, or failed.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problems (payment bypass, SSRF, sandbox escape) go to a private advisory instead:
+        https://github.com/balogvn/aimart/security/advisories/new
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where
+      options:
+        - Hosted REST API (x402-paid)
+        - Hosted MCP server (x402-paid)
+        - Local MCP server (stdio, free)
+        - CLI (aimart-parquet convert/inspect)
+        - Docker image
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: From `GET /health`, `aimart-parquet --version`, or the image tag.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+      description: >-
+        For payment problems include the decoded PAYMENT-REQUIRED header (base64 JSON); it holds
+        only public data. Never paste a private key, a signed payment payload, or a seed.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The smallest input file or request that shows it. Attach files if you can.
+      render: shell
+  - type: checkboxes
+    id: money
+    attributes:
+      label: Money
+      options:
+        - label: I was charged for a call that failed or returned wrong data

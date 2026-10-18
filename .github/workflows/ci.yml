@@ -1,0 +1,313 @@
+# CI: the same commands as `make check`, plus the checks only CI can do (workflow lint, secret
+# scan, vulnerability audit, the real container answering real 402s).
+#
+# Branch protection should require exactly one check: `ci-ok`. It needs every other job, so adding
+# a job here never means editing the branch protection rule (and forgetting to).
+#
+# Supply chain: every action is pinned to a full commit SHA (the `# vX.Y.Z` comment is for humans
+# and Dependabot). Tags are mutable and have been rewritten in real attacks; a SHA cannot be.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+# Nothing by default; each job asks for exactly what it uses.
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  # Superseded PR pushes are cancelled; main and the merge queue always run to completion so the
+  # last commit on main has a full result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  UV_VERSION: "0.13.0" # same uv as the Dockerfile's builder stage
+  # Default test selection: no big inputs, no internet, no testnet spending (pyproject markers).
+  MARKERS: not slow and not network and not testnet
+
+jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      # Only the dev group: ruff needs neither the project nor its runtime dependencies.
+      - run: uv sync --frozen --only-dev
+      - run: make lint RUN="uv run --frozen --no-sync"
+
+  types:
+    name: types (mypy --strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --all-extras --frozen
+      - run: make type RUN="uv run --frozen --no-sync"
+
+  tests:
+    name: tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      # One red cell must not hide whether the others are green.
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.12" } # requires-python floor
+          - { os: ubuntu-latest, python: "3.13" } # what the container runs
+          - { os: macos-latest, python: "3.13" } # forkserver + Accelerate BLAS (see AGENTS.md)
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      # --all-extras: the quantum tier and the GCS store are part of what we ship and test.
+      - run: uv sync --all-extras --frozen
+      # The coverage floor (fail_under) lives in pyproject.toml, so local and CI cannot disagree.
+      - run: make test RUN="uv run --frozen --no-sync" MARKERS="$MARKERS"
+
+  workflow-lint:
+    name: workflow lint (actionlint + zizmor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      # Exact tool versions: a linter that upgrades itself turns a green main red overnight.
+      # actionlint also runs shellcheck (preinstalled on ubuntu-latest) over every `run:` block.
+      - run: uvx --from actionlint-py==1.7.12.25 actionlint -color
+      - name: zizmor
+        # The token is only for zizmor's online audits (impostor commits, known-vulnerable
+        # actions); it reads public data and the job holds nothing but contents: read.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: uvx zizmor==1.31.1 --format=github .github
+
+  secrets:
+    name: secret scan (gitleaks)
+    # gitleaks-action supports push and pull_request; a merge-queue commit is exactly the PR's
+    # already-scanned commits on top of main, so there is nothing new to scan.
+    if: github.event_name != 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read # the action lists a PR's commits to choose the scan range
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the scan covers every commit in the range, not just the tip
+          persist-credentials: false
+      # Free for repositories owned by a personal account (balogvn is one); an organization
+      # owner would need a GITLEAKS_LICENSE secret. Comments are off: the job cannot write.
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_VERSION: "8.30.1"
+
+  audit:
+    name: dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+          enable-cache: false
+      # What ships: runtime dependencies with every extra, from the lockfile, with hashes.
+      # --no-emit-project: our own package is not on PyPI yet, and --strict would fail on it.
+      # --disable-pip: audit exactly the locked, hashed set; never re-resolve.
+      # pip-audit's version matches the one locked in the dev group.
+      - name: pip-audit
+        run: |
+          uv export --frozen --no-dev --all-extras --no-emit-project --format requirements-txt \
+            --output-file "$RUNNER_TEMP/requirements.txt"
+          uvx pip-audit==2.10.1 --strict --disable-pip --progress-spinner off \
+            --requirement "$RUNNER_TEMP/requirements.txt"
+
+  container:
+    name: container (build, Trivy, smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      IMAGE: aimart-parquet:ci
+      PAY_TO: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"
+      BASE_URL: http://127.0.0.1:8080
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha,scope=ci-container
+          cache-to: type=gha,scope=ci-container,mode=max
+          # Build attestations belong to the release build (release.yml), not to a CI image
+          # that is thrown away.
+          provenance: false
+          sbom: false
+      - name: Trivy (fail on fixable CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          # Only what we can act on: an unfixed CVE in the base image has no PR to merge.
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+          # An explicit, two-weeks-old Trivy rather than the action's default; Trivy's own
+          # release channel was compromised once (2026-03), so upgrades are deliberate.
+          version: v0.75.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+          enable-cache: false
+      - name: Run the container
+        # A throwaway ML-DSA seed, generated here and masked, so the smoke test can demand a
+        # persistent (non-ephemeral) signing key exactly as production does. It is passed via
+        # the environment, never argv, so it does not appear in the process list.
+        run: |
+          AIMART_SIGNING_KEY_MLDSA="$(python3 -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
+          echo "::add-mask::$AIMART_SIGNING_KEY_MLDSA"
+          export AIMART_SIGNING_KEY_MLDSA
+          docker run --detach --name aimart --publish 127.0.0.1:8080:8080 \
+            --env AIMART_PAY_TO_EVM="$PAY_TO" \
+            --env AIMART_PUBLIC_BASE_URL="$BASE_URL" \
+            --env AIMART_SIGNING_KEY_MLDSA \
+            "$IMAGE"
+      - name: Smoke test (decode the live 402s)
+        # The first paid probe makes the server contact https://x402.org/facilitator, so this
+        # also proves the image can reach its facilitator.
+        run: |
+          uv run --script scripts/smoke.py "$BASE_URL" \
+            --expect-pay-to "$PAY_TO" \
+            --expect-network eip155:84532 \
+            --require-operation quantum_compress \
+            --require-operation quantum_portfolio \
+            --require-provenance \
+            --wait 120
+      - name: Container logs
+        if: always()
+        run: docker logs aimart 2>&1 | tail -n 200 || true
+      - name: Stop the container
+        if: always()
+        run: docker rm --force aimart || true
+
+  dependency-review:
+    name: dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          # Commenting would need pull-requests: write; the job summary carries the result.
+          comment-summary-in-pr: never
+
+  ci-ok:
+    name: ci-ok
+    # always(): a failed dependency must turn this red, not skip it (a skipped required check
+    # counts as passing in branch protection).
+    if: always()
+    needs: [lint, types, tests, workflow-lint, secrets, audit, container, dependency-review]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - name: Every job passed or was skipped by design
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          if [ "$FAILED" = "true" ]; then
+            echo "::error::at least one required job failed or was cancelled"
+            exit 1
+          fi

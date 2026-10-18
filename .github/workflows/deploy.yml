@@ -1,0 +1,311 @@
+# Deploy one image, by digest, to Cloud Run; prove it serves the right values; roll back if not.
+#
+# Called by release.yml after every release, or run by hand (Actions -> Deploy -> Run workflow)
+# with a digest from the release summary or `docker buildx imagetools inspect`. Rolling back by
+# hand is the same thing: dispatch this workflow with the previous release's digest.
+#
+# Configuration lives in GitHub variables, not here (deploy/README.md, "GitHub configuration"):
+# non-secret values only. The two secrets live in Google Secret Manager and are referenced by
+# name; neither GitHub nor this log ever holds them. Authentication is Workload Identity
+# Federation: this job's OIDC token is exchanged for a short-lived Google token, scoped by the
+# provider's attribute condition to this repository. There is no service-account key.
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      image_digest:
+        description: sha256 digest of the ghcr.io/balogvn/aimart-parquet image (index) to deploy
+        type: string
+        required: true
+      version:
+        description: Package version the deployment must report (optional)
+        type: string
+        required: false
+        default: ""
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: "Image digest to deploy, e.g. sha256:0123... (ghcr.io/balogvn/aimart-parquet)"
+        type: string
+        required: true
+      version:
+        description: "Package version /health must then report, e.g. 0.2.0 (optional)"
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: deploy to Cloud Run
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # One deploy at a time, and never cancel one halfway (that is how traffic ends up split).
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    environment:
+      name: production
+      url: ${{ steps.config.outputs.public_url }}
+    permissions:
+      contents: read
+      id-token: write # Workload Identity Federation
+    env:
+      IMAGE: ghcr.io/balogvn/aimart-parquet
+      UV_VERSION: "0.13.0"
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check inputs and configuration
+        id: config
+        # Every value arrives through env, never `${{ }}` inside the script: a variable is
+        # data, and must not be able to become shell syntax.
+        env:
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          EXPECT_VERSION: ${{ inputs.version }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_SERVICE: ${{ vars.GCP_SERVICE }}
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          GCP_RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
+          GCP_SECRET_SIGNING_KEY: ${{ vars.GCP_SECRET_SIGNING_KEY }}
+          GCP_SECRET_SIGNING_SECRET: ${{ vars.GCP_SECRET_SIGNING_SECRET }}
+          AIMART_NETWORK_MODE: ${{ vars.AIMART_NETWORK_MODE }}
+          AIMART_PAY_TO_EVM: ${{ vars.AIMART_PAY_TO_EVM }}
+          AIMART_PAY_TO_SVM: ${{ vars.AIMART_PAY_TO_SVM }}
+          AIMART_PUBLIC_BASE_URL: ${{ vars.AIMART_PUBLIC_BASE_URL }}
+          AIMART_ARTIFACT_MAX_TOTAL_BYTES: ${{ vars.AIMART_ARTIFACT_MAX_TOTAL_BYTES }}
+          AIMART_GCS_BUCKET: ${{ vars.AIMART_GCS_BUCKET }}
+          AIMART_FACILITATOR_URLS: ${{ vars.AIMART_FACILITATOR_URLS }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+
+          missing=()
+          for name in GCP_PROJECT_ID GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT \
+                      GCP_RUNTIME_SERVICE_ACCOUNT AIMART_PUBLIC_BASE_URL; do
+            [ -n "${!name:-}" ] || missing+=("$name")
+          done
+          [ -n "${AIMART_PAY_TO_EVM}${AIMART_PAY_TO_SVM}" ] || missing+=("AIMART_PAY_TO_EVM and/or AIMART_PAY_TO_SVM")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            fail "deploy is not configured; set these GitHub variables (deploy/README.md): ${missing[*]}"
+          fi
+
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "image_digest must be sha256:<64 hex>, got '${IMAGE_DIGEST}'"
+          if [ -n "$EXPECT_VERSION" ]; then
+            [[ "$EXPECT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$ ]] || fail "version must look like 1.2.3"
+          fi
+          mode="${AIMART_NETWORK_MODE:-testnet}"
+          case "$mode" in testnet | mainnet) ;; *) fail "AIMART_NETWORK_MODE must be testnet or mainnet" ;; esac
+          if [ -n "$AIMART_PAY_TO_EVM" ]; then
+            [[ "$AIMART_PAY_TO_EVM" =~ ^0x[0-9a-fA-F]{40}$ ]] || fail "AIMART_PAY_TO_EVM is not a 0x address"
+          fi
+          if [ -n "$AIMART_PAY_TO_SVM" ]; then
+            [[ "$AIMART_PAY_TO_SVM" =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}$ ]] || fail "AIMART_PAY_TO_SVM is not a base58 address"
+          fi
+          base="${AIMART_PUBLIC_BASE_URL%/}"
+          [[ "$base" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || fail "AIMART_PUBLIC_BASE_URL must be an https origin with no path"
+
+          # /tmp on Cloud Run is RAM inside the 2 GiB limit: artifacts either go to a bucket or
+          # get a small local budget. Never the 512 MiB default.
+          max_bytes="${AIMART_ARTIFACT_MAX_TOTAL_BYTES}"
+          if [ -z "$AIMART_GCS_BUCKET" ] && [ -z "$max_bytes" ]; then
+            max_bytes=268435456
+            echo "::notice::AIMART_ARTIFACT_MAX_TOTAL_BYTES unset and no bucket: using 268435456 (256 MiB of RAM-backed /tmp)"
+          fi
+          [ -z "$max_bytes" ] || [[ "$max_bytes" =~ ^[0-9]+$ ]] || fail "AIMART_ARTIFACT_MAX_TOTAL_BYTES must be an integer"
+
+          lines=(
+            "AIMART_NETWORK_MODE=${mode}"
+            "AIMART_PUBLIC_BASE_URL=${base}"
+            "AIMART_TRUST_FORWARDED_FOR=true" # Google's front end sets X-Forwarded-For
+          )
+          # Optional values are omitted when empty, never sent as "": an empty string is a
+          # value, and "configured as empty" is exactly the bug class AGENTS.md warns about.
+          [ -z "$AIMART_PAY_TO_EVM" ] || lines+=("AIMART_PAY_TO_EVM=${AIMART_PAY_TO_EVM}")
+          [ -z "$AIMART_PAY_TO_SVM" ] || lines+=("AIMART_PAY_TO_SVM=${AIMART_PAY_TO_SVM}")
+          [ -z "$max_bytes" ] || lines+=("AIMART_ARTIFACT_MAX_TOTAL_BYTES=${max_bytes}")
+          [ -z "$AIMART_GCS_BUCKET" ] || lines+=("AIMART_GCS_BUCKET=${AIMART_GCS_BUCKET}")
+          if [ -n "$AIMART_FACILITATOR_URLS" ]; then
+            # The action splits KEY=VALUE pairs on commas unless escaped.
+            lines+=("AIMART_FACILITATOR_URLS=${AIMART_FACILITATOR_URLS//,/\\,}")
+          fi
+          for line in "${lines[@]}"; do
+            [[ "$line" != *$'\n'* && "$line" != *'"'* ]] || fail "variable values must not contain newlines or quotes"
+          done
+
+          delim="EOF_$(openssl rand -hex 12)"
+          {
+            echo "env_vars<<${delim}"
+            printf '%s\n' "${lines[@]}"
+            echo "${delim}"
+            echo "public_url=${base}"
+            echo "region=${GCP_REGION:-us-central1}"
+            echo "service=${GCP_SERVICE:-aimart-parquet}"
+            echo "secret_signing_key=${GCP_SECRET_SIGNING_KEY:-aimart-signing-key-mldsa}"
+            echo "secret_signing_secret=${GCP_SECRET_SIGNING_SECRET:-aimart-signing-secret}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Environment for the new revision (all public values):"
+          printf '  %s\n' "${lines[@]}"
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Record the traffic split before deploying
+        id: before
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ steps.config.outputs.region }}
+          SERVICE: ${{ steps.config.outputs.service }}
+        run: |
+          set -euo pipefail
+          if gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" \
+              --format=json > "$RUNNER_TEMP/before.json" 2> "$RUNNER_TEMP/before.err"; then
+            # The whole split, e.g. "svc-00007-abc=100" (or "a=90,b=10"), so a rollback restores
+            # exactly what served before, even if that was itself a pinned rollback.
+            traffic="$(jq -r '[.status.traffic[]? | select((.percent // 0) > 0) | "\(.revisionName)=\(.percent)"] | join(",")' "$RUNNER_TEMP/before.json")"
+            echo "Serving before deploy: ${traffic:-<none>}"
+            echo "traffic=${traffic}" >> "$GITHUB_OUTPUT"
+          elif grep -q "Cannot find service" "$RUNNER_TEMP/before.err"; then
+            echo "::notice::first deploy of ${SERVICE}: there is no previous revision to roll back to"
+            echo "traffic=" >> "$GITHUB_OUTPUT"
+          else
+            cat "$RUNNER_TEMP/before.err"
+            echo "::error::could not read the current service; refusing to deploy without a rollback point"
+            exit 1
+          fi
+
+      - name: Deploy the new revision
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@2028e2d7d30a78c6910e0632e48dd561b064884d # v3.0.1
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          region: ${{ steps.config.outputs.region }}
+          service: ${{ steps.config.outputs.service }}
+          # By digest: the bytes that passed the release build, not whatever a tag points to now.
+          image: ${{ env.IMAGE }}@${{ inputs.image_digest }}
+          env_vars: ${{ steps.config.outputs.env_vars }}
+          env_vars_update_strategy: overwrite # the variables above are the whole truth
+          # Secret Manager references, resolved by Cloud Run at instance start. `latest` makes a
+          # rotation (new secret version) take effect on the next instance start.
+          secrets: |-
+            AIMART_SIGNING_KEY_MLDSA=${{ steps.config.outputs.secret_signing_key }}:latest
+            AIMART_SIGNING_SECRET=${{ steps.config.outputs.secret_signing_secret }}:latest
+          secrets_update_strategy: overwrite
+          # Request-based billing (--cpu-throttling): CPU is billed only while a request is in
+          # flight, which is what keeps an idle service inside the free tier. max-instances=1 is
+          # the cost ceiling's first line; the budget/spend cap is the second (deploy/README.md).
+          # concurrency=4 lets cheap 402s and reads interleave with the two heavy job slots
+          # (AIMART_MAX_CONCURRENT_JOBS=2 answers 503 beyond that, unsettled).
+          flags: >-
+            --service-account=${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
+            --allow-unauthenticated
+            --port=8080
+            --cpu=1
+            --memory=2Gi
+            --concurrency=4
+            --min-instances=0
+            --max-instances=1
+            --timeout=120
+            --cpu-boost
+            --cpu-throttling
+
+      - name: Send all traffic to the new revision
+        # A previous rollback pins traffic to a named revision, and pinned traffic does not move
+        # on deploy. Re-attach traffic to LATEST so each deploy is actually served.
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ steps.config.outputs.region }}
+          SERVICE: ${{ steps.config.outputs.service }}
+        run: gcloud run services update-traffic "$SERVICE" --to-latest --project "$PROJECT" --region "$REGION"
+
+      - name: Verify the serving revision runs this digest
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ steps.config.outputs.region }}
+          SERVICE: ${{ steps.config.outputs.service }}
+          WANT_IMAGE: ${{ env.IMAGE }}@${{ inputs.image_digest }}
+        run: |
+          set -euo pipefail
+          gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" \
+            --format=json > "$RUNNER_TEMP/after.json"
+          revision="$(jq -r '.status.latestReadyRevisionName' "$RUNNER_TEMP/after.json")"
+          image="$(jq -r '.spec.template.spec.containers[0].image' "$RUNNER_TEMP/after.json")"
+          serving="$(jq -r '[.status.traffic[]? | select((.percent // 0) > 0) | "\(.revisionName)=\(.percent)"] | join(",")' "$RUNNER_TEMP/after.json")"
+          echo "latest ready revision: $revision"
+          echo "image:                 $image"
+          echo "serving:               $serving"
+          [ "$image" = "$WANT_IMAGE" ] || { echo "::error::service template runs $image, expected $WANT_IMAGE"; exit 1; }
+          [ "$serving" = "${revision}=100" ] || { echo "::error::traffic is $serving, expected ${revision}=100"; exit 1; }
+          echo "revision=$revision" >> "$GITHUB_ENV"
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+          enable-cache: false
+      - name: Smoke test the live service (decode real 402s)
+        env:
+          URL: ${{ steps.config.outputs.public_url }}
+          EXPECT_VERSION: ${{ inputs.version }}
+          AIMART_NETWORK_MODE: ${{ vars.AIMART_NETWORK_MODE }}
+          AIMART_PAY_TO_EVM: ${{ vars.AIMART_PAY_TO_EVM }}
+          AIMART_PAY_TO_SVM: ${{ vars.AIMART_PAY_TO_SVM }}
+          AIMART_PUBLIC_BASE_URL: ${{ steps.config.outputs.public_url }}
+          SMOKE_SIGNING_KEY_SHA256: ${{ vars.SMOKE_SIGNING_KEY_SHA256 }}
+        run: |
+          set -euo pipefail
+          flags="$(deploy/smoke-flags.sh)" # a failure here stops the step (set -e)
+          args=()
+          while IFS= read -r flag; do args+=("$flag"); done <<< "$flags"
+          if [ -n "$EXPECT_VERSION" ]; then args+=(--expect-version "$EXPECT_VERSION"); fi
+          # --wait covers the cold start (scale-to-zero; the quantum stack imports on boot).
+          uv run --script scripts/smoke.py "$URL" "${args[@]}" --wait 180
+
+      - name: Roll back to the previous traffic split
+        if: >-
+          failure() && steps.before.outputs.traffic != '' &&
+          (steps.deploy.outcome == 'success' || steps.deploy.outcome == 'failure')
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ steps.config.outputs.region }}
+          SERVICE: ${{ steps.config.outputs.service }}
+          PREVIOUS: ${{ steps.before.outputs.traffic }}
+        run: |
+          set -euo pipefail
+          gcloud run services update-traffic "$SERVICE" --to-revisions="$PREVIOUS" \
+            --project "$PROJECT" --region "$REGION"
+          now="$(gcloud run services describe "$SERVICE" --project "$PROJECT" --region "$REGION" --format=json \
+            | jq -r '[.status.traffic[]? | select((.percent // 0) > 0) | "\(.revisionName)=\(.percent)"] | join(",")')"
+          echo "::error::deploy failed verification; traffic restored to ${now} (was ${PREVIOUS} before this run)"
+          # This job is already failing; the rollback succeeding must not make it look green.
+          exit 1
+      - name: No rollback point (first deploy)
+        if: failure() && steps.before.outcome == 'success' && steps.before.outputs.traffic == ''
+        run: echo "::error::the first deploy failed verification and there is no previous revision; fix forward or delete the service"
+
+      - name: Summary
+        if: success()
+        env:
+          URL: ${{ steps.config.outputs.public_url }}
+          WANT_IMAGE: ${{ env.IMAGE }}@${{ inputs.image_digest }}
+        run: |
+          {
+            echo "### Deployed"
+            echo "- URL: ${URL}"
+            echo "- Revision: \`${revision}\` (100% of traffic)"
+            echo "- Image: \`${WANT_IMAGE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

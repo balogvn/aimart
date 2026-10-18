@@ -50,10 +50,13 @@ def pricing(settings: Settings, networks: list[dict[str, str]]) -> dict[str, Any
             "GET /health",
             "GET /pricing",
             "GET /llms.txt",
-            "GET /.well-known/x402",
             "GET /openapi.json",
-            "MCP initialize/tools/list",
-            "GET /v1/artifacts/{id}/{filename} (signed)",
+            "GET /.well-known/x402",
+            "GET /.well-known/mcp/server-card.json",
+            "GET /.well-known/aimart-signing-key",
+            "POST /v1/verify",
+            "GET /v1/artifacts/{id}/{filename} (signed link)",
+            "MCP initialize, tools/list and the verify_provenance tool",
         ],
     }
 
