@@ -175,6 +175,27 @@ def _drop_null_rows(con: duckdb.DuckDBPyConnection, table: str) -> int:
     return (int(before[0]) if before else 0) - (int(after[0]) if after else 0)
 
 
+def _has_structure(con: duckdb.DuckDBPyConnection, table: str) -> bool:
+    """False when DuckDB found no records or no keys (it then emits one opaque ``json`` column).
+
+    Those inputs — ``[]``, ``[{}, {}]``, ``[1, 2, 3]`` — go to the Python path, which either
+    rejects them clearly or wraps scalars as ``{"value": ...}``. Accepting them here wrote a
+    junk ``json`` column and charged for it.
+    """
+    row = con.execute(f"SELECT count(*) FROM {table}").fetchone()
+    if not row or int(row[0]) == 0:
+        con.execute(f"DROP TABLE IF EXISTS {table}")
+        return False
+    rel = con.sql(f"SELECT * FROM {table}")
+    opaque = str(rel.types[0]).startswith(("JSON", "MAP(")) if rel.types else False
+    if (
+        len(rel.columns) == 1 and rel.columns[0] == "json" and opaque
+    ):  # [{}, {}] is MAP(VARCHAR, JSON)
+        con.execute(f"DROP TABLE IF EXISTS {table}")
+        return False
+    return True
+
+
 def _count_lines(path: Path) -> int:
     with path.open("rb") as fh:
         return sum(1 for line in fh if line.strip())
@@ -207,6 +228,8 @@ def read_json(
                 loaded = True
             except Exception:  # noqa: BLE001 - any DuckDB failure falls back to the Python path
                 con.execute(f"DROP TABLE IF EXISTS {table}")
+            if loaded:
+                loaded = _has_structure(con, table)
             if loaded and duck_fmt == "newline_delimited":
                 skipped = _drop_null_rows(con, table)
                 row = con.execute(f"SELECT count(*) FROM {table}").fetchone()
@@ -227,6 +250,8 @@ def read_json(
         del doc
         if not records:
             raise InvalidInput("The JSON contains no records.", hint="Send at least one record.")
+        if all(isinstance(r, dict) and not r for r in records):
+            raise InvalidInput("The JSON records have no fields.", hint="Send objects with keys.")
         ndjson = workdir / "records.ndjson"
         with ndjson.open("w", encoding="utf-8") as out:
             for rec in records:

@@ -50,7 +50,53 @@ def _detect(path: Path) -> str:
     best = from_bytes(sample).best()
     if best is None:
         return "cp1252"  # the most common non-UTF-8 export encoding; decoding never fails
-    return str(best.encoding)
+    guess = codecs.lookup(str(best.encoding)).name
+    if guess in _CONFUSABLE_WESTERN and _plausible_cp1252(sample):
+        # charset_normalizer picks cp437/cp1250 for short Western-European files, silently
+        # turning € into Ç and ñ into ń with zero replacement characters. cp1252 (Windows
+        # Excel's export encoding, a superset of Latin-1's printable range) is the far more
+        # likely truth when its decoding reads as Latin text. Cyrillic/CJK guesses are trusted.
+        return "cp1252"
+    return guess
+
+
+# Single-byte code pages statistically confusable with cp1252 on short samples.
+_CONFUSABLE_WESTERN = frozenset(
+    codecs.lookup(n).name
+    for n in (
+        "cp437",
+        "cp850",
+        "cp852",
+        "cp858",
+        "cp1250",
+        "cp1257",
+        "iso8859-2",
+        "iso8859-4",
+        "iso8859-13",
+        "iso8859-15",
+        "latin-1",
+        "mac-roman",
+        "mac-latin2",
+        "cp1254",
+        "iso8859-9",
+    )
+)
+_CP1252_TEXT = frozenset(
+    "ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ"
+    "€‚„…†‡‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ¡¢£¤¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿×÷\u00a0"
+)
+
+
+def _plausible_cp1252(sample: bytes) -> bool:
+    """Decodes as cp1252 (no undefined bytes) and its non-ASCII characters read as Latin text."""
+    try:
+        text = sample.decode("cp1252")
+    except UnicodeDecodeError:
+        return False  # 0x81, 0x8D, 0x8F, 0x90, 0x9D are undefined in cp1252
+    non_ascii = [ch for ch in text if ord(ch) > 127]
+    if not non_ascii:
+        return True
+    return sum(ch in _CP1252_TEXT for ch in non_ascii) / len(non_ascii) >= 0.95
 
 
 def _transcode(src: Path, dst: Path, encoding: str) -> int:

@@ -106,7 +106,9 @@ ignore = [
 max-line-length = 120  # the formatter wraps code at 100; this leaves room for long messages
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S", "PLR0915", "PLC0415", "FBT003", "E501"]
+"tests/**" = ["S", "PLR0915", "PLC0415", "FBT003", "E501", "RUF001"]  # fixtures use exotic characters on purpose
+# The cp1252 plausibility set is a list of non-ASCII Latin characters by design.
+"src/aimart_parquet/engine/text.py" = ["RUF001"]
 "src/aimart_parquet/cli.py" = ["PLC0415"]  # lazy imports keep `convert` from loading uvicorn
 # FastAPI and the MCP SDK read route/tool annotations at runtime: these imports must stay real.
 "src/aimart_parquet/api/app.py" = ["TC001", "TC002", "TC003", "PLR0915"]  # one factory wires every route

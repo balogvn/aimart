@@ -1,0 +1,15 @@
+# The build needs only: pyproject.toml, uv.lock, README.md, LICENSE, CHANGELOG.md and src/.
+# Allow-list rather than deny-list, so a new local file (a wallet, an .env, a 2 GB test
+# fixture) can never reach the build context or an image layer by accident.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!CHANGELOG.md
+!src/
+
+# Even inside src/: never caches or compiled files from the host.
+**/__pycache__
+**/*.py[cod]
+**/.DS_Store

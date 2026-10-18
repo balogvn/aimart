@@ -61,11 +61,9 @@ def _concat(chunks: list[pa.Array]) -> pa.ChunkedArray:
     """Join per-chunk arrays whose inferred types may differ (an all-null chunk is null-typed)."""
     types = {c.type for c in chunks if not pa.types.is_null(c.type)}
     if not types:
-        return (
-            pa.chunked_array(chunks, type=pa.string())
-            if chunks
-            else pa.chunked_array([], pa.string())
-        )
+        # A variable missing in every row (a skipped survey question) is an all-null text
+        # column, not a crash: null-typed chunks must be re-materialized as string nulls.
+        return pa.chunked_array([pa.nulls(len(c), pa.string()) for c in chunks], type=pa.string())
     if len(types) > 1:
         target: pa.DataType = pa.string()
     else:

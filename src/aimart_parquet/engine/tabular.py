@@ -15,8 +15,11 @@ import decimal
 import io
 import json
 import re
+import shutil
+import tempfile
 import threading
-from typing import TYPE_CHECKING, Any, Literal
+from pathlib import Path
+from typing import Any, Literal
 
 import duckdb
 import pyarrow as pa
@@ -28,11 +31,9 @@ from aimart_parquet.engine.inspect import type_name
 from aimart_parquet.engine.models import TabularResult
 from aimart_parquet.errors import InvalidInput, InvalidRequest, QueryFailed, QueryRejected, Timeout
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 OutputFormat = Literal["json", "markdown", "csv"]
 TABLE_NAME_PATTERN = r"^[a-z_][a-z0-9_]{0,62}$"
+_MAX_SAFE_INT = 2**53
 _PATH_IN_MESSAGE = re.compile(r'"/[^"]*"')
 
 
@@ -44,7 +45,13 @@ def _cell(value: Any, max_chars: int) -> Any:
     if isinstance(value, dt.timedelta):
         return str(value)
     if isinstance(value, decimal.Decimal):
-        return str(value)
+        # sum() over BIGINT is HUGEINT -> decimal128(38, 0): agents expect a JSON number.
+        if value == value.to_integral_value():
+            as_int = int(value)
+            return (
+                as_int if abs(as_int) <= _MAX_SAFE_INT else str(value)
+            )  # beyond 2^53 JS loses digits
+        return float(value)
     if isinstance(value, bytes):
         return value.hex()[:max_chars]
     if isinstance(value, (list, tuple)):
@@ -173,7 +180,12 @@ def query(
     threads: int,
 ) -> TabularResult:
     text = validate_select(sql)
-    con = connect(memory_limit=memory_limit, threads=threads)  # no allowed dirs: zero file access
+    # A private, throwaway spill directory: big sorts and joins can spill instead of failing,
+    # and the only path current_setting() can reveal is this random temp dir, not the server's.
+    spill = Path(tempfile.mkdtemp(prefix="aimart-q-"))
+    con = connect(
+        memory_limit=memory_limit, threads=threads, temp_dir=spill
+    )  # no other file access
     timer = threading.Timer(query_timeout, con.interrupt)
     try:
         for name, path in tables.items():
@@ -204,5 +216,6 @@ def query(
     finally:
         timer.cancel()
         con.close()
+        shutil.rmtree(spill, ignore_errors=True)
     truncated = table.num_rows > limit
     return render(table.slice(0, limit), fmt=fmt, truncated=truncated, max_chars=max_chars)

@@ -50,6 +50,10 @@ def connect(
     if temp_dir is not None:
         con.execute(f"SET temp_directory = {literal(str(temp_dir))}")
         con.execute("SET max_temp_directory_size = '2GB'")
+    else:
+        # No spill directory at all. DuckDB's default is <cwd>/.tmp/, which it also adds to
+        # allowed_directories — readable via current_setting(), leaking the server's path.
+        con.execute("SET temp_directory = ''")
     dirs = [str(d.resolve()) for d in allowed_dirs]
     if dirs:
         con.execute(f"SET allowed_directories = [{', '.join(literal(d) for d in dirs)}]")
