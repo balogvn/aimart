@@ -48,9 +48,8 @@ from aimart_parquet.engine.models import ConvertOptions, ConvertResult, InspectR
 from aimart_parquet.errors import AimartError, ArtifactNotFound, InputTooLarge, InvalidRequest
 from aimart_parquet.logs import configure as configure_logging
 from aimart_parquet.mcp.server import build_mcp
-from aimart_parquet.payments.pricing import BY_KEY
+from aimart_parquet.payments.pricing import BY_KEY, quantum_enabled
 from aimart_parquet.provenance import Signer
-from aimart_parquet.quantum import available as quantum_available
 from aimart_parquet.quantum.models import PortfolioResult, QuantumCompressResult
 from aimart_parquet.service import Service, SourceRef
 
@@ -307,7 +306,7 @@ def create_app(
             {"data": body.source()}, body.sql, limit=body.limit, fmt=body.format
         )
 
-    if quantum_available():  # keep in step with pricing.active_operations()
+    if quantum_enabled(settings):  # keep in step with pricing.active_operations()
 
         @app.post(
             "/v1/quantum/compress",

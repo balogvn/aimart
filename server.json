@@ -48,16 +48,14 @@
           "mainnet": ["eip155:8453", "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"]
         },
         "prices": {
-          "convert_to_parquet": "$0.01",
+          "convert_to_parquet": "$0.02",
           "inspect_parquet": "$0.002",
           "preview_parquet": "$0.002",
           "query_parquet": "$0.005",
-          "quantum_compress_features": "$0.50",
-          "quantum_optimize_portfolio": "$1.00",
           "verify_provenance": "free"
         },
         "free": ["initialize", "tools/list", "verify_provenance", "local stdio mode (uvx aimart-parquet mcp)"],
-        "notes": "Quantum tools run on a circuit simulator and always return a classical baseline. Hosted artifacts are signed with ML-DSA-65 (FIPS 204)."
+        "notes": "Hosted artifacts are signed with ML-DSA-65 (FIPS 204). Optional quantum tools (simulator-based, always with a classical baseline) are off unless an operator enables them."
       }
     }
   }

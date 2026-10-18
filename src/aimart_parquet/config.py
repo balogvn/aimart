@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     # Floors are set by facilitator economics, not taste: Dexter rejects payments under about
     # $0.0013 on Solana mainnet, and fee-charging facilitators cost $0.001-0.002 per settlement.
     # Below $0.002 a call can be unsettleable or settle at a loss. Compare fee to margin.
-    price_convert: str = "$0.01"
+    price_convert: str = "$0.02"  # buyer panel: every persona would pay $0.03-$0.10
     price_inspect: str = "$0.002"
     price_preview: str = "$0.002"
     price_query: str = "$0.005"
@@ -121,6 +121,13 @@ class Settings(BaseSettings):
     )
 
     # ---------------------------------------------------------------- quantum + provenance
+    enable_quantum: bool = Field(
+        default=False,
+        description=(
+            "Serve the premium quantum tools (needs the quantum extra). Off by default: a buyer "
+            "panel valued them at $0 and said they made the core product look like hype."
+        ),
+    )
     quantum_timeout_s: float = 90.0
     signing_key_mldsa: SecretStr | None = Field(
         default=None,

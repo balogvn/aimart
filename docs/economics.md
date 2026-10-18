@@ -27,6 +27,7 @@ Dexter on mainnet: both are free and keyless.
 | **$0.002** | −$0.0002 to +$0.0005 net | +$0.001 net | +$0.002 net | **the floor**: clears every minimum, and is profitable on free and CDP routes |
 | $0.005 | +$0.0028 to +$0.0035 | +$0.004 | +$0.005 | comfortable |
 | $0.01 | +$0.0078 to +$0.0085 | +$0.009 | +$0.01 | comfortable |
+| **$0.02** | +$0.0178 to +$0.0185 | +$0.019 | +$0.02 | **convert's price**: raised from $0.01 after a buyer panel put every persona's maximum at $0.03–$0.10 |
 
 `inspect` and `preview` sit at the floor. `Payments._check_price_floors` logs an error at
 startup for any configured price below a facilitator's published `minPaymentAmountAtomic`.

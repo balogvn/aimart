@@ -24,6 +24,7 @@ from aimart_parquet import __version__
 from aimart_parquet.api import app as app_module
 from aimart_parquet.api.app import _transport_security, create_app
 from aimart_parquet.api.middleware import BodyLimitMiddleware, RateLimitMiddleware, client_ip
+from aimart_parquet.config import Settings
 from aimart_parquet.payments.pricing import BY_KEY, active_operations
 
 if TYPE_CHECKING:
@@ -32,7 +33,6 @@ if TYPE_CHECKING:
 
     from starlette.types import Receive, Scope, Send
 
-    from aimart_parquet.config import Settings
 
 pytestmark = pytest.mark.anyio
 
@@ -731,3 +731,20 @@ async def test_converted_parquet_is_typed(free_app: kit.AppHarness, tmp_path: Pa
     table = pq.read_table(out)
     assert table.column_names == ["region", "units"]
     assert str(table.schema.field("units").type).startswith("int")
+
+
+async def test_quantum_off_by_default(make_settings: Callable[..., Settings]) -> None:
+    """The real default: quantum tools are neither served, listed, priced nor advertised."""
+    settings = make_settings(enable_quantum=False)
+    assert Settings(_env_file=None).enable_quantum is False
+    async with kit.running_app(settings, paid=False) as h:
+        spec = (await h.http.get("/openapi.json")).json()
+        assert not any("quantum" in path for path in spec["paths"])
+        assert "quantum" not in (await h.http.get("/llms.txt")).text
+        pricing = (await h.http.get("/pricing")).json()
+        assert not any("quantum" in op["operation"] for op in pricing["operations"])
+        r = await h.http.post("/v1/quantum/portfolio", json={"artifact_id": "x" * 24})
+        assert r.status_code in {404, 405}
+        async with kit.mcp_over_http(h.app) as client:
+            names = {t.name for t in (await client.list_tools()).tools}
+    assert not any(n.startswith("quantum_") for n in names)

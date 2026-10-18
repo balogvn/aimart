@@ -23,9 +23,9 @@ DESCRIPTION = (
 )
 
 
-def _tools() -> list[str]:
+def _tools(settings: Settings) -> list[str]:
     """MCP tool names, from the same table that prices them."""
-    return list(dict.fromkeys(op.tool for op in active_operations()))
+    return list(dict.fromkeys(op.tool for op in active_operations(settings)))
 
 
 def pricing(settings: Settings, networks: list[dict[str, str]]) -> dict[str, Any]:
@@ -43,7 +43,7 @@ def pricing(settings: Settings, networks: list[dict[str, str]]) -> dict[str, Any
                 "price": op.price(settings),
                 "summary": op.summary,
             }
-            for op in active_operations()
+            for op in active_operations(settings)
         ],
         "free": [
             "GET /",
@@ -90,7 +90,7 @@ def llms_txt(settings: Settings) -> str:
         "",
         "## Use it",
         "",
-        f"- [MCP server (Streamable HTTP)]({base}/mcp): tools {', '.join(_tools())}",
+        f"- [MCP server (Streamable HTTP)]({base}/mcp): tools {', '.join(_tools(settings))}",
         f"- [OpenAPI]({base}/openapi.json): REST endpoints under /v1",
         f"- [Pricing]({base}/pricing): per-call prices in USDC",
         f"- [x402 discovery]({base}/.well-known/x402): payable resources",
@@ -98,7 +98,9 @@ def llms_txt(settings: Settings) -> str:
         "## Operations",
         "",
     ]
-    lines += [f"- `{op.route}` ({op.price(settings)}): {op.summary}" for op in active_operations()]
+    lines += [
+        f"- `{op.route}` ({op.price(settings)}): {op.summary}" for op in active_operations(settings)
+    ]
     lines += [
         "",
         "## Notes",
@@ -132,7 +134,7 @@ def mcp_server_card(settings: Settings) -> dict[str, Any]:
         },
         "tools": [
             {"name": op.tool, "description": op.summary, "price": op.price(settings)}
-            for op in active_operations()
+            for op in active_operations(settings)
             if op.key != "convert_upload"
         ],
     }

@@ -36,7 +36,7 @@ CSV = b"region,units,price\nNorth,10,1.5\nSouth,20,2.5\nEast,30,3.25\n"
 UNKNOWN_ARTIFACT = "Zz" * 12
 PAID_TOOLS = list(dict.fromkeys(op.tool for op in active_operations()))
 TOOL_ATOMIC = {
-    "convert_to_parquet": "10000",
+    "convert_to_parquet": "20000",
     "inspect_parquet": "2000",
     "preview_parquet": "2000",
     "query_parquet": "5000",
@@ -44,7 +44,7 @@ TOOL_ATOMIC = {
     "quantum_optimize_portfolio": "1000000",
 }
 TOOL_PRICE = {
-    "convert_to_parquet": "$0.01",
+    "convert_to_parquet": "$0.02",
     "inspect_parquet": "$0.002",
     "preview_parquet": "$0.002",
     "query_parquet": "$0.005",
@@ -244,7 +244,7 @@ async def test_paid_tool_call_returns_the_result_and_the_settlement(
     assert query.structured_content["rows"] == [[60]]
     assert query.meta["x402/payment-response"]["success"] is True
 
-    assert [req.amount for _, req in facilitator.settled] == ["10000", "5000"]
+    assert [req.amount for _, req in facilitator.settled] == ["20000", "5000"]
     assert [req.pay_to for _, req in facilitator.settled] == [kit.PAY_TO_EVM] * 2
     assert len(facilitator.verified) == 2
 
@@ -389,7 +389,7 @@ async def test_settlement_failure_withholds_the_tool_output(
     assert body["error"] == f"Payment settlement failed: {reason}"
     assert body["x402/payment-response"]["success"] is False
     assert body["x402/payment-response"]["network"] == kit.BASE_SEPOLIA
-    assert body["accepts"][0]["amount"] == "10000"
+    assert body["accepts"][0]["amount"] == "20000"
     assert "artifact" not in body
     assert "report" not in body
     assert all(c.type == "text" for c in result.content)  # no download link leaks either

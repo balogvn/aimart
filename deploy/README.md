@@ -266,7 +266,7 @@ Run pricing page before relying on them.
 - **A paid call is two HTTP requests** (the unpaid 402, then the paid retry).
 - **A typical `convert`** (about 1.5 s on 1 vCPU, 2 GiB) uses 1.5 vCPU-s and 3 GiB-s: the free
   tier covers roughly 120,000 of them a month. Beyond it, one costs about $0.00004, under 0.5% of
-  its $0.01 price. A quantum call of a minute costs about $0.002 against $0.50-1.00. Concurrent
+  its $0.02 price. A quantum call of a minute costs about $0.002 against $0.50-1.00. Concurrent
   requests share instance time, so these are upper bounds.
 - **Worst case is a flood, not a heavy customer.** Every request is billed, including the cheap
   402s an attacker can generate, and egress beyond the small free allowance is billed too. With

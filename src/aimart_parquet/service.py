@@ -331,14 +331,18 @@ class Service:
             shutil.rmtree(workdir, ignore_errors=True)
 
     # ------------------------------------------------------------------ premium quantum tier
-    @staticmethod
-    def _require_quantum() -> None:
+    def _require_quantum(self) -> None:
         from aimart_parquet import quantum
 
         if not quantum.available():
             raise QuantumUnavailable(
                 "The quantum tier is not installed on this server.",
                 hint="Install the `quantum` extra (pip install 'aimart-parquet[quantum]').",
+            )
+        if not self.settings.enable_quantum:
+            raise QuantumUnavailable(
+                "The quantum tier is not enabled on this server.",
+                hint="Set AIMART_ENABLE_QUANTUM=true to serve it.",
             )
 
     async def quantum_compress(

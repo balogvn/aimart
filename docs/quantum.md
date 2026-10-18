@@ -1,5 +1,8 @@
 # The premium quantum tier
 
+> **Off by default.** Deployments serve these tools only with `AIMART_ENABLE_QUANTUM=true`. A skeptical buyer panel of AI agents (enterprise analyst, researcher, coding agent, trader) valued them at $0 and said they distract from the core product.
+
+
 > **Read this first.** Both premium tools run quantum circuits on a **simulator** (PennyLane
 > on an ordinary CPU), not on quantum hardware. At the sizes a web request can simulate, a
 > simulator gives **no speed or accuracy advantage** over classical methods, and we do not

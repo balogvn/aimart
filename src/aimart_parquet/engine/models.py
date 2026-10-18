@@ -162,7 +162,10 @@ class ConversionReport(BaseModel):
         description="Rough LLM tokens to read the input as text (bytes / 4)."
     )
     estimated_tokens_schema: int = Field(
-        description="Rough LLM tokens to read this schema summary instead."
+        description=(
+            "Rough LLM tokens for a name/type/null-count digest of the output schema (bytes / 4). "
+            "The full report you are reading is larger."
+        )
     )
 
 

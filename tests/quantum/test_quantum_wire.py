@@ -67,6 +67,7 @@ def _app(tmp_path: Path, seed: str) -> tuple[FastAPI, FakeFacilitator, Settings]
         log_level="WARNING",
         signing_key_mldsa=seed,
         isolate_jobs=False,
+        enable_quantum=True,
     )
     fake = FakeFacilitator()
     return create_app(settings, payments=Payments(settings, [fake])), fake, settings

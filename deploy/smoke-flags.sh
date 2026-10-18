@@ -53,9 +53,9 @@ fi
 if [ -n "${SMOKE_SIGNING_KEY_SHA256:-}" ]; then
   printf '%s\n' --expect-signing-key-sha256 "$SMOKE_SIGNING_KEY_SHA256"
 fi
-# Production always ships the quantum extra and a persistent signing key: their absence is a
-# broken deploy, not a smaller one.
-printf '%s\n' \
-  --require-operation quantum_compress \
-  --require-operation quantum_portfolio \
-  --require-provenance
+# A persistent signing key is mandatory in production: its absence is a broken deploy. The quantum
+# tools are off by default (AIMART_ENABLE_QUANTUM); when they are switched on, they must be live.
+if [ "${AIMART_ENABLE_QUANTUM:-false}" = "true" ]; then
+  printf '%s\n' --require-operation quantum_compress --require-operation quantum_portfolio
+fi
+printf '%s\n' --require-provenance

@@ -57,7 +57,7 @@ class X402McpGate(Extension):
 
     def settings(self) -> dict[str, Any]:
         prices: dict[str, str] = {}
-        for op in active_operations():
+        for op in active_operations(self.payments.settings):
             prices.setdefault(op.tool, op.price(self.payments.settings))
         return {
             "x402Version": 2,

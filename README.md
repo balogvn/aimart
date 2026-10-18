@@ -82,7 +82,7 @@ curl -s -D - -o /dev/null -X POST "$URL/v1/convert" \
 }
 ```
 
-`amount` is in USDC atomic units (6 decimals): `10000` is $0.01. `curl` cannot sign. An x402
+`amount` is in USDC atomic units (6 decimals): `20000` is $0.02. `curl` cannot sign. An x402
 client signs the quote with your wallet and retries with a `PAYMENT-SIGNATURE` header. The
 settlement comes back in `PAYMENT-RESPONSE`. With the x402 Python SDK
 (`pip install "x402[evm,httpx]"`):
@@ -154,7 +154,7 @@ and no network. After the PyPI release:
 ```bash
 claude mcp add aimart-local -- uvx aimart-parquet mcp
 # with the quantum tools:
-claude mcp add aimart-local -- uvx --from 'aimart-parquet[quantum]' aimart-parquet mcp
+claude mcp add aimart-local -e AIMART_ENABLE_QUANTUM=true -- uvx --from 'aimart-parquet[quantum]' aimart-parquet mcp
 ```
 
 ```json
@@ -178,12 +178,12 @@ deployment can override each price with `AIMART_PRICE_*`. Its live list is at `G
 
 | operation | REST | MCP tool | price |
 |---|---|---|---:|
-| convert | `POST /v1/convert`, `POST /v1/convert/upload` (multipart) | `convert_to_parquet` | $0.01 |
+| convert | `POST /v1/convert`, `POST /v1/convert/upload` (multipart) | `convert_to_parquet` | $0.02 |
 | inspect (footer only) | `POST /v1/inspect` | `inspect_parquet` | $0.002 |
 | preview | `POST /v1/preview` | `preview_parquet` | $0.002 |
 | query (one read-only SELECT) | `POST /v1/query` | `query_parquet` | $0.005 |
-| premium: quantum-kernel PCA | `POST /v1/quantum/compress` | `quantum_compress_features` | $0.50 |
-| premium: QAOA portfolio | `POST /v1/quantum/portfolio` | `quantum_optimize_portfolio` | $1.00 |
+| premium (off by default): quantum-kernel PCA | `POST /v1/quantum/compress` | `quantum_compress_features` | $0.50 |
+| premium (off by default): QAOA portfolio | `POST /v1/quantum/portfolio` | `quantum_optimize_portfolio` | $1.00 |
 
 **Free:** `GET /`, `/health`, `/pricing`, `/llms.txt`, `/openapi.json`, `/docs`,
 `/.well-known/x402`, `/.well-known/mcp/server-card.json`, `/.well-known/aimart-signing-key`,
@@ -218,6 +218,10 @@ conversion into a validation step. The full option list is in the `ConvertOption
 (`/openapi.json`, or the tool's input schema).
 
 ## Premium quantum tier
+
+**Off by default.** A deployment serves these tools only with `AIMART_ENABLE_QUANTUM=true` (and
+the `quantum` extra installed). A skeptical buyer panel of AI agents valued them at $0 and said
+they distract from the core product, so the hosted service leads with conversion.
 
 > **Honesty first.** Both premium tools run on a quantum circuit **simulator** (PennyLane),
 > not on quantum hardware. At these sizes a simulator gives **no speed or accuracy advantage**

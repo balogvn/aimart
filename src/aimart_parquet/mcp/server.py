@@ -25,7 +25,7 @@ from aimart_parquet import __version__
 from aimart_parquet.config import Settings
 from aimart_parquet.engine.models import ConvertOptions, ConvertResult, InspectResult, TabularResult
 from aimart_parquet.errors import AimartError
-from aimart_parquet.quantum import available as quantum_available
+from aimart_parquet.payments.pricing import quantum_enabled
 from aimart_parquet.quantum.models import (
     PortfolioOptions,
     PortfolioResult,
@@ -364,7 +364,7 @@ GROUP BY 1 ORDER BY 2 DESC. {note(settings.price_query)}"""
         ) -> Annotated[CallToolResult, TabularResult]:
             return await _query(SourceRef(artifact_id=artifact_id, url=url), sql, limit, format)
 
-    if quantum_available():  # keep in step with pricing.active_operations()
+    if quantum_enabled(settings):  # keep in step with pricing.active_operations()
         _register_quantum_tools(server, service, settings, local_mode=local_mode)
     if not local_mode and service.signer is not None:
         _register_verify_tool(server, service)

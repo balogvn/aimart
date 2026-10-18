@@ -94,15 +94,22 @@ OPERATIONS: tuple[Operation, ...] = (
 )
 
 
-def active_operations() -> tuple[Operation, ...]:
-    """Operations this installation can actually serve — what we advertise and charge for.
-
-    Advertising a premium tool whose extra is not installed would take a verification, fail
-    the call, and teach agents that the listing lies.
-    """
+def quantum_enabled(settings: Settings | None) -> bool:
+    """Installed, and (when settings are given) switched on for this deployment."""
     from aimart_parquet import quantum  # noqa: PLC0415 - keeps pricing import-light
 
-    has_quantum = quantum.available()
+    return quantum.available() and (settings is None or settings.enable_quantum)
+
+
+def active_operations(settings: Settings | None = None) -> tuple[Operation, ...]:
+    """Operations to advertise and charge for.
+
+    Pass the deployment's settings to get what it serves. Without settings: every operation
+    this installation COULD serve (optional extras installed) — used by tests and tooling.
+    Advertising a tool the deployment does not serve would take a verification, fail the call,
+    and teach agents that the listing lies.
+    """
+    has_quantum = quantum_enabled(settings)
     return tuple(op for op in OPERATIONS if op.requires != "quantum" or has_quantum)
 
 

@@ -28,8 +28,10 @@ This order is what guarantees that no caller pays for an error and no work is gi
 - **MCP:** `payments/mcp_gate.py` verifies, calls the tool, and settles only if the tool
   result has `isError=false`. Every tool wraps its work in `_guard`, which turns any
   `AimartError` into an `isError` result.
-- Prices are strings such as `"$0.01"`. They are converted to integer atomic units by
-  `pricing.usd_to_atomic` (USDC has 6 decimals, so `"$0.01"` becomes `10000`). Floats never
+- Prices are strings such as `"$0.02"`. The x402 SDK turns them into integer atomic units on
+  the wire (USDC has 6 decimals, so `"$0.02"` becomes `20000`); `pricing.usd_to_atomic` is an
+  independent exact re-implementation used for the facilitator price-floor check and as the
+  tests' oracle, and the wire tests pin both against hand-written amounts. Floats never
   touch money.
 
 ## REST flow (real header names)

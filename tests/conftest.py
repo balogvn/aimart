@@ -58,6 +58,8 @@ def make_settings(tmp_path: Path) -> Callable[..., Settings]:
         values: dict[str, Any] = {
             "artifact_dir": tmp_path / "artifacts",
             "isolate_jobs": False,
+            # The full surface by default; test_quantum_off_by_default covers the real default.
+            "enable_quantum": True,
             "log_json": False,
             "public_base_url": kit.BASE_URL,
             "pay_to_evm": kit.PAY_TO_EVM,

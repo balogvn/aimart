@@ -18,7 +18,7 @@ def test_safe_defaults_without_any_environment() -> None:
     assert s.pay_to_svm is None
     assert s.signing_key_mldsa is None
     assert (s.price_convert, s.price_inspect, s.price_preview, s.price_query) == (
-        "$0.01",
+        "$0.02",
         "$0.002",
         "$0.002",
         "$0.005",

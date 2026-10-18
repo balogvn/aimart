@@ -249,10 +249,12 @@ jobs:
             --env AIMART_PAY_TO_EVM="$PAY_TO" \
             --env AIMART_PUBLIC_BASE_URL="$BASE_URL" \
             --env AIMART_SIGNING_KEY_MLDSA \
+            --env AIMART_ENABLE_QUANTUM=true \
             "$IMAGE"
       - name: Smoke test (decode the live 402s)
         # The first paid probe makes the server contact https://x402.org/facilitator, so this
-        # also proves the image can reach its facilitator.
+        # also proves the image can reach its facilitator. Quantum is switched on here (off by
+        # default in production) so the image's quantum stack is exercised on every change.
         run: |
           uv run --script scripts/smoke.py "$BASE_URL" \
             --expect-pay-to "$PAY_TO" \

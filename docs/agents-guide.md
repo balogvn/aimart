@@ -131,7 +131,7 @@ It:
 It registers a signer only for Base Sepolia, refuses quotes above `--max-usd`, and refuses
 `--network mainnet` unless `AIMART_MAINNET_CONFIRM=I_UNDERSTAND_THIS_SPENDS_REAL_USDC` is set.
 The flows were tested against the real app in-process, with a fake facilitator in place of
-the chain: it settled $0.01 + $0.002 + $0.005, the cap refused a $0.01 quote, and the signature
+the chain: it settled $0.02 + $0.002 + $0.005, the cap refused a $0.02 quote, and the signature
 verified.
 
 The MCP part, in short:

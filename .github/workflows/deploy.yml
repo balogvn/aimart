@@ -85,6 +85,7 @@ jobs:
           AIMART_ARTIFACT_MAX_TOTAL_BYTES: ${{ vars.AIMART_ARTIFACT_MAX_TOTAL_BYTES }}
           AIMART_GCS_BUCKET: ${{ vars.AIMART_GCS_BUCKET }}
           AIMART_FACILITATOR_URLS: ${{ vars.AIMART_FACILITATOR_URLS }}
+          AIMART_ENABLE_QUANTUM: ${{ vars.AIMART_ENABLE_QUANTUM }}
         run: |
           set -euo pipefail
           fail() { echo "::error::$*"; exit 1; }
@@ -134,6 +135,11 @@ jobs:
           [ -z "$AIMART_PAY_TO_SVM" ] || lines+=("AIMART_PAY_TO_SVM=${AIMART_PAY_TO_SVM}")
           [ -z "$max_bytes" ] || lines+=("AIMART_ARTIFACT_MAX_TOTAL_BYTES=${max_bytes}")
           [ -z "$AIMART_GCS_BUCKET" ] || lines+=("AIMART_GCS_BUCKET=${AIMART_GCS_BUCKET}")
+          case "$AIMART_ENABLE_QUANTUM" in
+            "") ;;  # off by default
+            true|false) lines+=("AIMART_ENABLE_QUANTUM=${AIMART_ENABLE_QUANTUM}") ;;
+            *) fail "AIMART_ENABLE_QUANTUM must be true or false, got '${AIMART_ENABLE_QUANTUM}'" ;;
+          esac
           if [ -n "$AIMART_FACILITATOR_URLS" ]; then
             # The action splits KEY=VALUE pairs on commas unless escaped.
             lines+=("AIMART_FACILITATOR_URLS=${AIMART_FACILITATOR_URLS//,/\\,}")
@@ -266,6 +272,7 @@ jobs:
           AIMART_PAY_TO_SVM: ${{ vars.AIMART_PAY_TO_SVM }}
           AIMART_PUBLIC_BASE_URL: ${{ steps.config.outputs.public_url }}
           SMOKE_SIGNING_KEY_SHA256: ${{ vars.SMOKE_SIGNING_KEY_SHA256 }}
+          AIMART_ENABLE_QUANTUM: ${{ vars.AIMART_ENABLE_QUANTUM }}
         run: |
           set -euo pipefail
           flags="$(deploy/smoke-flags.sh)" # a failure here stops the step (set -e)

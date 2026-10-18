@@ -31,8 +31,8 @@ pytestmark = pytest.mark.anyio
 
 # Default prices in USDC atomic units (6 decimals), written out by hand.
 DEFAULT_ATOMIC = {
-    "convert": "10000",
-    "convert_upload": "10000",
+    "convert": "20000",
+    "convert_upload": "20000",
     "inspect": "2000",
     "preview": "2000",
     "query": "5000",
@@ -208,7 +208,7 @@ async def test_mainnet_mode_quotes_base_mainnet_usdc(
         [accept] = kit.payment_required(r)["accepts"]
     assert accept["network"] == kit.BASE_MAINNET
     assert accept["asset"] == kit.USDC_BASE_MAINNET
-    assert accept["amount"] == "10000"
+    assert accept["amount"] == "20000"
 
 
 # ------------------------------------------------------------------------------ paid -> 200
@@ -328,7 +328,7 @@ async def test_settlement_failure_returns_402_and_withholds_the_result(
     assert "report" not in r.text
     assert "download_url" not in r.text
     assert len(facilitator.settled) >= 1
-    assert all(req.amount == "10000" for _, req in facilitator.settled)
+    assert all(req.amount == "20000" for _, req in facilitator.settled)
 
 
 async def test_settlement_exception_returns_402_and_withholds_the_result(

@@ -1,6 +1,6 @@
 # Spec: premium quantum tier
 
-Status: implementing (2026-10-17). Source: the 13 Oct 2026 product discussion, which proposed a
+Status: implemented (2026-10-17); **off by default** since 2026-10-18 (`AIMART_ENABLE_QUANTUM=true` to serve it) after a buyer panel of AI agents valued it at $0. Source: the 13 Oct 2026 product discussion, which proposed a
 PennyLane-powered premium tier priced at $0.50–$2.00 per call, sitting *behind* the Parquet
 conversion (quantum computing does not help the conversion itself).
 
@@ -9,8 +9,8 @@ conversion (quantum computing does not help the conversion itself).
 At the sizes a request handler can simulate (≤ ~16 qubits), simulated quantum circuits offer
 **no computational advantage** over classical methods. So every quantum result:
 
-1. Says it ran on a quantum **simulator** (PennyLane `lightning.qubit` by default), and names
-   the device in the result.
+1. Says it ran on a quantum **simulator** and names the device in the result: `default.qubit`
+   (vectorized state vectors) for the kernel, `lightning.qubit` (C++, adjoint gradients) for QAOA.
 2. Ships with an **exact or standard classical baseline** computed in the same call, plus the
    comparison metric (explained variance; approximation ratio). The agent always receives a
    verified answer, whichever method wins.
@@ -34,6 +34,8 @@ Input (`QuantumCompressRequest`):
 | `components` | int 1..8 | 3 | output dimensions |
 | `max_qubits` | int 2..12 | 8 | features above this are pre-reduced with classical PCA (reported) |
 | `landmarks` | int 16..1024 | 256 | rows sampled to fit the kernel (Nyström-style) |
+| `max_rows` | int 1..200000 | 100000 | rows projected (first N after dropping nulls) |
+| `bandwidth` | float 0.01..1 \| null | auto | angle scale; auto targets a median kernel ≈ 0.75 to avoid kernel concentration |
 | `seed` | int | 0 | sampling reproducibility |
 
 Method: standardize features, scale to [0, π], embed each row with PennyLane `IQPEmbedding`
@@ -43,20 +45,23 @@ the landmarks, and project every row (in chunks) onto the top `components`.
 
 Output (`QuantumCompressResult`): a new Parquet artifact with `keep_columns`, `qpc_1..k`
 (quantum kernel components) and `pc_1..k` (classical PCA baseline); `quantum_explained_variance`
-and `classical_explained_variance` (per component); `method` (feature_map, qubits, device,
-landmarks, rows, features_in, pre_reduction); `duration_ms`; `notes` (honest caveats).
+(kernel space) and `classical_explained_variance` (input space) — not comparable to each other —
+plus the comparable `neighbor_preservation_quantum` / `neighbor_preservation_classical` (share of
+each sampled row's 10 nearest neighbours kept); `method` (feature_map, qubits, device, landmarks,
+rows, features_in, pre_reduction, bandwidth, median_kernel); `duration_ms`; `notes`.
 
 ## 2. `quantum_optimize_portfolio` — $1.00
 
 QAOA portfolio selection. REST: `POST /v1/quantum/portfolio`. MCP tool: `quantum_optimize_portfolio`.
 
-Input (`PortfolioRequest`): `artifact_id`/`url`; `assets` (≤ 16 numeric columns, default all
+Input (`PortfolioRequest`): `artifact_id`/`url`; `assets` (≤ 14 numeric columns, default all
 numeric non-date columns); `data_kind` `"prices"|"returns"` (default prices: simple returns are
 computed); `budget` k (default ⌈n/2⌉); `risk_aversion` q ≥ 0 (default 0.5); `layers` p 1..4
 (default 2); `steps` 10..200 (default 60); `seed`.
 
 Method: μ, Σ from returns; minimize `q·xᵀΣx − μᵀx` over binary x with `Σx = k`, encoded as an
-Ising cost Hamiltonian with a penalty; QAOA with p layers on `lightning.qubit`, Adam-optimized;
+Ising cost Hamiltonian; QAOA from the uniform superposition over valid selections with a
+Hamming-weight-preserving XY mixer (no penalty term), p layers on `lightning.qubit`, Adam-optimized;
 read the state's bitstring distribution; choose the best feasible bitstring among the most
 probable. Classical reference: exhaustive search over all C(n, k) selections (exact).
 
@@ -82,8 +87,8 @@ ephemeral per-boot key with a loud warning (verification breaks across restarts)
 
 ## Settings
 
-`price_quantum_compress="$0.50"`, `price_quantum_portfolio="$1.00"`,
-`quantum_device="lightning.qubit"`, `quantum_timeout_s=90`, `signing_key_mldsa` (secret),
+`enable_quantum=False`, `price_quantum_compress="$0.50"`, `price_quantum_portfolio="$1.00"`,
+`quantum_timeout_s=90`, `signing_key_mldsa` (secret),
 `hosted_url` (local-mode upsell hint). Quantum tools register only if the `quantum` extra is
 installed. They run in the isolated worker process like other heavy jobs.
 
