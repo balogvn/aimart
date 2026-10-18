@@ -5,6 +5,8 @@
   that matched the requested schema. A scale above the precision crashed in DuckDB (a 500).
 * strict=true counted only the cast's own rejects. Values the 98% tolerance had already nulled
   during inference passed, so the caller paid for a column with 'oops' silently made null.
+* A column declared ``string`` was the inferred value cast back to text: '1.50' became '1.5',
+  '15/01/2025' became '2025-01-15', and values the tolerance had nulled were lost.
 """
 
 from __future__ import annotations
@@ -106,3 +108,46 @@ class TestStrictCountsInferenceRejects:
         )
         assert result.rows["v"][-1] is None
         assert result.column("v").rejected_count == 1
+
+
+class TestStringKeepsTheText:
+    """Declaring a column string asks for its text, not the inferred value cast back to text."""
+
+    def test_inferred_columns_keep_their_original_text(self, tmp_path) -> None:
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            "a;b;c;n\n1.50;1.234;15/01/2025;1\n2.25;2.500;16/01/2025;NA\n",
+            expected_schema=[{"name": name, "type": "string"} for name in "abcn"],
+            strict=True,
+        )
+        # Were '1.5', '1234' (decimal-comma file) and '2025-01-15': rewritten, and charged.
+        assert result.rows == {
+            "a": ["1.50", "2.25"],
+            "b": ["1.234", "2.500"],
+            "c": ["15/01/2025", "16/01/2025"],
+            "n": ["1", "NA"],  # as in any text column, 'NA' is data unless listed in null_values
+        }
+        for column in result.report.columns:
+            assert column.type == "string"
+            assert (column.inferred_from_text, column.notes) == (False, [])
+
+    def test_values_the_tolerance_nulled_come_back(self, tmp_path) -> None:
+        """'oops' among 99 dates was nulled by inference, and strict passed: a lost value, charged."""
+        csv = "d\n" + "".join(f"2025-01-{1 + i % 28:02d}\n" for i in range(99)) + "oops\n"
+        result = kit.convert_bytes(
+            tmp_path, "a.csv", csv, expected_schema=[{"name": "d", "type": "string"}], strict=True
+        )
+        assert result.rows["d"][0] == "2025-01-01"
+        assert result.rows["d"][-1] == "oops"
+        assert result.column("d").rejected_count == 0
+
+    def test_null_values_still_apply(self, tmp_path) -> None:
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            "n\n1\nNA\n",
+            null_values=["NA"],
+            expected_schema=[{"name": "n", "type": "string"}],
+        )
+        assert result.rows["n"] == ["1", None]

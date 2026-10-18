@@ -182,6 +182,12 @@ def _apply_expected_schema(
             plan = ColumnPlan(source="", expr=f"CAST(NULL AS {target})", type_name=col.type)
             result.append(_Output(col.name, None, plan, ["added as all-null: missing from input"]))
             continue
+        typed = out.plan.type_name != "string"
+        if col.type == "string" and typed and out.raw is not None and out.raw.text:
+            # Declaring a text column string asks for its text. Casting the inferred value back
+            # rewrote it ('1.50' -> '1.5', '15/01/2025' -> '2025-01-15', '1.234' -> '1234') and
+            # lost what the 98% tolerance had nulled ('oops' -> null, charged under strict).
+            out = _Output(out.name, out.raw, inferrer.text_plan(out.raw.source), [])
         expr = _expected_expr(inferrer, out, col)
         row = con.sql(
             f"SELECT count_if(({out.plan.expr}) IS NOT NULL AND ({expr}) IS NULL), "

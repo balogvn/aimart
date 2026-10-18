@@ -149,6 +149,31 @@ class TestCastText:
         ]
 
 
+class TestCastReport:
+    @pytest.mark.parametrize("type_name", ["timestamp", "date"])
+    def test_the_utc_conversion_is_reported(self, tmp_path, type_name) -> None:
+        csv = "ts,x\n" + "".join(f"{v},{i}\n" for i, v in enumerate(REVIEW))
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            csv,
+            infer_types=False,
+            expected_schema=[{"name": "ts", "type": type_name}],
+        )
+        notes = result.column("ts").notes
+        assert "values with a UTC offset were converted to UTC (2 of 3)" in notes
+
+    def test_naive_values_carry_no_note(self, tmp_path) -> None:
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            "ts,x\n2025-01-15 10:00:00,a\n2025-01-15,b\n",
+            infer_types=False,
+            expected_schema=[{"name": "ts", "type": "timestamp"}],
+        )
+        assert result.column("ts").notes == ["cast to timestamp per expected_schema"]
+
+
 class TestEndToEnd:
     def test_csv_column_is_timestamptz_with_the_note(self, tmp_path) -> None:
         csv = "ts,x\n" + "".join(f"{v},{i}\n" for i, v in enumerate(REVIEW))

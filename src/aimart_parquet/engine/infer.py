@@ -335,17 +335,26 @@ class TypeInferrer:
         )
 
     def cast_note(self, source: str, type_name: str, expr: str) -> str | None:
-        """The separator note for a cast_text result, when the dialect read an ambiguous value.
+        """What a cast_text result assumed that its values do not say, for the report.
 
         A per-value cast cannot see the column, so the file's dialect alone decided '1,234' and
-        '1.234'. Inference says so in a note; the expected_schema cast must too.
+        '1.234', and a naive target holds an offset only by converting to UTC. Inference says
+        so in a note; the expected_schema cast must too.
         """
-        if type_name not in {"int64", "float64", "decimal"}:
-            return None
-        style = "eu" if self.prefer_decimal_comma else "us"
-        return self._separator_note(
-            source, style, expr, "declare it as string in expected_schema to keep the text"
-        )
+        if type_name in {"int64", "float64", "decimal"}:
+            style = "eu" if self.prefer_decimal_comma else "us"
+            return self._separator_note(
+                source, style, expr, "declare it as string in expected_schema to keep the text"
+            )
+        if type_name in {"date", "timestamp"}:
+            v = _Exprs.build(ident(source), self.tokens).v
+            row = self.con.sql(
+                f"SELECT count_if({_has_zone(v)} AND ({expr}) IS NOT NULL), count({v}) "
+                f"FROM {self.table}"
+            ).fetchone()
+            if row and row[0]:
+                return f"values with a UTC offset were converted to UTC ({row[0]} of {row[1]})"
+        return None
 
     def _fit_counts(self, fit: str, converted: str) -> tuple[int, int]:
         """(values fitting the style, of which integral after conversion)."""
