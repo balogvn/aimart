@@ -84,7 +84,7 @@ flowchart LR
 | question | the one answer |
 |---|---|
 | what costs what, at which route or tool | `payments/pricing.py` `OPERATIONS`, `active_operations()` |
-| what this installation can serve (quantum extra present?) | `pricing.active_operations()` |
+| what this deployment serves (quantum extra installed and `AIMART_ENABLE_QUANTUM=true`?) | `pricing.active_operations(settings)` |
 | the configuration | `config.Settings` (`AIMART_*` environment variables) |
 | how an operation behaves | the `Service` method used by both REST and MCP |
 | the public contract (fields agents read) | `engine/models.py`, `quantum/models.py` |

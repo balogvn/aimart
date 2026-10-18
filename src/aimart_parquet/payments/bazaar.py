@@ -116,7 +116,10 @@ EXAMPLES: dict[str, dict[str, Any]] = {
                         "type": "object",
                         "properties": {
                             "artifact_id": _SOURCE_PROPS["artifact_id"],
-                            "url": _SOURCE_PROPS["url"],
+                            "url": {
+                                "type": "string",
+                                "description": "Public http(s) URL of a Parquet file.",
+                            },
                         },
                         "additionalProperties": False,
                     },

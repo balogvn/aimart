@@ -179,8 +179,9 @@ hosted service, which adds signed provenance.
 ### Joins
 
 One query reads up to 8 tables in total: the top-level input is table `data`, and `tables` adds
-up to 7 more by name, for one query price. REST takes an object per table (`artifact_id` or
-`url`); the MCP tool takes the `artifact_id` string itself (a local path in local mode). With
+up to 7 more by name, for one query price. REST takes an object per table (`artifact_id`, or
+`url` of a Parquet file); the MCP tool takes the `artifact_id` string itself (a local path in
+local mode). With
 `sql` = `SELECT d.*, o.status FROM data d JOIN orders o USING (order_id)`:
 
 ```text

@@ -87,7 +87,7 @@ Keep using the `artifact_id`. Artifacts live for `AIMART_ARTIFACT_TTL_S`, one ho
 adds up to 7 more by name (lowercase letters, digits, underscores), still for one query price.
 The two transports take different shapes:
 
-- REST, an object per table (`artifact_id` or `url`):
+- REST, an object per table (`artifact_id`, or `url` of a Parquet file):
   `{"artifact_id": "<invoices_id>", "sql": "SELECT d.*, o.status FROM data d JOIN orders o USING (order_id)", "tables": {"orders": {"artifact_id": "<orders_id>"}}}`
 - MCP `query_parquet`, the `artifact_id` string itself (a local path in local mode):
   `{"artifact_id": "<invoices_id>", "sql": "...", "tables": {"orders": "<orders_id>"}}`
