@@ -56,6 +56,7 @@ jobs:
           AIMART_PAY_TO_SVM: ${{ vars.AIMART_PAY_TO_SVM }}
           AIMART_PUBLIC_BASE_URL: ${{ vars.AIMART_PUBLIC_BASE_URL }}
           SMOKE_SIGNING_KEY_SHA256: ${{ vars.SMOKE_SIGNING_KEY_SHA256 }}
+          AIMART_ENABLE_QUANTUM: ${{ vars.AIMART_ENABLE_QUANTUM }}
         run: |
           set -euo pipefail
           flags="$(deploy/smoke-flags.sh)" # a failure here stops the step (set -e)

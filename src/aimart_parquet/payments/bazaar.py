@@ -40,7 +40,13 @@ EXAMPLES: dict[str, dict[str, Any]] = {
             "type": "object",
             "properties": {
                 **_SOURCE_PROPS,
-                "options": {"type": "object", "description": "ConvertOptions; see /openapi.json."},
+                "options": {
+                    "type": "object",
+                    "description": (
+                        "ConvertOptions, e.g. sheet, or pdf_pages and pdf_table for tables in a "
+                        "digital (not scanned) PDF; see /openapi.json."
+                    ),
+                },
             },
         },
         "output": _REPORT_EXAMPLE,
@@ -95,7 +101,26 @@ EXAMPLES: dict[str, dict[str, Any]] = {
             "type": "object",
             "properties": {
                 **_SOURCE_PROPS,
-                "sql": {"type": "string", "description": "One DuckDB SELECT over table data."},
+                "sql": {
+                    "type": "string",
+                    "description": "One DuckDB SELECT over table data, joined with any `tables`.",
+                },
+                "tables": {
+                    "type": "object",
+                    "description": (
+                        "Up to 7 more tables to join, by name: "
+                        '{"orders": {"artifact_id": "..."}}. The top-level input is `data`.'
+                    ),
+                    "maxProperties": 7,
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                            "artifact_id": _SOURCE_PROPS["artifact_id"],
+                            "url": _SOURCE_PROPS["url"],
+                        },
+                        "additionalProperties": False,
+                    },
+                },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
                 "format": {"type": "string", "enum": ["json", "markdown", "csv"]},
             },

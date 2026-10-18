@@ -46,7 +46,7 @@ The figures below are **assumptions**, not measurements of production traffic:
 
 | unit | assumed CPU time | calls inside the free tier per month | cost beyond the free tier* | revenue |
 |---|---:|---:|---:|---:|
-| classical session: convert + inspect + preview + 2 queries | 4 vCPU-s | about 45,000 | about $0.00012 | $0.024 |
+| classical session: convert + inspect + preview + 2 queries | 4 vCPU-s | about 45,000 | about $0.00012 | $0.034 |
 | one premium call (QAOA on 14 assets took 11 s in our re-run) | 10 vCPU-s | about 18,000 | about $0.0003 | $0.50–$1.00 |
 
 \*At Cloud Run's 2025 list prices ($0.000024 per vCPU-second, $0.0000025 per GiB-second,
@@ -62,24 +62,25 @@ the pace of x402 adoption nor the share of agents allowed to spend money can be 
 inside this repo.
 
 To make the assumptions inspectable, here is a transparent model. Monthly revenue =
-sessions × ($0.024 + premium share × $0.75), where $0.75 is the mean of the two premium
+sessions × ($0.034 + premium share × $0.75), where $0.75 is the mean of the two premium
 prices and "premium share" is the fraction of sessions that buy one premium call. Prices are
 the defaults. There are no fees (free facilitators) and no compute cost (free tier) in the
 model.
 
 | sessions per month | 0% premium | 1% premium | 5% premium | 12% premium |
 |---|---:|---:|---:|---:|
-| 1,000 (conservative) | $24/mo · $288/yr | $32/mo · $378/yr | $62/mo · $738/yr | $114/mo · $1,368/yr |
-| 10,000 | $240/mo · $2,880/yr | $315/mo · $3,780/yr | $615/mo · $7,380/yr | $1,140/mo · $13,680/yr |
-| 100,000 (base) | $2,400/mo · $28,800/yr | $3,150/mo · $37,800/yr | $6,150/mo · $73,800/yr | $11,400/mo · $136,800/yr |
-| 333,000 (optimistic) | $7,992/mo · $95,904/yr | $10,490/mo · $125,874/yr | $20,480/mo · $245,754/yr | $37,962/mo · $455,544/yr |
+| 1,000 (conservative) | $34/mo · $408/yr | $42/mo · $498/yr | $72/mo · $858/yr | $124/mo · $1,488/yr |
+| 10,000 | $340/mo · $4,080/yr | $415/mo · $4,980/yr | $715/mo · $8,580/yr | $1,240/mo · $14,880/yr |
+| 100,000 (base) | $3,400/mo · $40,800/yr | $4,150/mo · $49,800/yr | $7,150/mo · $85,800/yr | $12,400/mo · $148,800/yr |
+| 235,000 (optimistic) | $7,990/mo · $95,880/yr | $9,753/mo · $117,030/yr | $16,803/mo · $201,630/yr | $29,140/mo · $349,680/yr |
 
 Reading the table:
 
-- The discussion's $96k a year matches about **333,000 sessions a month** with no premium.
-  That is roughly 11,000 agent sessions every day.
-- At that same volume, 12% premium adoption gives about **$456k**, not $1.23M. Reaching
-  $1.23M at 12% needs about **900,000 sessions a month**, or premium sessions that buy several
+- The discussion's $96k a year matches about **235,000 sessions a month** with no premium
+  (at convert's $0.02; it took 333,000 at the old $0.01). That is roughly 7,800 agent sessions
+  every day.
+- At that same volume, 12% premium adoption gives about **$350k**, not $1.23M. Reaching
+  $1.23M at 12% needs about **830,000 sessions a month**, or premium sessions that buy several
   premium calls each. The $1.23M figure therefore rests on stronger assumptions than the $96k.
 - Premium share moves revenue more than any other lever. It is also the least certain
   number: the tools give no quantum advantage, so their value has to come from convenience and

@@ -39,7 +39,8 @@ OPERATIONS: tuple[Operation, ...] = (
         "POST",
         "/v1/convert",
         "price_convert",
-        "Convert a messy CSV/JSON/Excel/SPSS/Stata/SAS file (by URL or base64) to clean Parquet.",
+        "Convert a messy CSV/JSON/Excel/SPSS/Stata/SAS file, or tables in a digital (not scanned) "
+        "PDF, to clean Parquet (input by URL or base64).",
     ),
     Operation(
         "convert_upload",
@@ -47,7 +48,8 @@ OPERATIONS: tuple[Operation, ...] = (
         "POST",
         "/v1/convert/upload",
         "price_convert",
-        "Convert an uploaded (multipart) data file to clean Parquet.",
+        "Convert an uploaded (multipart) CSV/JSON/Excel/SPSS/Stata/SAS file, or tables in a "
+        "digital (not scanned) PDF, to clean Parquet.",
     ),
     Operation(
         "inspect",
@@ -71,7 +73,8 @@ OPERATIONS: tuple[Operation, ...] = (
         "POST",
         "/v1/query",
         "price_query",
-        "Run one read-only DuckDB SELECT over a Parquet file (table `data`).",
+        "Run one read-only DuckDB SELECT over a Parquet file (table `data`); join up to 7 more "
+        "artifacts via `tables`.",
     ),
     Operation(
         "quantum_compress",

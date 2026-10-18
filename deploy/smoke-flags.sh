@@ -7,8 +7,10 @@
 #   uv run --script scripts/smoke.py "$URL" "${args[@]}"
 #
 # Used by .github/workflows/deploy.yml (after every deploy) and synthetic.yml (every 6 hours), so
-# both check the same expectations. It deliberately does not ask the package which network a
-# mode means: the smoke test exists to catch the package disagreeing with the deployer.
+# both check the same expectations, provided both pass every input below (a test checks that:
+# the synthetic check once ran without AIMART_ENABLE_QUANTUM and never required the quantum
+# tools). It deliberately does not ask the package which network a mode means: the smoke test
+# exists to catch the package disagreeing with the deployer.
 #
 # Inputs (environment):
 #   AIMART_NETWORK_MODE      testnet (default) | mainnet
@@ -16,6 +18,7 @@
 #   AIMART_PAY_TO_SVM        Solana payee
 #   AIMART_PUBLIC_BASE_URL   origin the server must advertise in resource URLs (optional)
 #   SMOKE_SIGNING_KEY_SHA256 sha256 of the raw ML-DSA-65 public key to pin (optional)
+#   AIMART_ENABLE_QUANTUM    true: the two quantum operations must be served (default: false)
 set -euo pipefail
 
 mode="${AIMART_NETWORK_MODE:-testnet}"

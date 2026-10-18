@@ -9,10 +9,13 @@ accurate enough to act on: if you change a command, path or rule below, change i
 
 **AImart Parquet** (`aimart-parquet` on PyPI, import `aimart_parquet`): a pay-per-call service
 that AI agents use to turn messy CSV/TSV, JSON/NDJSON, Excel (xlsx/xls/ods), SPSS (sav/zsav/por),
-Stata (dta) and SAS (sas7bdat/xpt) files into clean, typed, zstd Parquet, then inspect (footer
-only), preview, and query them with sandboxed read-only DuckDB SQL. A premium tier adds
-simulated-quantum kernel PCA and QAOA portfolio selection, each with a classical baseline, and
-every hosted artifact carries an ML-DSA-65 (post-quantum) provenance signature.
+Stata (dta) and SAS (sas7bdat/xpt) files, and tables in digital (not scanned) PDFs, into clean,
+typed, zstd Parquet, then inspect (footer only), preview, and query them with sandboxed
+read-only DuckDB SQL (joins across up to 8 artifacts per query). Every hosted artifact carries an
+ML-DSA-65 (post-quantum) provenance signature. An optional premium tier, **off by default**
+(`AIMART_ENABLE_QUANTUM=true` plus the `quantum` extra), adds simulated-quantum kernel PCA and
+QAOA portfolio selection, each with a classical baseline; treat it as opt-in everywhere (docs,
+discovery, smoke checks), not as part of the default product.
 
 One ASGI app serves the REST API (FastAPI) and a remote MCP server (Streamable HTTP at `/mcp`).
 Callers pay in USDC with x402 v2 on Base or Solana; testnet (Base Sepolia, `eip155:84532`) is the
@@ -61,8 +64,10 @@ Module docstrings explain the why; read the one you are about to change.
   `readers/` (delimited, jsonish, excel, statistical, columnar, pdf; the `READERS` map is in
   `convert.py`), `infer.py` (type ladder in SQL), `names.py`, `convert.py` (pipeline and
   report), `writer.py` (DuckDB `COPY` by default, pyarrow when labels exist), `inspect.py`
-  (footer-only stats), `tabular.py` (preview and SELECT-only query), `isolate.py` (forkserver
-  child per heavy job), `models.py` (the pydantic contract agents read).
+  (footer-only stats), `tabular.py` (preview and SELECT-only query; rows are positional, so
+  duplicate column names survive), `isolate.py` (forkserver child per heavy job, with a deadline
+  and a per-job memory cap, `AIMART_JOB_MEMORY_LIMIT_MB`), `models.py` (the pydantic contract
+  agents read).
 - `quantum/`: premium tools (`kernel_pca.py`, `portfolio.py`, `data.py`, `models.py`). Served only
   when the `quantum` extra is installed AND `AIMART_ENABLE_QUANTUM=true` (off by default; a buyer
   panel valued them at $0). `pricing.active_operations(settings)` decides. Spec:
@@ -73,7 +78,11 @@ Module docstrings explain the why; read the one you are about to change.
 - `provenance.py`: ML-DSA-65 manifests and signatures for every hosted artifact.
 - `sources.py`: SSRF-safe URL fetch (validated IPs at connect time, re-checked redirects, port
   allow-list, size cap, deadline), base64 decode, `safe_filename`.
-- `artifacts.py`: `LocalArtifactStore` (TTL disk, HMAC-signed links) and `GcsArtifactStore`.
+- `artifacts.py`: `LocalArtifactStore` (TTL disk, HMAC-signed links, `delete()`, and a
+  request-path sweep at most once a minute) and `GcsArtifactStore` (also deletes expired blobs;
+  a bucket-listing sweep at most every 6 h catches blobs a restart orphaned, and the bucket's
+  1-day lifecycle rule is the last resort). The TTL makes an artifact unreachable; the sweeps
+  delete it. `discovery.retention_policy()` publishes exactly that, so change both together.
 - `service.py`: `Service`, the **one** implementation of every operation, used by REST and MCP.
   `query` takes a map of table names (`data` + up to 7 joined artifacts) for one query price.
 - `payments/`: `pricing.py` (`OPERATIONS`, the single source of prices, routes and tool names;
@@ -84,14 +93,17 @@ Module docstrings explain the why; read the one you are about to change.
   agent sees). Remote mode takes `url`/`content_base64`/`artifact_id`; local mode adds `path`.
 - `api/`: `app.py` (`create_app`; routes, OpenAPI `x-payment-info`, middleware order),
   `middleware.py` (access log, rate limit, body limit), `discovery.py` (`/llms.txt`, server card,
-  pricing), `schemas.py`.
+  pricing, `retention_policy()`: the one data-retention statement), `schemas.py`.
 - `cli.py`: `serve`, `mcp`, `convert`, `inspect`.
 
 Outside `src/`: `tests/` (`aimart_testkit.py` helpers, `unit/`, `integration/`, `quantum/`),
 `scripts/smoke.py` (live 402 decoder), `Dockerfile`, `.github/workflows/` (`ci.yml`,
-`codeql.yml`, `release.yml`, `scorecard.yml`), `deploy/` (Cloud Run), `server.json` (MCP
-Registry manifest; prices and tools there must match `OPERATIONS`),
-`docs/examples/agent_pays.py` (paying client example).
+`codeql.yml`, `release.yml`, `deploy.yml`, `synthetic.yml`, `mutation.yml`, `scorecard.yml`,
+`claude-review.yml`), `deploy/` (Cloud Run: `setup-gcp.sh`, `smoke-flags.sh` shared by the
+deploy and synthetic smoke steps), `server.json` (MCP Registry manifest; prices and tools there
+must match `OPERATIONS`), `docs/examples/agent_pays.py` (paying client example). `deploy.yml`
+overwrites the service's env vars and secrets on every deploy: a runtime setting it does not
+pass (from a GitHub variable) does not exist in production.
 
 Docs: [architecture](docs/architecture.md), [payments](docs/payments.md), [privacy](docs/privacy.md),
 [agents guide](docs/agents-guide.md), [quantum tier](docs/quantum.md),
@@ -230,6 +242,15 @@ test suite.
 - **The forkserver re-imports `__main__`.** A script that triggers isolated jobs
   (`Settings(isolate_jobs=True)`, the default) without an `if __name__ == "__main__":` guard
   re-runs itself in the forkserver. Under pytest it works; in ad-hoc scripts, guard.
+
+- **Text that promised more than the code did.** The published retention said "deleted 60
+  minutes after creation" while the code only made artifacts unreachable; the README's decoded
+  402 kept a `$0.01` amount after convert moved to `$0.02`; discovery summaries never mentioned
+  PDFs or joins. Docs, samples and discovery text are interface: `tests/*/test_fix_docs_*.py`
+  compare them with the wire and the code, so update both in one change.
+- **Two callers of one script, one input short.** The synthetic smoke ran `smoke-flags.sh`
+  without `AIMART_ENABLE_QUANTUM`, so it never required the quantum tools the deploy smoke did.
+  A test now checks every workflow that calls it passes every input it reads.
 
 Found by the engine unit suite (commit 0fea70d), each with a regression test:
 

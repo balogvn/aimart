@@ -21,8 +21,8 @@ hosts. Report those to their maintainers.
 
 AImart Parquet is a public, paid, anonymous service. Anyone with a wallet can:
 
-1. send **untrusted bytes** (CSV, JSON, Excel, SPSS/Stata/SAS, Parquet, or a compressed form
-   of any of them) to native parsers;
+1. send **untrusted bytes** (CSV, JSON, Excel, SPSS/Stata/SAS, Parquet, PDF, or a compressed
+   form of any of them) to native parsers;
 2. make the server **fetch a URL** of their choosing;
 3. run **their own SQL** against the converted data;
 4. send **payment payloads** that may be malformed, replayed, underpriced, or aimed at the
@@ -111,11 +111,14 @@ interrupts DuckDB at the deadline, and file paths are scrubbed from error messag
 
 ### Artifacts and downloads
 
-Artifacts have random 144-bit IDs (`secrets.token_urlsafe(18)`) and expire after `AIMART_ARTIFACT_TTL_S` (1 hour). A
-size budget evicts old ones. Local downloads need an HMAC-SHA256-signed, expiring link
-(`exp` and `sig`). Set `AIMART_SIGNING_SECRET`, or a random per-boot secret is used. With
-`AIMART_GCS_BUCKET`, downloads are GCS V4 signed URLs, and a bucket lifecycle rule is the
-cleanup backstop.
+Artifacts have random 144-bit IDs (`secrets.token_urlsafe(18)`) and become unreachable after
+`AIMART_ARTIFACT_TTL_S` (1 hour). A sweep that runs at most once a minute while the service has
+traffic then deletes them, normally within minutes, and a size budget evicts old ones. Local
+downloads need an HMAC-SHA256-signed, expiring link (`exp` and `sig`). Set
+`AIMART_SIGNING_SECRET`, or a random per-boot secret is used. With `AIMART_GCS_BUCKET`,
+downloads are GCS V4 signed URLs, the sweep deletes the stored copies too, and a copy orphaned
+by an instance restart is deleted in about a day at worst (a bucket-listing sweep, then the
+bucket's 1-day lifecycle rule as the last resort; see [docs/privacy.md](docs/privacy.md)).
 
 ### Provenance: ML-DSA-65
 
@@ -130,8 +133,9 @@ If `AIMART_SIGNING_KEY_MLDSA` is unset, the key is ephemeral and the server logs
 ### Secrets
 
 Production secrets live in **Google Secret Manager** and are injected into Cloud Run as
-environment variables (see [deploy/README.md](deploy/README.md)). There are two:
-`AIMART_SIGNING_KEY_MLDSA` and `AIMART_SIGNING_SECRET`. Receive addresses are not secrets. The
+environment variables (see [deploy/README.md](deploy/README.md)): `AIMART_SIGNING_KEY_MLDSA`
+and `AIMART_SIGNING_SECRET`, plus `AIMART_ADMIN_TOKEN` if the operator switches on the demand
+report. Receive addresses are not secrets. The
 repository ignores `.env*` (except `.env.example`), `.wallets/`, `.local/`, `*.pem` and
 `*.key`. The Docker build context is an allow-list, so none of them can reach an image layer.
 Check a deployed secret by its length, never by printing it. Payment payloads are never

@@ -5,6 +5,7 @@
 #
 #   PROJECT_ID=my-project deploy/setup-gcp.sh
 #   PROJECT_ID=my-project BUCKET=my-project-aimart-artifacts deploy/setup-gcp.sh   # GCS artifacts
+#   PROJECT_ID=my-project SECRET_ADMIN_TOKEN=aimart-admin-token deploy/setup-gcp.sh # GET /v1/demand
 #
 # Needs: gcloud (logged in as a project Owner, or someone who can create service accounts, WIF
 # pools, secrets and IAM bindings), python3 (only to generate random secrets), and billing
@@ -19,6 +20,9 @@
 #     after a rename or deletion; the numeric id cannot)
 #   * Secret Manager secrets AIMART_SIGNING_KEY_MLDSA and AIMART_SIGNING_SECRET, generated here
 #     and piped straight into gcloud on stdin: never echoed, never in argv, never on disk
+#   * optionally the AIMART_ADMIN_TOKEN secret for GET /v1/demand (SECRET_ADMIN_TOKEN=<name>);
+#     deploy.yml mounts it only when the GitHub variable GCP_SECRET_ADMIN_TOKEN names it, because
+#     it overwrites the service's secrets on every deploy
 #   * optionally a bucket for artifacts with a 1-day delete rule
 set -euo pipefail
 
@@ -35,6 +39,7 @@ DEPLOYER_SA_NAME="${DEPLOYER_SA_NAME:-aimart-deployer}"
 RUNTIME_SA_NAME="${RUNTIME_SA_NAME:-aimart-runtime}"
 SECRET_SIGNING_KEY="${SECRET_SIGNING_KEY:-aimart-signing-key-mldsa}"
 SECRET_SIGNING_SECRET="${SECRET_SIGNING_SECRET:-aimart-signing-secret}"
+SECRET_ADMIN_TOKEN="${SECRET_ADMIN_TOKEN:-}" # empty: no admin token, GET /v1/demand stays off
 BUCKET="${BUCKET:-}" # empty: artifacts stay in the instance's RAM-backed /tmp
 # generate (default): random values made here. prompt: paste existing values (input hidden),
 # e.g. to keep the ML-DSA key you already publish so old signatures keep verifying.
@@ -50,6 +55,8 @@ command -v python3 > /dev/null || die "python3 is needed to generate secrets"
 case "$SECRET_SOURCE" in generate | prompt) ;; *) die "SECRET_SOURCE must be generate or prompt" ;; esac
 [[ "$GITHUB_REPO" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || die "GITHUB_REPO must be owner/name"
 [[ "$GITHUB_OWNER_ID" =~ ^[0-9]+$ ]] || die "GITHUB_OWNER_ID must be the numeric GitHub account id"
+[ -z "$SECRET_ADMIN_TOKEN" ] || [[ "$SECRET_ADMIN_TOKEN" =~ ^[A-Za-z0-9_-]{1,255}$ ]] ||
+  die "SECRET_ADMIN_TOKEN must be a Secret Manager secret name ([A-Za-z0-9_-])"
 
 # Every command names the project explicitly; the caller's gcloud config is never changed.
 gc() { gcloud --project="$PROJECT_ID" --quiet "$@"; }
@@ -62,8 +69,8 @@ generate_secret() {
   case "$1" in
     # FIPS 204 ML-DSA-65 key generation from a 32-byte seed; the server takes base64 of it.
     mldsa) python3 -c 'import base64, secrets, sys; sys.stdout.write(base64.b64encode(secrets.token_bytes(32)).decode())' ;;
-    # HMAC key for signed download links.
-    hmac) python3 -c 'import secrets, sys; sys.stdout.write(secrets.token_urlsafe(48))' ;;
+    # HMAC key for signed download links; also the bearer token for GET /v1/demand.
+    hmac | token) python3 -c 'import secrets, sys; sys.stdout.write(secrets.token_urlsafe(48))' ;;
   esac
 }
 
@@ -172,11 +179,16 @@ echo "deployer: workloadIdentityUser (from ${GITHUB_REPO}), run.admin, serviceAc
 log "Secrets (values are generated and piped into Secret Manager; never printed)"
 ensure_secret "$SECRET_SIGNING_KEY" mldsa
 ensure_secret "$SECRET_SIGNING_SECRET" hmac
-for name in "$SECRET_SIGNING_KEY" "$SECRET_SIGNING_SECRET"; do
+runtime_secrets=("$SECRET_SIGNING_KEY" "$SECRET_SIGNING_SECRET")
+if [ -n "$SECRET_ADMIN_TOKEN" ]; then
+  ensure_secret "$SECRET_ADMIN_TOKEN" token
+  runtime_secrets+=("$SECRET_ADMIN_TOKEN")
+fi
+for name in "${runtime_secrets[@]}"; do
   gc secrets add-iam-policy-binding "$name" \
     --role=roles/secretmanager.secretAccessor --member="serviceAccount:${RUNTIME_SA}" > /dev/null
 done
-echo "runtime: secretAccessor on $SECRET_SIGNING_KEY and $SECRET_SIGNING_SECRET only"
+echo "runtime: secretAccessor on ${runtime_secrets[*]} only"
 
 # ------------------------------------------------------------------------------ 6. bucket
 if [ -n "$BUCKET" ]; then
@@ -193,8 +205,10 @@ if [ -n "$BUCKET" ]; then
   fi
   lifecycle="$(mktemp)"
   trap 'rm -f "$lifecycle"' EXIT
-  # Artifacts live an hour (AIMART_ARTIFACT_TTL_S); the bucket deletes anything a day old as a
-  # backstop, and keeps no soft-deleted copies (they would be billed for 7 more days).
+  # Artifacts are unreachable after an hour (AIMART_ARTIFACT_TTL_S) and the service's sweeps
+  # delete them; the bucket deletes anything a day old as the last resort (a copy a restart lost
+  # track of), and keeps no soft-deleted copies (they would be billed for 7 more days). Without
+  # this rule the published retention has no worst-case bound.
   printf '%s\n' '{"rule": [{"action": {"type": "Delete"}, "condition": {"age": 1}}]}' > "$lifecycle"
   gc storage buckets update "gs://${BUCKET}" --lifecycle-file="$lifecycle" --clear-soft-delete > /dev/null
   gc storage buckets add-iam-policy-binding "gs://${BUCKET}" \
@@ -232,6 +246,7 @@ if [ -n "$BUCKET" ]; then
 else
   echo "  AIMART_ARTIFACT_MAX_TOTAL_BYTES=268435456"
 fi
+[ -z "$SECRET_ADMIN_TOKEN" ] || echo "  GCP_SECRET_ADMIN_TOKEN=${SECRET_ADMIN_TOKEN}"
 
 cat << EOF
 
