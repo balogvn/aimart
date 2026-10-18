@@ -303,25 +303,48 @@ class TypeInferrer:
         plan = ColumnPlan(source, expr, type_name)
         if style in {"us", "eu", "space"}:
             plan.notes.append(f"parsed {style}-style number formatting")
-        if ambiguous:
-            plan.notes.append(self._separator_note(source, style, expr))
+        if ambiguous and (note := self._separator_note(source, style, expr)):
+            plan.notes.append(note)
         if n_currency:
             plan.notes.append("stripped currency symbols")
         plan.rejected_count = self._reject_count(source, expr)
         return plan
 
-    def _separator_note(self, source: str, style: str, expr: str) -> str:
-        """Say which convention was assumed, with a value it changed, so the reader can check."""
+    def _separator_note(
+        self,
+        source: str,
+        style: str,
+        expr: str,
+        remedy: str = "infer_types=false keeps the original text",
+    ) -> str | None:
+        """Say which convention was assumed, with a value it read, so the reader can check.
+
+        None when no value both conventions read made it into the column: nothing was assumed.
+        """
         e = _Exprs.build(ident(source), self.tokens)
         row = self.con.sql(
             f"SELECT {e.v}, {expr} FROM {self.table} "
             f"WHERE {_ambiguous_separator(e.n)} AND ({expr}) IS NOT NULL ORDER BY 1 LIMIT 1"
         ).fetchone()
+        if row is None:
+            return None
         mark = "comma" if style == "eu" else "point"
-        example = f", so '{str(row[0])[:40]}' is {row[1]}" if row else ""
         return (
-            f"ambiguous thousands/decimal separator; assumed a decimal {mark}{example} "
-            "(infer_types=false keeps the original text)"
+            f"ambiguous thousands/decimal separator; assumed a decimal {mark}, so "
+            f"'{str(row[0])[:40]}' is {row[1]} ({remedy})"
+        )
+
+    def cast_note(self, source: str, type_name: str, expr: str) -> str | None:
+        """The separator note for a cast_text result, when the dialect read an ambiguous value.
+
+        A per-value cast cannot see the column, so the file's dialect alone decided '1,234' and
+        '1.234'. Inference says so in a note; the expected_schema cast must too.
+        """
+        if type_name not in {"int64", "float64", "decimal"}:
+            return None
+        style = "eu" if self.prefer_decimal_comma else "us"
+        return self._separator_note(
+            source, style, expr, "declare it as string in expected_schema to keep the text"
         )
 
     def _fit_counts(self, fit: str, converted: str) -> tuple[int, int]:

@@ -136,3 +136,51 @@ def test_grouped_and_currency_numbers_round_trip(amounts, style: str, currency: 
     assert column.type == "double", (style, [fmt(a) for a in amounts], column.notes)
     assert column.rejected_count == 0
     assert got == [float(a) for a in amounts]
+
+
+def _money(value: Any, style: str) -> str:
+    text = f"{value:,.2f}"
+    return text.replace(",", "_").replace(".", ",").replace("_", ".") if style == "eu" else text
+
+
+@settings(
+    max_examples=60,
+    deadline=None,
+    suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+)
+@given(
+    st.lists(st.tuples(_AMOUNTS, st.sampled_from(["us", "eu"])), min_size=1, max_size=60),
+    st.sampled_from(["us", "eu"]),
+    st.sampled_from(["infer", "expected_schema"]),
+)
+def test_a_number_is_its_true_value_or_a_counted_reject(cells, dialect: str, mode: str) -> None:
+    """Whatever the mix of conventions, no value is read with another value's separators.
+
+    The 98% tolerance once read the misfits with the winner's separators ('2,50' -> 250.0 in a
+    US column), and expected_schema casts did the same to every value of a text column.
+    """
+    if dialect == "us":
+        # A lone mixed column still needs an unambiguous delimiter to be sniffed.
+        cells = cells + [(a, "us") for a, _ in cells[:1]]
+    buf = io.StringIO()
+    writer = csv.writer(buf, delimiter=";" if dialect == "eu" else ",", lineterminator="\n")
+    writer.writerow(["id", "amount"])
+    writer.writerows([[i, _money(a, style)] for i, (a, style) in enumerate(cells)])
+    options: dict[str, Any] = {}
+    if mode == "expected_schema":
+        options = {
+            "infer_types": False,
+            "expected_schema": [
+                {"name": "id", "type": "int64"},
+                {"name": "amount", "type": "float64"},
+            ],
+        }
+    with tempfile.TemporaryDirectory() as tmp:
+        result = kit.convert_bytes(Path(tmp), "money.csv", buf.getvalue(), **options)
+        got = result.rows["amount"]
+        column = result.column("amount")
+    if column.type == "string":
+        return  # kept as text: nothing was read as a number
+    for value, (amount, style) in zip(got, cells, strict=True):
+        assert value is None or value == float(amount), (dialect, mode, _money(amount, style))
+    assert column.rejected_count == sum(v is None for v in got)

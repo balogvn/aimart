@@ -222,4 +222,49 @@ class TestCastTextKeepsTheConvention:
             tmp_path, "a.csv", csv, expected_schema=[{"name": "v", "type": "float64"}]
         )
         assert result.rows["v"] == [None, None, None]
-        assert result.column("v").rejected_count == 3
+        v = result.column("v")
+        assert v.rejected_count == 3
+        assert v.rejected_examples == ["12,5", "3,75", "abc"]  # were [], a count without values
+
+    @pytest.mark.parametrize(
+        ("csv", "rows", "note"),
+        [
+            ("v;w\n1.234;a\n2,5;b\n", [1234.0, 2.5], "decimal comma, so '1.234' is 1234.0"),
+            ('v,w\n"1,234",a\n2.5,b\n', [1234.0, 2.5], "decimal point, so '1,234' is 1234.0"),
+            ("v,w\n1.234,a\n2.5,b\n", [1.234, 2.5], "decimal point, so '1.234' is 1.234"),
+        ],
+    )
+    def test_the_dialect_choice_is_reported(self, tmp_path, csv, rows, note) -> None:
+        """A per-value cast cannot see the column: the dialect decided, and the report says so."""
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            csv,
+            infer_types=False,
+            expected_schema=[{"name": "v", "type": "float64"}],
+        )
+        assert result.rows["v"] == pytest.approx(rows)
+        notes = result.column("v").notes
+        assert any(n.startswith(AMBIGUOUS) and note in n for n in notes), notes
+        assert any("declare it as string in expected_schema" in n for n in notes)
+
+    def test_unambiguous_values_carry_no_note(self, tmp_path) -> None:
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            "v;w\n1.234,5;a\n2,5;b\n12;c\n",
+            infer_types=False,
+            expected_schema=[{"name": "v", "type": "float64"}],
+        )
+        assert result.rows["v"] == pytest.approx([1234.5, 2.5, 12.0])
+        assert result.column("v").notes == ["cast to float64 per expected_schema"]
+
+    def test_typed_column_cast_rejects_have_examples(self, tmp_path) -> None:
+        result = kit.convert_bytes(
+            tmp_path, "a.csv", "v,w\n1.5,a\n2,b\n", expected_schema=[{"name": "v", "type": "int64"}]
+        )
+        assert result.rows["v"] == [None, 2]
+        assert (result.column("v").rejected_count, result.column("v").rejected_examples) == (
+            1,
+            ["1.5"],
+        )

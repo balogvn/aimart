@@ -152,6 +152,14 @@ def _expected_expr(inferrer: TypeInferrer, out: _Output, col: ExpectedColumn) ->
     return f"TRY_CAST(({out.plan.expr}) AS {target})"
 
 
+def _cast_rejects(con: duckdb.DuckDBPyConnection, table: str, before: str, after: str) -> list[str]:
+    rows = con.sql(
+        f"SELECT DISTINCT TRY_CAST(({before}) AS VARCHAR) AS x FROM {ident(table)} "
+        f"WHERE ({before}) IS NOT NULL AND ({after}) IS NULL ORDER BY x LIMIT 3"
+    ).fetchall()
+    return [str(r[0])[:80] for r in rows if r[0] is not None]
+
+
 def _apply_expected_schema(
     con: duckdb.DuckDBPyConnection,
     table: str,
@@ -191,13 +199,18 @@ def _apply_expected_schema(
             violations.append(
                 {"column": col.name, "problem": f"{nulls} nulls in a non-nullable column"}
             )
+        examples = out.plan.rejected_examples
+        if rejects:
+            # A count without the values ('3 rejected', examples []) leaves the caller unable to
+            # see that '12,5' was the problem.
+            examples = [*examples, *_cast_rejects(con, table, out.plan.expr, expr)][:3]
         plan = ColumnPlan(
             out.plan.source,
             expr,
             col.type,
             inferred=out.plan.inferred,
             rejected_count=out.plan.rejected_count,
-            rejected_examples=out.plan.rejected_examples,
+            rejected_examples=examples,
             notes=out.plan.notes,
         )
         notes = (
@@ -205,6 +218,9 @@ def _apply_expected_schema(
             if out.plan.type_name != col.type
             else out.notes
         )
+        if out.plan.type_name == "string" and out.raw is not None:
+            note = inferrer.cast_note(out.raw.source, col.type, expr)
+            notes = [*notes, note] if note else notes
         result.append(_Output(col.name, out.raw, plan, notes, extra_rejects=rejects))
     extras = [o for o in outputs if o.name.lower() not in expected_names]
     if extras and options.strict:

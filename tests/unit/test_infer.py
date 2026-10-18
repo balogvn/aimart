@@ -295,9 +295,14 @@ class TestTemporal:
             dt.datetime(2024, 1, 15, 8, 30),
         ]
 
-    def test_an_even_mix_of_offsets_and_naive_values_stays_text(self) -> None:
-        """Neither reading fits both: the offset is never dropped, and UTC is not assumed."""
-        values = ["2024-01-15T10:30:00+02:00", "2024-01-15 10:30:00"]
+    @pytest.mark.parametrize("offset", ["Z", "+02:00"])
+    def test_an_even_mix_of_offsets_and_naive_values_stays_text(self, offset: str) -> None:
+        """Neither reading fits both: the offset is never dropped, and UTC is not assumed.
+
+        This test once expected 'timestamp' for the 'Z' case: the TIMESTAMP cast dropped the
+        offset, which for any other offset than Z shifted the time silently.
+        """
+        values = [f"2024-01-15T10:30:00{offset}", "2024-01-15 10:30:00"]
         plan, out = infer(values)
         assert plan.type_name == "string"
         assert out == values
