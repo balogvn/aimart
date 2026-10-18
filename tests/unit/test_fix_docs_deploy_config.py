@@ -191,10 +191,48 @@ def test_admin_token_secret_is_mounted_only_when_configured(tmp_path: Path) -> N
     assert on.splitlines() == [*off, "AIMART_ADMIN_TOKEN=aimart-admin-token:latest"]
 
 
+SECRET_VARIABLES = {
+    "GCP_SECRET_SIGNING_KEY": "AIMART_SIGNING_KEY_MLDSA",
+    "GCP_SECRET_SIGNING_SECRET": "AIMART_SIGNING_SECRET",
+    "GCP_SECRET_ADMIN_TOKEN": "AIMART_ADMIN_TOKEN",
+}
+
+
 @needs_bash
-def test_secret_names_are_validated(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "value",
+    [
+        "bad name,AIMART_X=y",  # a comma would smuggle in a second reference
+        "name,AIMART_X=other",
+        "name:3",  # the version is always `latest`, appended by the step
+        "projects/123/secrets/name,AIMART_X=other",
+        "projects/123/secrets/name/versions/3",
+        "projects/123/secrets/",
+        "projects//secrets/name",
+        "projects/1 2/secrets/name",
+        "projects/123/secrets/name\nAIMART_X=other",
+    ],
+)
+@pytest.mark.parametrize("variable", sorted(SECRET_VARIABLES))
+def test_secret_names_are_validated(tmp_path: Path, variable: str, value: str) -> None:
     with pytest.raises(subprocess.CalledProcessError):
-        run_config_step(tmp_path, GCP_SECRET_ADMIN_TOKEN="bad name,AIMART_X=y")
+        run_config_step(tmp_path, **{variable: value})
+
+
+@needs_bash
+@pytest.mark.parametrize("variable", sorted(SECRET_VARIABLES))
+def test_a_secret_in_another_project_is_accepted(tmp_path: Path, variable: str) -> None:
+    """Review of 8197c71: the new name check refused the full resource path.
+
+    Cloud Run takes ``projects/<project number>/secrets/<name>`` for a secret kept in another
+    project (a central secrets project, say). 6f99145 passed it through unchecked; 8197c71's
+    check failed every deploy that used one. Both forms pass, and nothing else does.
+    """
+    path = "projects/123456/secrets/aimart-signing-key-mldsa"
+    secrets = run_config_step(tmp_path, **{variable: path})["secrets"].splitlines()
+    assert f"{SECRET_VARIABLES[variable]}={path}:latest" in secrets
+    assert len(secrets) == 3 if variable == "GCP_SECRET_ADMIN_TOKEN" else len(secrets) == 2
+    assert "projects/<project number>/secrets/<name>" in DEPLOY_README.read_text(encoding="utf-8")
 
 
 FAKE_GCLOUD = """#!/usr/bin/env bash
@@ -248,6 +286,31 @@ def test_setup_script_creates_the_admin_token_secret_only_when_asked(tmp_path: P
         for c in admin
     )
     assert "GCP_SECRET_ADMIN_TOKEN=aimart-admin-token" in stdout
+
+
+@needs_bash
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"SECRET_ADMIN_TOKEN": "aimart-admin-token", "BUCKET": "proj-aimart-artifacts"}],
+)
+def test_setup_script_prints_the_same_variables_both_ways(
+    tmp_path: Path, extra: dict[str, str]
+) -> None:
+    """Review of 8197c71: the `gh variable set` block left out GCP_SECRET_ADMIN_TOKEN (and the
+    artifact storage variable), so copying it switched nothing on."""
+    stdout, _ = run_setup(tmp_path, **extra)
+    listed = dict(re.findall(r"^  ([A-Z][A-Z0-9_]+)=(\S.*)$", stdout, re.M))
+    gh = dict(
+        re.findall(r"^  gh variable set ([A-Z0-9_]+) --repo \S+ --body '([^']*)'$", stdout, re.M)
+    )
+    assert set(listed) == set(gh)
+    for name, value in listed.items():
+        if name != "AIMART_PAY_TO_EVM":  # a placeholder both ways, worded differently
+            assert gh[name] == value, name
+    assert ("GCP_SECRET_ADMIN_TOKEN" in gh) == bool(extra)
+    assert ("AIMART_GCS_BUCKET" in gh) == bool(extra)
+    assert ("AIMART_ARTIFACT_MAX_TOTAL_BYTES" in gh) != bool(extra)
+    assert set(gh) <= documented_variables()
 
 
 @needs_bash

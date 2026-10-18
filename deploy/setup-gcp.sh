@@ -225,43 +225,41 @@ fi
 # set now. Replace it with your custom domain if you map one.
 URL="https://${SERVICE}-${PROJECT_NUMBER}.${REGION}.run.app"
 
-log "Done. Set these GitHub repository variables (Settings -> Secrets and variables -> Actions -> Variables)"
-cat << EOF
-
-  GCP_PROJECT_ID=${PROJECT_ID}
-  GCP_REGION=${REGION}
-  GCP_SERVICE=${SERVICE}
-  GCP_WORKLOAD_IDENTITY_PROVIDER=${PROVIDER}
-  GCP_SERVICE_ACCOUNT=${DEPLOYER_SA}
-  GCP_RUNTIME_SERVICE_ACCOUNT=${RUNTIME_SA}
-  GCP_SECRET_SIGNING_KEY=${SECRET_SIGNING_KEY}
-  GCP_SECRET_SIGNING_SECRET=${SECRET_SIGNING_SECRET}
-  AIMART_PUBLIC_BASE_URL=${URL}
-  PRODUCTION_URL=${URL}
-  AIMART_NETWORK_MODE=testnet
-  AIMART_PAY_TO_EVM=<your Base address: receive-only, never a key>
-EOF
+# One list for both printouts: the `gh` block once left out the optional variables the plain
+# list had, so copying it switched nothing on.
+github_vars=(
+  "GCP_PROJECT_ID=${PROJECT_ID}"
+  "GCP_REGION=${REGION}"
+  "GCP_SERVICE=${SERVICE}"
+  "GCP_WORKLOAD_IDENTITY_PROVIDER=${PROVIDER}"
+  "GCP_SERVICE_ACCOUNT=${DEPLOYER_SA}"
+  "GCP_RUNTIME_SERVICE_ACCOUNT=${RUNTIME_SA}"
+  "GCP_SECRET_SIGNING_KEY=${SECRET_SIGNING_KEY}"
+  "GCP_SECRET_SIGNING_SECRET=${SECRET_SIGNING_SECRET}"
+  "AIMART_PUBLIC_BASE_URL=${URL}"
+  "PRODUCTION_URL=${URL}"
+  "AIMART_NETWORK_MODE=testnet"
+)
 if [ -n "$BUCKET" ]; then
-  echo "  AIMART_GCS_BUCKET=${BUCKET}"
+  github_vars+=("AIMART_GCS_BUCKET=${BUCKET}")
 else
-  echo "  AIMART_ARTIFACT_MAX_TOTAL_BYTES=268435456"
+  github_vars+=("AIMART_ARTIFACT_MAX_TOTAL_BYTES=268435456")
 fi
-[ -z "$SECRET_ADMIN_TOKEN" ] || echo "  GCP_SECRET_ADMIN_TOKEN=${SECRET_ADMIN_TOKEN}"
+[ -z "$SECRET_ADMIN_TOKEN" ] || github_vars+=("GCP_SECRET_ADMIN_TOKEN=${SECRET_ADMIN_TOKEN}")
+
+log "Done. Set these GitHub repository variables (Settings -> Secrets and variables -> Actions -> Variables)"
+echo
+printf '  %s\n' "${github_vars[@]}"
+echo "  AIMART_PAY_TO_EVM=<your Base address: receive-only, never a key>"
+echo
+echo "Or with the GitHub CLI (run them yourself; this script never touches GitHub):"
+echo
+for pair in "${github_vars[@]}"; do
+  printf "  gh variable set %s --repo %s --body '%s'\n" "${pair%%=*}" "$GITHUB_REPO" "${pair#*=}"
+done
+printf "  gh variable set AIMART_PAY_TO_EVM --repo %s --body '0x...'\n" "$GITHUB_REPO"
 
 cat << EOF
-
-Or with the GitHub CLI (run them yourself; this script never touches GitHub):
-
-  gh variable set GCP_PROJECT_ID --repo ${GITHUB_REPO} --body '${PROJECT_ID}'
-  gh variable set GCP_REGION --repo ${GITHUB_REPO} --body '${REGION}'
-  gh variable set GCP_SERVICE --repo ${GITHUB_REPO} --body '${SERVICE}'
-  gh variable set GCP_WORKLOAD_IDENTITY_PROVIDER --repo ${GITHUB_REPO} --body '${PROVIDER}'
-  gh variable set GCP_SERVICE_ACCOUNT --repo ${GITHUB_REPO} --body '${DEPLOYER_SA}'
-  gh variable set GCP_RUNTIME_SERVICE_ACCOUNT --repo ${GITHUB_REPO} --body '${RUNTIME_SA}'
-  gh variable set AIMART_PUBLIC_BASE_URL --repo ${GITHUB_REPO} --body '${URL}'
-  gh variable set PRODUCTION_URL --repo ${GITHUB_REPO} --body '${URL}'
-  gh variable set AIMART_NETWORK_MODE --repo ${GITHUB_REPO} --body 'testnet'
-  gh variable set AIMART_PAY_TO_EVM --repo ${GITHUB_REPO} --body '0x...'
 
 Next: create the 'production' environment and the budgets (deploy/README.md), then run the
 Deploy workflow or merge a release PR.

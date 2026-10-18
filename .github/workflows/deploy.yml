@@ -159,10 +159,12 @@ jobs:
             "AIMART_SIGNING_SECRET=${GCP_SECRET_SIGNING_SECRET:-aimart-signing-secret}:latest"
           )
           [ -z "$GCP_SECRET_ADMIN_TOKEN" ] || secrets+=("AIMART_ADMIN_TOKEN=${GCP_SECRET_ADMIN_TOKEN}:latest")
+          # A secret is a name ([A-Za-z0-9_-]) or, for one kept in another project, the resource
+          # path Cloud Run takes: projects/<project number>/secrets/<name>. Anything else (a
+          # comma, `=`, a newline) would smuggle in another reference.
+          secret_re='^([A-Za-z0-9_-]{1,255}|projects/[a-z0-9-]{1,63}/secrets/[A-Za-z0-9_-]{1,255}):latest$'
           for line in "${secrets[@]}"; do
-            # A secret name is [A-Za-z0-9_-]; anything else (a comma, `=`) would smuggle in
-            # another reference.
-            [[ "${line#*=}" =~ ^[A-Za-z0-9_-]{1,255}:latest$ ]] || fail "invalid Secret Manager secret name in '${line%%=*}'"
+            [[ "${line#*=}" =~ $secret_re ]] || fail "invalid Secret Manager secret name in '${line%%=*}' (a name, or projects/<number>/secrets/<name>)"
           done
 
           delim="EOF_$(openssl rand -hex 12)"

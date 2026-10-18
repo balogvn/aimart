@@ -109,8 +109,8 @@ so both the deploy and the synthetic check can read them; every value here is pu
 | `GCP_RUNTIME_SERVICE_ACCOUNT` | yes | the runtime SA, from the script |
 | `GCP_REGION` | no | `us-central1` (default) |
 | `GCP_SERVICE` | no | `aimart-parquet` (default) |
-| `GCP_SECRET_SIGNING_KEY`, `GCP_SECRET_SIGNING_SECRET` | no | secret names, if you changed them |
-| `GCP_SECRET_ADMIN_TOKEN` | no | name of the Secret Manager secret holding `AIMART_ADMIN_TOKEN`, e.g. `aimart-admin-token`; unset: `GET /v1/demand` is off |
+| `GCP_SECRET_SIGNING_KEY`, `GCP_SECRET_SIGNING_SECRET` | no | secret names, if you changed them; a secret kept in another project is `projects/<project number>/secrets/<name>` (the runtime SA needs `secretAccessor` on it there) |
+| `GCP_SECRET_ADMIN_TOKEN` | no | name of the Secret Manager secret holding `AIMART_ADMIN_TOKEN`, e.g. `aimart-admin-token` (or its `projects/...` path, as above); unset: `GET /v1/demand` is off |
 | `AIMART_PUBLIC_BASE_URL` | yes | the run.app URL, or your custom domain |
 | `PRODUCTION_URL` | yes, for the synthetic check | same as above |
 | `AIMART_NETWORK_MODE` | no | `testnet` (default) or `mainnet` |
