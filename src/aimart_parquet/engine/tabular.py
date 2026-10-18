@@ -5,6 +5,11 @@ no filesystem access at all (data arrives only as registered Arrow datasets), ex
 statement which must be a SELECT, a row cap, and a watchdog that interrupts DuckDB at the
 deadline. Results are rendered compactly — JSON rows, a Markdown table, or CSV — with long
 cells truncated, because every byte returned is a token the agent pays to read.
+
+Memory: DuckDB's ``memory_limit`` covers only its own buffer manager, never the Arrow batches it
+hands back, the Python rows ``render`` builds, or a preview's Parquet decode. So both paths
+decode in small batches, cut long text before it is kept (inside DuckDB for queries), and refuse
+a result over ``MAX_RESULT_BYTES`` with a typed error instead of growing until the process dies.
 """
 
 from __future__ import annotations
@@ -19,22 +24,42 @@ import shutil
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import duckdb
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as pads
 import pyarrow.parquet as pq
 
 from aimart_parquet.engine.duck import connect, ident
 from aimart_parquet.engine.inspect import type_name
 from aimart_parquet.engine.models import TabularResult
-from aimart_parquet.errors import InvalidInput, InvalidRequest, QueryFailed, QueryRejected, Timeout
+from aimart_parquet.errors import (
+    InputTooLarge,
+    InvalidInput,
+    InvalidRequest,
+    QueryFailed,
+    QueryRejected,
+    Timeout,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 OutputFormat = Literal["json", "markdown", "csv"]
 TABLE_NAME_PATTERN = r"^[a-z_][a-z0-9_]{0,62}$"
 _MAX_SAFE_INT = 2**53
 _PATH_IN_MESSAGE = re.compile(r'"/[^"]*"')
+# A preview or query result larger than this (after long cells are cut) is refused, unpaid.
+# 1000 rows of 30 full-length text columns still fit; nothing that big is readable by an agent.
+MAX_RESULT_BYTES = 64 * 1024 * 1024
+# Rows decoded per Parquet read in preview. pads.dataset().take() decoded whole row groups before
+# any row cap: a 258-byte file (one row group of 20,000 rows, its dictionary one 64 KB string)
+# took 2.3 GB of RAM to preview one row. Reading this many rows at a time keeps it under 100 MB.
+_PREVIEW_BATCH_ROWS = 64
+# Rows per Arrow batch pulled from a query result; the byte cap is checked between batches.
+_QUERY_BATCH_ROWS = 256
 
 
 def _cell(value: Any, max_chars: int) -> Any:
@@ -70,11 +95,54 @@ def _text_cell(value: Any) -> str:
     return str(value)
 
 
+def _clip(batch: pa.RecordBatch, max_chars: int) -> pa.RecordBatch:
+    """Cut top-level text and binary cells to what ``_cell`` can show, before they are kept."""
+    arrays = []
+    for arr in batch.columns:
+        values = arr.dictionary if isinstance(arr, pa.DictionaryArray) else arr
+        kind = values.type
+        if pa.types.is_string(kind) or pa.types.is_large_string(kind):
+            values = pc.utf8_slice_codeunits(values, 0, max_chars + 1)  # code points, like len()
+        elif pa.types.is_binary(kind) or pa.types.is_large_binary(kind):
+            values = pc.binary_slice(values, 0, (max_chars + 1) // 2)  # _cell shows it as hex
+        if isinstance(arr, pa.DictionaryArray):
+            values = pa.DictionaryArray.from_arrays(arr.indices, values, ordered=arr.type.ordered)
+        arrays.append(values)
+    return pa.RecordBatch.from_arrays(arrays, schema=batch.schema)
+
+
+def _collect(batches: Iterable[pa.RecordBatch], rows: int, max_chars: int) -> list[pa.RecordBatch]:
+    """Keep up to ``rows`` rows, clipped, and refuse a result over MAX_RESULT_BYTES."""
+    kept: list[pa.RecordBatch] = []
+    seen = size = 0
+    if rows <= 0:
+        return kept
+    for batch in batches:
+        clipped = _clip(batch.slice(0, rows - seen), max_chars)
+        size += clipped.nbytes
+        if size > MAX_RESULT_BYTES:
+            raise InputTooLarge(
+                f"The result is over {MAX_RESULT_BYTES // (1024 * 1024)} MB after long cells "
+                f"were cut to {max_chars} characters.",
+                hint="Select fewer or narrower columns (nested values are not cut), or lower "
+                "limit; you were not charged.",
+                limit_bytes=MAX_RESULT_BYTES,
+            )
+        kept.append(clipped)
+        seen += clipped.num_rows
+        if seen >= rows:
+            break
+    return kept
+
+
 def render(
     table: pa.Table, *, fmt: OutputFormat, truncated: bool, max_chars: int, total: int | None = None
 ) -> TabularResult:
     columns = table.column_names
-    rows = [[_cell(v, max_chars) for v in row.values()] for row in table.to_pylist()]
+    # By position, never by name: every SELECT * join repeats names (id, name, id, name), and
+    # to_pylist()'s dicts kept only the last of each, so values shifted under the wrong headers.
+    values = [table.column(i).to_pylist() for i in range(table.num_columns)]
+    rows = [[_cell(v, max_chars) for v in row] for row in zip(*values, strict=True)]
     result = TabularResult(
         columns=columns,
         types=[type_name(f.type) for f in table.schema],
@@ -115,11 +183,11 @@ def preview(
 ) -> TabularResult:
     try:
         pf = pq.ParquetFile(path)
-    except (pa.ArrowInvalid, OSError) as exc:
+        names = pf.schema_arrow.names
+    except (pa.ArrowException, OSError) as exc:
         raise InvalidInput(
             f"Not a readable Parquet file: {exc}", hint="Convert the file first."
         ) from exc
-    names = pf.schema_arrow.names
     if columns:
         lowered = {n.lower(): n for n in names}
         unknown = [c for c in columns if c.lower() not in lowered]
@@ -132,15 +200,34 @@ def preview(
         columns = [lowered[c.lower()] for c in columns]
     total = pf.metadata.num_rows
     stop = min(offset + limit, total)
-    indices = (
-        pa.array(range(offset, stop), type=pa.int64())
-        if stop > offset
-        else pa.array([], pa.int64())
-    )
-    # take() decodes only the row groups that hold these indices, so a deep offset stays cheap.
-    table = pads.dataset(path).take(indices, columns=columns)
-    truncated = stop < total
-    return render(table, fmt=fmt, truncated=truncated, max_chars=max_chars, total=total)
+    try:
+        schema = pf.read_row_groups([], columns=columns).schema
+        batches = _collect(_rows_from(pf, offset, columns), stop - offset, max_chars)
+    except (pa.ArrowException, OSError) as exc:
+        raise InvalidInput(
+            f"The Parquet file is corrupt: {str(exc).splitlines()[0]}",
+            hint="Re-create the file, or convert the original again.",
+        ) from exc
+    table = pa.Table.from_batches(batches, schema=schema)
+    return render(table, fmt=fmt, truncated=stop < total, max_chars=max_chars, total=total)
+
+
+def _rows_from(
+    pf: pq.ParquetFile, offset: int, columns: list[str] | None
+) -> Iterable[pa.RecordBatch]:
+    """Batches starting exactly at row ``offset``; row groups before it are never read."""
+    meta = pf.metadata
+    first = 0
+    while first < meta.num_row_groups and offset >= meta.row_group(first).num_rows:
+        offset -= meta.row_group(first).num_rows
+        first += 1
+    groups = range(first, meta.num_row_groups)
+    for batch in pf.iter_batches(_PREVIEW_BATCH_ROWS, row_groups=groups, columns=columns):
+        if offset >= batch.num_rows:  # rows before the offset in its own row group
+            offset -= batch.num_rows
+            continue
+        yield batch.slice(offset)
+        offset = 0
 
 
 def validate_select(sql: str) -> str:
@@ -189,17 +276,21 @@ def query(
     timer = threading.Timer(query_timeout, con.interrupt)
     try:
         for name, path in tables.items():
-            con.register(name, pads.dataset(path))
+            try:
+                dataset = pads.dataset(path, format="parquet")
+            except (pa.ArrowException, OSError) as exc:  # its message names the server path
+                raise InvalidInput(
+                    f"Table {name!r} is not a readable Parquet file.",
+                    hint="Convert it first (/v1/convert or the convert tool) and pass the "
+                    "returned artifact_id.",
+                ) from exc
+            con.register(name, dataset)
         timer.start()
         try:
-            reader = con.execute(text).to_arrow_reader(min(limit + 1, 10_000))
-            batches: list[pa.RecordBatch] = []
-            seen = 0
-            for batch in reader:
-                batches.append(batch)
-                seen += batch.num_rows
-                if seen > limit:
-                    break
+            reader = con.execute(_clipped(con, text, max_chars)).to_arrow_reader(
+                min(limit + 1, _QUERY_BATCH_ROWS)
+            )
+            batches = _collect(reader, limit + 1, max_chars)
             table = pa.Table.from_batches(batches, schema=reader.schema)
         except duckdb.InterruptException as exc:
             raise Timeout(
@@ -219,3 +310,36 @@ def query(
         shutil.rmtree(spill, ignore_errors=True)
     truncated = table.num_rows > limit
     return render(table.slice(0, limit), fmt=fmt, truncated=truncated, max_chars=max_chars)
+
+
+def _clipped(con: duckdb.DuckDBPyConnection, text: str, max_chars: int) -> str:
+    """The caller's SELECT with long text and BLOB cells cut inside DuckDB.
+
+    ``SELECT repeat('x', 1000000) FROM range(1000)`` reached 2.3 GB of RSS: DuckDB built each
+    result chunk, then Arrow copied it, all outside memory_limit. Cut by ``left()`` in the same
+    plan it stays under 100 MB. Columns are picked by position (``#n``) and renamed back, so
+    repeated names (``SELECT *`` over a join) survive the subquery unchanged.
+    """
+    # Binds the statement without running it. Typed as never None, but DuckDB returns None for
+    # statements that are not queries; validate_select makes that unexpected, not impossible.
+    rel: duckdb.DuckDBPyRelation | None = con.sql(text)
+    if rel is None:
+        return text
+    exprs, cut = [], False
+    for i, (name, kind) in enumerate(zip(rel.columns, rel.types, strict=True), start=1):
+        expr = f"#{i}"
+        if kind.id == "varchar":
+            expr, cut = f"left({expr}, {max_chars + 1})", True
+        elif kind.id == "blob":
+            expr, cut = f"{expr}[1:{(max_chars + 1) // 2}]", True
+        exprs.append(f"{expr} AS {ident(name)}")
+    if not cut:
+        return text
+    # The newlines keep a trailing -- comment in the caller's SQL from eating the ")".
+    wrapped = f"SELECT {', '.join(exprs)} FROM (\n{text}\n) AS q"
+    try:
+        validate_select(wrapped)
+        con.sql(wrapped)
+    except (QueryRejected, duckdb.Error):
+        return text  # never fail a valid query over our wrapper; the byte cap still holds
+    return wrapped
