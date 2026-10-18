@@ -113,8 +113,34 @@ def unwrap(
     return src, filename
 
 
+def _sql_type(col: ExpectedColumn) -> str:
+    """The DuckDB type for an expected_schema column; an impossible decimal is the caller's error."""
+    if col.type != "decimal":
+        return SQL_TYPES[col.type]
+    # Explicit None checks: scale 0 is a real request. `col.scale or 2` made DECIMAL(10, 0) a
+    # DECIMAL(10, 2), so 1234567890 overflowed to NULL and strict failed on matching data.
+    precision = 18 if col.precision is None else col.precision
+    scale = 2 if col.scale is None else col.scale
+    if scale > precision:
+        default = " (the default)" if col.scale is None else ""
+        raise InvalidRequest(
+            f"expected_schema column {col.name!r}: decimal scale {scale}{default} exceeds "
+            f"precision {precision}.",
+            hint="Pass a scale no larger than precision, e.g. precision 10 with scale 2 "
+            "(scale 0 for whole numbers).",
+            column=col.name,
+        )
+    return f"DECIMAL({precision}, {scale})"
+
+
+def _check_expected_schema(options: ConvertOptions) -> None:
+    """Refuse an impossible schema before reading the file, not after (DuckDB raises a 500)."""
+    for col in options.expected_schema or ():
+        _sql_type(col)
+
+
 def _expected_expr(inferrer: TypeInferrer, out: _Output, col: ExpectedColumn) -> str:
-    target = SQL_TYPES.get(col.type) or f"DECIMAL({col.precision or 18}, {col.scale or 2})"
+    target = _sql_type(col)
     if out.plan.type_name == col.type:
         return out.plan.expr
     if out.plan.type_name == "string" and out.raw is not None:
@@ -140,7 +166,7 @@ def _apply_expected_schema(
     result: list[_Output] = []
     for col in options.expected_schema:
         out = by_name.get(col.name.lower())
-        target = SQL_TYPES.get(col.type) or f"DECIMAL({col.precision or 18}, {col.scale or 2})"
+        target = _sql_type(col)
         if out is None:
             if options.strict or not col.nullable:
                 violations.append({"column": col.name, "problem": "missing"})
@@ -154,9 +180,12 @@ def _apply_expected_schema(
             f"count_if(({expr}) IS NULL) FROM {ident(table)}"
         ).fetchone()
         rejects, nulls = (int(row[0]), int(row[1])) if row else (0, 0)
-        if rejects and options.strict:
+        # Values inference already nulled (the 98% tolerance) do not fit either. Counting only
+        # this cast's rejects let strict=true pass, and charge, with 'oops' in an int64 column.
+        misfits = out.plan.rejected_count + rejects
+        if misfits and options.strict:
             violations.append(
-                {"column": col.name, "problem": f"{rejects} values do not fit {col.type}"}
+                {"column": col.name, "problem": f"{misfits} values do not fit {col.type}"}
             )
         if nulls and not col.nullable:
             violations.append(
@@ -201,6 +230,7 @@ def convert_file(
     limits: Limits,
 ) -> ConversionReport:
     started = time.monotonic()
+    _check_expected_schema(options)
     source_bytes = safety.ensure_size(src, limits.max_input_bytes)
     path, name = unwrap(src, filename, workdir, limits)
     fmt = detect_format(path, safety.read_magic(path), name, options.format)

@@ -295,9 +295,12 @@ class TestTemporal:
             dt.datetime(2024, 1, 15, 8, 30),
         ]
 
-    def test_mixed_offsets_and_naive_values_do_not_become_timestamptz(self) -> None:
-        plan, _ = infer(["2024-01-15T10:30:00Z", "2024-01-15 10:30:00"])
-        assert plan.type_name == "timestamp"
+    def test_an_even_mix_of_offsets_and_naive_values_stays_text(self) -> None:
+        """Neither reading fits both: the offset is never dropped, and UTC is not assumed."""
+        values = ["2024-01-15T10:30:00+02:00", "2024-01-15 10:30:00"]
+        plan, out = infer(values)
+        assert plan.type_name == "string"
+        assert out == values
 
     def test_date_rejects_are_counted_under_tolerance(self) -> None:
         values = [f"2024-01-{d:02d}" for d in range(1, 29)] * 4 + ["2024-02-30"]
