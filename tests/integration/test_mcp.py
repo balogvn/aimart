@@ -86,7 +86,7 @@ async def test_remote_tool_set_and_schemas(settings: Settings) -> None:
     server = build_mcp(make_service(settings, local=False), settings, local_mode=False)
     async with mcp.Client(server) as client:
         tools = {t.name: t for t in (await client.list_tools()).tools}
-    assert set(tools) == {*PAID_TOOLS, "verify_provenance"}
+    assert set(tools) == {*PAID_TOOLS, "verify_provenance", "request_capability"}
     for name, tool in tools.items():
         props = set(tool.input_schema.get("properties", {}))
         assert not props & LOCAL_ONLY_ARGS, f"{name} exposes a server path to remote callers"
@@ -183,7 +183,7 @@ async def test_tools_list_and_initialize_are_free(
 ) -> None:
     async with kit.mcp_over_http(paid_app.app) as client:
         tools = (await client.list_tools()).tools
-    assert {t.name for t in tools} == {*PAID_TOOLS, "verify_provenance"}
+    assert {t.name for t in tools} == {*PAID_TOOLS, "verify_provenance", "request_capability"}
     assert facilitator.verified == []
     assert facilitator.settled == []
 

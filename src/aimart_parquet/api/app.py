@@ -12,6 +12,7 @@ stay free so directories and agents can discover the tools. MCP charges per tool
 from __future__ import annotations
 
 import contextlib
+import hmac
 import logging
 import tempfile
 from pathlib import Path
@@ -21,7 +22,7 @@ from urllib.parse import urlsplit
 import anyio
 import anyio.to_thread
 from fastapi import FastAPI, File, Form, Query, Request, UploadFile
-from fastapi.exceptions import RequestValidationError
+from fastapi.exceptions import HTTPException, RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import ValidationError
@@ -44,6 +45,7 @@ from aimart_parquet.api.schemas import (
 )
 from aimart_parquet.artifacts import ArtifactStore, build_store
 from aimart_parquet.config import Settings, get_settings
+from aimart_parquet.demand import CapabilityAck, CapabilityRequest, DemandSignals
 from aimart_parquet.engine.models import ConvertOptions, ConvertResult, InspectResult, TabularResult
 from aimart_parquet.errors import AimartError, ArtifactNotFound, InputTooLarge, InvalidRequest
 from aimart_parquet.logs import configure as configure_logging
@@ -83,7 +85,8 @@ def create_app(
     signer = Signer.from_b64(
         settings.signing_key_mldsa.get_secret_value() if settings.signing_key_mldsa else None
     )
-    service = Service(settings, store, local_mode=False, signer=signer)
+    demand = DemandSignals()
+    service = Service(settings, store, local_mode=False, signer=signer, demand=demand)
 
     def paid(key: str) -> dict[str, Any]:
         """OpenAPI x-payment-info: how x402scan and agents learn the price from the schema."""
@@ -303,8 +306,26 @@ def create_app(
     )
     async def query(body: QueryBody) -> TabularResult:
         return await service.query(
-            {"data": body.source()}, body.sql, limit=body.limit, fmt=body.format
+            body.table_sources(), body.sql, limit=body.limit, fmt=body.format
         )
+
+    @app.post(
+        "/v1/feedback",
+        summary="Tell us what you needed and would pay for (free)",
+        openapi_extra=free,
+    )
+    async def feedback(body: CapabilityRequest) -> CapabilityAck:
+        return demand.capability_request(body)
+
+    @app.get("/v1/demand", include_in_schema=False)
+    async def demand_report(request: Request) -> dict[str, Any]:
+        token = settings.admin_token.get_secret_value() if settings.admin_token else ""
+        given = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+        # Off unless a token is configured; constant-time compare; 404 either way on failure,
+        # so the endpoint's existence is not advertised.
+        if not token or not hmac.compare_digest(given.encode(), token.encode()):
+            raise HTTPException(status_code=404, detail="Not Found")
+        return demand.snapshot()
 
     if quantum_enabled(settings):  # keep in step with pricing.active_operations()
 

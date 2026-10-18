@@ -36,6 +36,7 @@ _EXTENSIONS: dict[str, InputFormat] = {
     ".xpt": InputFormat.XPT,
     ".parquet": InputFormat.PARQUET,
     ".pq": InputFormat.PARQUET,
+    ".pdf": InputFormat.PDF,
 }
 
 SUPPORTED_EXTENSIONS = tuple(sorted(_EXTENSIONS))
@@ -74,6 +75,8 @@ def _zip_office_format(path: Path) -> InputFormat | None:
 def format_from_magic(path: Path, magic: bytes) -> InputFormat | None:
     if magic.startswith(b"PAR1"):
         return InputFormat.PARQUET
+    if magic.lstrip(b"\x00\t\r\n ")[:5] == b"%PDF-":
+        return InputFormat.PDF
     if magic.startswith(b"$FL3"):
         return InputFormat.ZSAV
     if magic.startswith(b"$FL2"):
@@ -134,7 +137,7 @@ def detect_format(
         raise UnsupportedFormat(
             "Could not recognise this binary file.",
             hint=(
-                "Supported: CSV/TSV, JSON/NDJSON, Excel (xlsx/xls/ods), SPSS (sav/zsav/por), "
+                "Supported: CSV/TSV, JSON/NDJSON, Excel (xlsx/xls/ods), tables in digital PDFs, SPSS (sav/zsav/por), "
                 "Stata (dta), SAS (sas7bdat/xpt), Parquet — optionally gzip/bz2/zip compressed. "
                 "Pass options.format if the file is one of these."
             ),

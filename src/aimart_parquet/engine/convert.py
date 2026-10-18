@@ -33,6 +33,7 @@ from aimart_parquet.engine.readers.columnar import read_parquet_input
 from aimart_parquet.engine.readers.delimited import read_delimited
 from aimart_parquet.engine.readers.excel import read_excel
 from aimart_parquet.engine.readers.jsonish import read_json
+from aimart_parquet.engine.readers.pdf import read_pdf
 from aimart_parquet.engine.readers.statistical import labels_json, read_statistical
 from aimart_parquet.engine.writer import copy_to_parquet, write_parquet
 from aimart_parquet.errors import InvalidRequest, SchemaViolation
@@ -60,6 +61,7 @@ READERS: dict[InputFormat, Reader] = {
     InputFormat.SAS7BDAT: read_statistical,
     InputFormat.XPT: read_statistical,
     InputFormat.PARQUET: read_parquet_input,
+    InputFormat.PDF: read_pdf,
 }
 
 _MAX_COLUMNS_META = 256 * 1024  # file-level label map; huge survey files keep field metadata only

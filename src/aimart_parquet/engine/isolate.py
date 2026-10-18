@@ -52,6 +52,7 @@ if _METHOD == "forkserver":
             "aimart_parquet.quantum.kernel_pca",
             "aimart_parquet.quantum.portfolio",
             "pennylane",  # the quantum modules import it lazily; preload it explicitly
+            "pdfplumber",
         ]
     )
 

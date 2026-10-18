@@ -23,8 +23,9 @@ from pydantic import BaseModel, Field
 
 from aimart_parquet import __version__
 from aimart_parquet.config import Settings
+from aimart_parquet.demand import CapabilityAck, CapabilityRequest
 from aimart_parquet.engine.models import ConvertOptions, ConvertResult, InspectResult, TabularResult
-from aimart_parquet.errors import AimartError
+from aimart_parquet.errors import AimartError, InvalidRequest
 from aimart_parquet.payments.pricing import quantum_enabled
 from aimart_parquet.quantum.models import (
     PortfolioOptions,
@@ -45,8 +46,8 @@ inspect_parquet or preview_parquet to look -> query_parquet to answer questions 
 Pass the artifact_id between calls instead of re-sending the file.
 
 Inputs: a public http(s) `url` (best for large files), or `content_base64` plus `filename` \
-(small files, under ~3 MB). Formats: CSV/TSV, JSON/NDJSON, Excel (xlsx/xls/ods), \
-SPSS (sav/zsav/por), Stata (dta), SAS (sas7bdat/xpt), Parquet; optionally gzip/bz2/zip.\
+(small files, under ~3 MB). Formats: CSV/TSV, JSON/NDJSON, Excel (xlsx/xls/ods), tables in \
+digital PDFs, SPSS (sav/zsav/por), Stata (dta), SAS (sas7bdat/xpt), Parquet; optionally gzip/bz2/zip.\
 """
 
 UrlArg = Annotated[
@@ -163,8 +164,9 @@ def build_mcp(
 
     convert_description = f"""Convert a messy data file into clean, typed, zstd-compressed Parquet.
 
-Use this first for any CSV/TSV, JSON/NDJSON, Excel, SPSS, Stata or SAS file. It detects the \
-format, encoding and delimiter; skips title rows; repairs broken JSON; infers int/float/bool/\
+Use this first for any CSV/TSV, JSON/NDJSON, Excel, SPSS, Stata or SAS file, or a digital PDF \
+with tables. It detects the format, encoding and delimiter; skips title rows; repairs broken JSON; \
+pulls tables out of PDFs (merging tables that continue across pages); infers int/float/bool/\
 date/timestamp columns (including 1.234,56 and $1,234 formats) while keeping IDs with leading \
 zeros as text; normalizes column names to snake_case; keeps SPSS/Stata/SAS variable and value \
 labels; and can validate against an expected_schema.
@@ -237,7 +239,8 @@ a .parquet file. {note(settings.price_inspect)}"""
 CSV. Use to eyeball data; use query_parquet to filter or aggregate. Long cells are truncated. \
 {note(settings.price_preview)}"""
     query_description = f"""Run one read-only DuckDB SELECT over a Parquet file, available as \
-table `data`. Supports aggregates, window functions, CTEs, DESCRIBE data and SUMMARIZE data. \
+table `data`; join more files by passing `tables` ({{name: artifact_id}}), e.g. a GL against a \
+bank statement. Supports aggregates, window functions, CTEs, DESCRIBE data and SUMMARIZE data. \
 Up to {settings.max_query_rows} rows are returned; `truncated` says if more matched. Writes, \
 file access and multiple statements are rejected. Example: SELECT region, sum(units) FROM data \
 GROUP BY 1 ORDER BY 2 DESC. {note(settings.price_query)}"""
@@ -271,8 +274,26 @@ GROUP BY 1 ORDER BY 2 DESC. {note(settings.price_query)}"""
             )
         )
 
-    async def _query(src: SourceRef, sql: str, limit: int, fmt: Any) -> CallToolResult:
-        return await _guard(lambda: _wrap(service.query({"data": src}, sql, limit=limit, fmt=fmt)))
+    def _tables(
+        src: SourceRef, extra: dict[str, str] | None, *, local: bool
+    ) -> dict[str, SourceRef]:
+        refs: dict[str, SourceRef] = {"data": src} if src.kinds() else {}
+        for name, value in (extra or {}).items():
+            if name in refs:
+                raise InvalidRequest(
+                    f"Table name {name!r} is used twice.", hint="`data` is the main input."
+                )
+            refs[name] = SourceRef(path=value) if local else SourceRef(artifact_id=value)
+        return refs
+
+    async def _query(
+        src: SourceRef, sql: str, limit: int, fmt: Any, extra: dict[str, str] | None = None
+    ) -> CallToolResult:
+        async def run() -> CallToolResult:
+            tables = _tables(src, extra, local=local_mode)
+            return await _wrap(service.query(tables, sql, limit=limit, fmt=fmt))
+
+        return await _guard(run)
 
     if local_mode:
 
@@ -313,10 +334,17 @@ GROUP BY 1 ORDER BY 2 DESC. {note(settings.price_query)}"""
             sql: Sql,
             path: PathArg = None,
             url: UrlArg = None,
+            tables: Annotated[
+                dict[str, str] | None,
+                Field(
+                    description="Extra tables for joins: {name: local path}. The main input is `data`.",
+                    max_length=8,
+                ),
+            ] = None,
             limit: QueryLimit = 100,
             format: FormatArg = "json",
         ) -> Annotated[CallToolResult, TabularResult]:
-            return await _query(SourceRef(path=path, url=url), sql, limit, format)
+            return await _query(SourceRef(path=path, url=url), sql, limit, format, tables)
 
     else:
 
@@ -359,16 +387,46 @@ GROUP BY 1 ORDER BY 2 DESC. {note(settings.price_query)}"""
             sql: Sql,
             artifact_id: ArtifactArg = None,
             url: UrlArg = None,
+            tables: Annotated[
+                dict[str, str] | None,
+                Field(
+                    description="Extra tables for joins: {name: artifact_id}. The main input is `data`.",
+                    max_length=8,
+                ),
+            ] = None,
             limit: QueryLimit = 100,
             format: FormatArg = "json",
         ) -> Annotated[CallToolResult, TabularResult]:
-            return await _query(SourceRef(artifact_id=artifact_id, url=url), sql, limit, format)
+            return await _query(
+                SourceRef(artifact_id=artifact_id, url=url), sql, limit, format, tables
+            )
 
     if quantum_enabled(settings):  # keep in step with pricing.active_operations()
         _register_quantum_tools(server, service, settings, local_mode=local_mode)
     if not local_mode and service.signer is not None:
         _register_verify_tool(server, service)
+    if not local_mode:
+        _register_feedback_tool(server, service)
     return server
+
+
+def _register_feedback_tool(server: MCPServer, service: Service) -> None:
+    @server.tool(
+        name="request_capability",
+        title="Request a capability (free)",
+        description="""Free. If none of these tools does what you need — a file type we reject, an \
+output we do not produce, a missing operation — describe the task, the formats involved, and \
+the most you would pay per call. The operator reads these to decide what to build next. Do not \
+include personal or confidential data.""",
+        annotations=ToolAnnotations(
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=False,
+            open_world_hint=False,
+        ),
+    )
+    async def request_capability(request: CapabilityRequest) -> CapabilityAck:
+        return service.demand.capability_request(request)
 
 
 QUANTUM_HONESTY = (

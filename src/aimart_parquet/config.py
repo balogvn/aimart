@@ -138,6 +138,11 @@ class Settings(BaseSettings):
         description="Local mode: URL of the hosted service, mentioned once in results for premium tools.",
     )
 
+    admin_token: SecretStr | None = Field(
+        default=None,
+        description="Bearer token for GET /v1/demand (demand signals). Unset: the endpoint is off.",
+    )
+
     # ---------------------------------------------------------------- ops
     log_level: str = "INFO"
     log_json: bool = True

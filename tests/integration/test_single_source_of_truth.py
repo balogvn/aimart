@@ -30,8 +30,8 @@ if TYPE_CHECKING:
 
 pytestmark = pytest.mark.anyio
 
-FREE_POSTS = {"/v1/verify"}
-FREE_TOOLS = {"verify_provenance"}
+FREE_POSTS = {"/v1/verify", "/v1/feedback"}
+FREE_TOOLS = {"verify_provenance", "request_capability"}
 PRICES = {
     "price_convert": "$0.011",
     "price_inspect": "$0.0021",
@@ -122,8 +122,13 @@ async def test_every_operation_is_wired_everywhere_with_one_price(
 
 async def test_free_route_set_is_explicit(make_settings: Callable[..., Settings]) -> None:
     async with kit.running_app(make_settings()) as h:
+        bodies = {
+            "/v1/verify": {"manifest": {}, "signature": "AAAA"},
+            "/v1/feedback": {"task": "need XML support"},
+        }
+        assert set(bodies) == FREE_POSTS
         for path in FREE_POSTS:
-            r = await h.http.post(path, json={"manifest": {}, "signature": "AAAA"})
+            r = await h.http.post(path, json=bodies[path])
             assert r.status_code == 200, path
     assert h.facilitator is not None
     assert h.facilitator.verified == []

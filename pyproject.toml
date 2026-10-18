@@ -27,6 +27,7 @@ dependencies = [
   "httpx>=0.28.1",
   "json-repair>=0.64.0",
   "mcp>=2.3.0,<3",
+  "pdfplumber>=0.11.10",
   "pyarrow>=26.0.0",
   "pydantic>=2.14.0",
   "pydantic-settings>=2.15.0",
@@ -55,6 +56,7 @@ aimart-parquet = "aimart_parquet.cli:main"
 [dependency-groups]
 dev = [
   "anyio>=4.6",
+  "fpdf2>=2.8",
   "hypothesis>=6.169.0",
   "mutmut>=3.8.0",
   "mypy>=2.4.0",

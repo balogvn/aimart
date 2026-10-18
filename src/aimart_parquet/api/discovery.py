@@ -35,6 +35,7 @@ def pricing(settings: Settings, networks: list[dict[str, str]]) -> dict[str, Any
         "x402Version": 2,
         "networks": networks,
         "charged": "only on success (HTTP < 400 / MCP isError=false)",
+        "data_retention": retention_policy(settings),
         "operations": [
             {
                 "operation": op.key,
@@ -55,9 +56,29 @@ def pricing(settings: Settings, networks: list[dict[str, str]]) -> dict[str, Any
             "GET /.well-known/mcp/server-card.json",
             "GET /.well-known/aimart-signing-key",
             "POST /v1/verify",
+            "POST /v1/feedback and the request_capability tool",
             "GET /v1/artifacts/{id}/{filename} (signed link)",
-            "MCP initialize, tools/list and the verify_provenance tool",
+            "MCP initialize, tools/list, verify_provenance and request_capability",
         ],
+    }
+
+
+def retention_policy(settings: Settings) -> dict[str, Any]:
+    """What happens to caller data — stated once, derived from the settings that enforce it.
+
+    Every buyer persona we asked raised data handling before price. These are facts about the
+    code paths (per-request work directories, artifact TTL, log fields), not aspirations.
+    """
+    minutes = settings.artifact_ttl_s // 60
+    return {
+        "inputs": "deleted when the call finishes (each call works in its own temporary directory)",
+        "outputs": f"converted files are deleted {minutes} minutes after creation"
+        + (" (a 1-day storage lifecycle rule is the backstop)" if settings.gcs_bucket else ""),
+        "logs": "request method, path, status and duration; never file contents",
+        "training": "your data is never used to train models",
+        "sharing": "none; the payment facilitator sees the payment, never the data",
+        "local_mode": "the free local server never sends files anywhere",
+        "details": "https://github.com/balogvn/aimart/blob/main/docs/privacy.md",
     }
 
 
@@ -75,6 +96,7 @@ def service_index(settings: Settings) -> dict[str, Any]:
         "x402_discovery": f"{base}/.well-known/x402",
         "source": "https://github.com/balogvn/aimart",
         "formats": list(SUPPORTED_EXTENSIONS),
+        "data_retention": retention_policy(settings),
     }
 
 
@@ -106,6 +128,10 @@ def llms_txt(settings: Settings) -> str:
         "## Notes",
         "",
         "- Inputs: `url` (preferred), `content_base64` + `filename`, or `artifact_id` from an earlier convert.",
+        "- Data handling: inputs are deleted when the call ends, outputs after "
+        f"{settings.artifact_ttl_s // 60} minutes; file contents are never logged or used for training.",
+        "- Missing something? Call the free `request_capability` tool (or POST /v1/feedback) with "
+        "the task and what you would pay.",
         "- convert returns an `artifact_id` and a signed `download_url`; artifacts expire after "
         f"{settings.artifact_ttl_s // 60} minutes.",
         f"- Supported extensions: {', '.join(SUPPORTED_EXTENSIONS)} (optionally .gz/.bz2/.zip).",

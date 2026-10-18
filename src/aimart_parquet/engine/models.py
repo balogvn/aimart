@@ -27,6 +27,7 @@ class InputFormat(StrEnum):
     SAS7BDAT = "sas7bdat"
     XPT = "xpt"
     PARQUET = "parquet"
+    PDF = "pdf"
 
 
 class DateOrder(StrEnum):
@@ -93,6 +94,17 @@ class ConvertOptions(BaseModel):
     date_order: DateOrder = Field(
         default=DateOrder.AUTO,
         description="Order for ambiguous dates like 03/04/2025. auto assumes day-first.",
+    )
+    pdf_pages: str | None = Field(
+        default=None,
+        max_length=200,
+        pattern=r"^[0-9 ,\-]+$",
+        description="PDF only: pages to read, e.g. '1-3,7'. Default: all (up to 300).",
+    )
+    pdf_table: int | None = Field(
+        default=None,
+        ge=0,
+        description="PDF only: which detected table to convert (see available_sheets). Default: the largest.",
     )
     json_records_path: str | None = Field(
         default=None,

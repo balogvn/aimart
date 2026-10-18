@@ -8,6 +8,7 @@ and both map ``AimartError`` to a >= 400 response that cancels payment.
 from __future__ import annotations
 
 import functools
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 import anyio
 import anyio.to_thread
 
+from aimart_parquet.demand import DemandSignals
 from aimart_parquet.engine.convert import convert_file
 from aimart_parquet.engine.inspect import inspect_parquet
 from aimart_parquet.engine.isolate import run_isolated
@@ -30,7 +32,7 @@ from aimart_parquet.engine.models import (
     TabularResult,
 )
 from aimart_parquet.engine.tabular import OutputFormat, preview, query
-from aimart_parquet.errors import AimartError, Busy, InvalidRequest, Timeout
+from aimart_parquet.errors import AimartError, Busy, InvalidRequest, Timeout, UnsupportedFormat
 from aimart_parquet.provenance import ALGORITHM, build_manifest
 from aimart_parquet.provenance import verify as verify_signature
 from aimart_parquet.sources import decode_base64, fetch_url, safe_filename
@@ -50,6 +52,8 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 _QUEUE_FACTOR = 4  # callers allowed to wait per worker slot before we answer "busy"
+MAX_QUERY_TABLES = 8
+TABLE_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 
 
 class QuantumUnavailable(AimartError):
@@ -84,11 +88,13 @@ class Service:
         *,
         local_mode: bool = False,
         signer: Signer | None = None,
+        demand: DemandSignals | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.local_mode = local_mode
         self.signer = signer
+        self.demand = demand or DemandSignals()
         self.limits = Limits.from_settings(settings)
         self._limiter = anyio.CapacityLimiter(max(1, settings.max_concurrent_jobs))
         self._workroot = settings.artifact_dir / ".work"
@@ -179,24 +185,28 @@ class Service:
         try:
             in_path, name = await self._materialize(src, workdir)
             out = workdir / "out.parquet"
-            report = await self._execute(
-                convert_file,
-                in_path,
-                out,
-                filename=name,
-                options=options,
-                workdir=workdir,
-                limits=self.limits,
-                timeout_s=self.settings.convert_timeout_s,
-                isolate=self.settings.isolate_jobs,
-            )
+            try:
+                report = await self._execute(
+                    convert_file,
+                    in_path,
+                    out,
+                    filename=name,
+                    options=options,
+                    workdir=workdir,
+                    limits=self.limits,
+                    timeout_s=self.settings.convert_timeout_s,
+                    isolate=self.settings.isolate_jobs,
+                )
+            except UnsupportedFormat:
+                self.demand.unsupported_format(name)  # roadmap signal: what agents tried to send
+                raise
             stem = Path(name).name.split(".")[0] if name else "data"
             ref = self._publish(src, out, f"{stem or 'data'}.parquet", "convert", output_path)
             hint = None
             if self.local_mode and self.settings.hosted_url:
                 hint = (
-                    f"Premium tools (quantum_compress_features, quantum_optimize_portfolio) and "
-                    f"hosted conversion with signed provenance: {self.settings.hosted_url}"
+                    "Hosted version (no install; signed provenance, works from any agent "
+                    f"platform): {self.settings.hosted_url}"
                 )
             return ConvertResult(artifact=ref, report=report, hint=hint)
         finally:
@@ -304,6 +314,17 @@ class Service:
         if not tables:
             raise InvalidRequest(
                 "No tables to query.", hint="Pass an input; it is available as table `data`."
+            )
+        if len(tables) > MAX_QUERY_TABLES:
+            raise InvalidRequest(
+                f"{len(tables)} tables requested; the limit is {MAX_QUERY_TABLES}.",
+                hint="Join fewer files per query, or pre-aggregate them.",
+            )
+        bad = [name for name in tables if not TABLE_NAME.match(name)]
+        if bad:
+            raise InvalidRequest(
+                f"Invalid table names: {bad}.",
+                hint="Use lowercase names of letters, digits and underscores, e.g. 'gl' or 'bank_2025'.",
             )
         limit = max(1, min(limit, self.settings.max_query_rows))
         workdir = self._workdir()

@@ -7,6 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from aimart_parquet.engine.models import ConvertOptions
+from aimart_parquet.errors import InvalidRequest
 from aimart_parquet.quantum.models import PortfolioOptions, QuantumCompressOptions
 from aimart_parquet.service import SourceRef
 
@@ -47,10 +48,43 @@ class PreviewBody(SourceBody):
     format: Literal["json", "markdown", "csv"] = "json"
 
 
+class TableRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: str | None = Field(default=None, max_length=64)
+    url: str | None = Field(default=None, max_length=4096)
+
+    def source(self) -> SourceRef:
+        return SourceRef(artifact_id=self.artifact_id, url=self.url)
+
+
 class QueryBody(SourceBody):
     sql: str = Field(
-        min_length=1, max_length=20_000, description="One DuckDB SELECT over table `data`."
+        min_length=1,
+        max_length=20_000,
+        description="One DuckDB SELECT. The top-level input is table `data`; `tables` adds more.",
     )
+    tables: dict[str, TableRef] | None = Field(
+        default=None,
+        max_length=8,
+        description=(
+            "Extra named tables for joins, e.g. {'gl': {'artifact_id': ...}, 'bank': {...}}. "
+            "Names: lowercase letters, digits, underscores."
+        ),
+    )
+
+    def table_sources(self) -> dict[str, SourceRef]:
+        refs: dict[str, SourceRef] = {}
+        if self.source().kinds():
+            refs["data"] = self.source()
+        for name, ref in (self.tables or {}).items():
+            if name in refs:
+                raise InvalidRequest(
+                    f"Table name {name!r} is used twice.", hint="`data` is the top-level input."
+                )
+            refs[name] = ref.source()
+        return refs
+
     limit: int = Field(default=100, ge=1, le=1000)
     format: Literal["json", "markdown", "csv"] = "json"
 
