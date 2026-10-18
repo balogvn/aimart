@@ -5,9 +5,13 @@
 Messy data in, clean Parquet out, paid per call by AI agents.
 
 AImart Parquet is an MCP server and REST API that turns messy CSV/TSV, JSON/NDJSON, Excel,
-SPSS, Stata and SAS files into clean, typed, zstd-compressed Parquet. You can then inspect the
-result (footer only), preview rows, and query it with sandboxed, read-only DuckDB SQL. Agents
-pay per call in USDC with [x402 v2](https://www.x402.org/). There is no signup and no API key.
+SPSS, Stata and SAS files, and tables in digital PDFs, into clean, typed, zstd-compressed
+Parquet. You can then inspect the result (footer only), preview rows, and query it with
+sandboxed, read-only DuckDB SQL, including joins across several files. Agents pay per call in
+USDC with [x402 v2](https://www.x402.org/). There is no signup and no API key.
+
+**Your data:** inputs are deleted when the call ends, converted files after 60 minutes, and file
+contents are never logged or used for training. Details: [docs/privacy.md](docs/privacy.md).
 
 Why it exists: an agent that reads a 100,000-row CSV as text spends a large share of its
 context on raw rows. With this service it reads a compact schema report and then asks targeted
@@ -181,13 +185,14 @@ deployment can override each price with `AIMART_PRICE_*`. Its live list is at `G
 | convert | `POST /v1/convert`, `POST /v1/convert/upload` (multipart) | `convert_to_parquet` | $0.02 |
 | inspect (footer only) | `POST /v1/inspect` | `inspect_parquet` | $0.002 |
 | preview | `POST /v1/preview` | `preview_parquet` | $0.002 |
-| query (one read-only SELECT) | `POST /v1/query` | `query_parquet` | $0.005 |
+| query (one read-only SELECT; joins up to 8 files via `tables`) | `POST /v1/query` | `query_parquet` | $0.005 |
 | premium (off by default): quantum-kernel PCA | `POST /v1/quantum/compress` | `quantum_compress_features` | $0.50 |
 | premium (off by default): QAOA portfolio | `POST /v1/quantum/portfolio` | `quantum_optimize_portfolio` | $1.00 |
 
 **Free:** `GET /`, `/health`, `/pricing`, `/llms.txt`, `/openapi.json`, `/docs`,
 `/.well-known/x402`, `/.well-known/mcp/server-card.json`, `/.well-known/aimart-signing-key`,
-`POST /v1/verify` and the `verify_provenance` tool, signed artifact downloads
+`POST /v1/verify` and the `verify_provenance` tool, `POST /v1/feedback` and the
+`request_capability` tool (tell us what you needed and would pay for), signed artifact downloads
 (`GET /v1/artifacts/{id}/{filename}?exp&sig`), MCP `initialize` and `tools/list`, and the whole
 local stdio server.
 
@@ -210,6 +215,7 @@ must be switched on explicitly by the operator. See [docs/payments.md](docs/paym
 | Stata | `.dta` | labels kept |
 | SAS | `.sas7bdat` `.xpt` | labels kept |
 | Parquet | `.parquet` `.pq` | re-typed and re-compressed |
+| PDF (digital) | `.pdf` | tables with or without borders; tables continuing across pages are merged; pick pages with `pdf_pages` (`"1-3,7"`) and a table with `pdf_table`; the report lists every table found. Scanned PDFs (images, no text layer) are rejected: no OCR |
 
 Any of these can also arrive gzip-, bz2- or zip-compressed. Detection uses magic bytes before
 extensions. Every column in the report carries its type, null count, rejected values with
@@ -334,6 +340,7 @@ The CLI converts single files too: `aimart-parquet convert data.sav -o data.parq
 - [Quantum tier](docs/quantum.md): what the premium tools do and measured behaviour
 - [Discovery](docs/discovery.md): registries, directories and catalogs
 - [Economics](docs/economics.md): fees against margins, and honest revenue scenarios
+- [Privacy](docs/privacy.md): what happens to your data, stated from the code
 - [Decision records](docs/adr/README.md)
 - [Changelog](CHANGELOG.md), [Security](SECURITY.md), [Code of conduct](CODE_OF_CONDUCT.md)
 

@@ -58,18 +58,24 @@ Module docstrings explain the why; read the one you are about to change.
   concrete `hint`. Raising one is what guarantees the caller is not charged.
 - `engine/`: the pure conversion engine. `detect.py` (magic bytes over extensions), `safety.py`
   (gzip/zip bomb caps), `text.py` (UTF-8 transcoding), `duck.py` (sandboxed DuckDB),
-  `readers/` (delimited, jsonish, excel, statistical, columnar; the `READERS` map is in
+  `readers/` (delimited, jsonish, excel, statistical, columnar, pdf; the `READERS` map is in
   `convert.py`), `infer.py` (type ladder in SQL), `names.py`, `convert.py` (pipeline and
   report), `writer.py` (DuckDB `COPY` by default, pyarrow when labels exist), `inspect.py`
   (footer-only stats), `tabular.py` (preview and SELECT-only query), `isolate.py` (forkserver
   child per heavy job), `models.py` (the pydantic contract agents read).
-- `quantum/`: premium tools (`kernel_pca.py`, `portfolio.py`, `data.py`, `models.py`). Registered
-  only when the `quantum` extra is installed. Spec: `docs/specs/quantum-premium.md`.
+- `quantum/`: premium tools (`kernel_pca.py`, `portfolio.py`, `data.py`, `models.py`). Served only
+  when the `quantum` extra is installed AND `AIMART_ENABLE_QUANTUM=true` (off by default; a buyer
+  panel valued them at $0). `pricing.active_operations(settings)` decides. Spec:
+  `docs/specs/quantum-premium.md`.
+- `demand.py`: demand signals. Unsupported file extensions are counted, and agents can describe
+  unmet needs via the free `request_capability` tool / `POST /v1/feedback`. Logged as
+  `demand_signal`; `GET /v1/demand` behind `AIMART_ADMIN_TOKEN`. This decides the roadmap.
 - `provenance.py`: ML-DSA-65 manifests and signatures for every hosted artifact.
 - `sources.py`: SSRF-safe URL fetch (validated IPs at connect time, re-checked redirects, port
   allow-list, size cap, deadline), base64 decode, `safe_filename`.
 - `artifacts.py`: `LocalArtifactStore` (TTL disk, HMAC-signed links) and `GcsArtifactStore`.
 - `service.py`: `Service`, the **one** implementation of every operation, used by REST and MCP.
+  `query` takes a map of table names (`data` + up to 7 joined artifacts) for one query price.
 - `payments/`: `pricing.py` (`OPERATIONS`, the single source of prices, routes and tool names;
   `usd_to_atomic`), `__init__.py` (`Payments`: x402 resource server, REST route configs with the
   Bazaar extension, lazy facilitator init, price-floor check), `mcp_gate.py` (x402 for MCP tool
@@ -87,7 +93,7 @@ Outside `src/`: `tests/` (`aimart_testkit.py` helpers, `unit/`, `integration/`, 
 Registry manifest; prices and tools there must match `OPERATIONS`),
 `docs/examples/agent_pays.py` (paying client example).
 
-Docs: [architecture](docs/architecture.md), [payments](docs/payments.md),
+Docs: [architecture](docs/architecture.md), [payments](docs/payments.md), [privacy](docs/privacy.md),
 [agents guide](docs/agents-guide.md), [quantum tier](docs/quantum.md),
 [discovery](docs/discovery.md), [economics](docs/economics.md), [ADRs](docs/adr/README.md),
 [security](SECURITY.md), [contributing](CONTRIBUTING.md).

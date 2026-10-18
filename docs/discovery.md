@@ -94,11 +94,30 @@ them.
 
 `uvx aimart-parquet mcp` is free and open source, and it is listed in the registry next to the
 remote. When `AIMART_HOSTED_URL` is set, local convert results carry a one-line `hint`
-pointing at the hosted service: premium tools without installing PennyLane, plus signed
-provenance. This is the "free local, paid hosted" funnel from the spec. The hint appears once
+pointing at the hosted service (no install, works from any agent platform, signed
+provenance). This is the "free local, paid hosted" funnel from the spec. The hint appears once
 per result and never blocks anything.
 
-### 9. Future work
+### 9. Let real traffic decide the roadmap: demand signals
+
+Two free, zero-cost signals tell you what agents tried to buy that you do not sell yet:
+
+- **Unsupported formats.** Every conversion rejected for its file type logs the *extension*
+  only (never the content or full name).
+- **`request_capability`** (MCP tool) / **`POST /v1/feedback`** (REST). Its description invites
+  any agent to say what it needed, the formats involved and the most it would pay per call.
+
+Read them from the logs (Cloud Logging keeps them under its free tier):
+
+```bash
+gcloud logging read 'jsonPayload.msg="demand_signal"' --limit 100 --format json
+```
+
+or, with `AIMART_ADMIN_TOKEN` set, `GET /v1/demand` with `Authorization: Bearer <token>` for
+the counters since the last restart. After a few weeks live, build the most requested
+format or tool next.
+
+### 10. Future work
 
 - Tool wrappers for **LangChain** and **CrewAI** that pay through x402 (an x402 httpx
   transport under a `StructuredTool`), published as a small separate package.
