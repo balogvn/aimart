@@ -168,6 +168,11 @@ def _has_zone(v: str) -> str:
     )
 
 
+def naive_as_utc_note(naive: int, total: int) -> str:
+    """Said whenever a timestamptz column holds values that carried no offset of their own."""
+    return f"values without a UTC offset were read as UTC ({naive} of {total})"
+
+
 def _parse_ts(v: str, formats: list[str]) -> str:
     """Naive timestamp text only: text with an offset parses to NULL here, never to a shifted time."""
     return (
@@ -338,21 +343,26 @@ class TypeInferrer:
         """What a cast_text result assumed that its values do not say, for the report.
 
         A per-value cast cannot see the column, so the file's dialect alone decided '1,234' and
-        '1.234', and a naive target holds an offset only by converting to UTC. Inference says
-        so in a note; the expected_schema cast must too.
+        '1.234'; a naive target holds an offset only by converting to UTC, and a timestamptz
+        target holds a naive value only by assuming UTC. Inference says so in a note; the
+        expected_schema cast must too.
         """
         if type_name in {"int64", "float64", "decimal"}:
             style = "eu" if self.prefer_decimal_comma else "us"
             return self._separator_note(
                 source, style, expr, "declare it as string in expected_schema to keep the text"
             )
-        if type_name in {"date", "timestamp"}:
+        if type_name in {"date", "timestamp", "timestamptz"}:
             v = _Exprs.build(ident(source), self.tokens).v
+            # The values the target type could not hold as written: offsets in a naive target,
+            # naive values in a timestamptz one.
+            assumed = _has_zone(v) if type_name != "timestamptz" else f"NOT {_has_zone(v)}"
             row = self.con.sql(
-                f"SELECT count_if({_has_zone(v)} AND ({expr}) IS NOT NULL), count({v}) "
-                f"FROM {self.table}"
+                f"SELECT count_if({assumed} AND ({expr}) IS NOT NULL), count({v}) FROM {self.table}"
             ).fetchone()
             if row and row[0]:
+                if type_name == "timestamptz":
+                    return naive_as_utc_note(int(row[0]), int(row[1]))
                 return f"values with a UTC offset were converted to UTC ({row[0]} of {row[1]})"
         return None
 
@@ -433,7 +443,7 @@ class TypeInferrer:
             type_name = "timestamptz"
             naive = n_dmy if order == "dmy" else n_mdy
             if naive:
-                notes.append(f"values without a UTC offset were read as UTC ({naive} of {n})")
+                notes.append(naive_as_utc_note(naive, n))
         elif n_time:
             expr, type_name = parsed, "timestamp"
         else:

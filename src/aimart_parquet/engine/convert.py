@@ -19,7 +19,7 @@ from aimart_parquet import __version__
 from aimart_parquet.engine import safety
 from aimart_parquet.engine.detect import _zip_office_format, detect_format
 from aimart_parquet.engine.duck import connect, ident
-from aimart_parquet.engine.infer import ColumnPlan, TypeInferrer
+from aimart_parquet.engine.infer import ColumnPlan, TypeInferrer, naive_as_utc_note
 from aimart_parquet.engine.inspect import inspect_parquet
 from aimart_parquet.engine.models import (
     ColumnReport,
@@ -191,9 +191,9 @@ def _apply_expected_schema(
         expr = _expected_expr(inferrer, out, col)
         row = con.sql(
             f"SELECT count_if(({out.plan.expr}) IS NOT NULL AND ({expr}) IS NULL), "
-            f"count_if(({expr}) IS NULL) FROM {ident(table)}"
+            f"count_if(({expr}) IS NULL), count(({expr})) FROM {ident(table)}"
         ).fetchone()
-        rejects, nulls = (int(row[0]), int(row[1])) if row else (0, 0)
+        rejects, nulls, kept = (int(row[0]), int(row[1]), int(row[2])) if row else (0, 0, 0)
         # Values inference already nulled (the 98% tolerance) do not fit either. Counting only
         # this cast's rejects let strict=true pass, and charge, with 'oops' in an int64 column.
         misfits = out.plan.rejected_count + rejects
@@ -227,6 +227,9 @@ def _apply_expected_schema(
         if out.plan.type_name == "string" and out.raw is not None:
             note = inferrer.cast_note(out.raw.source, col.type, expr)
             notes = [*notes, note] if note else notes
+        elif col.type == "timestamptz" and out.plan.type_name in {"date", "timestamp"} and kept:
+            # An instant from a naive value assumes its zone, as inference says when it does.
+            notes = [*notes, naive_as_utc_note(kept, kept)]
         result.append(_Output(col.name, out.raw, plan, notes, extra_rejects=rejects))
     extras = [o for o in outputs if o.name.lower() not in expected_names]
     if extras and options.strict:

@@ -173,6 +173,31 @@ class TestCastReport:
         )
         assert result.column("ts").notes == ["cast to timestamp per expected_schema"]
 
+    @pytest.mark.parametrize("infer_types", [False, True])  # text cast, then typed cast
+    def test_naive_values_cast_to_timestamptz_say_utc_was_assumed(
+        self, tmp_path, infer_types
+    ) -> None:
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            "ts,x\n2025-01-15 10:00:00,a\n2025-01-16 11:00:00,b\n",
+            infer_types=infer_types,
+            expected_schema=[{"name": "ts", "type": "timestamptz"}],
+        )
+        assert as_utc(result.rows["ts"]) == [utc(2025, 1, 15, 10), utc(2025, 1, 16, 11)]
+        assert f"{READ_AS_UTC} (2 of 2)" in result.column("ts").notes
+
+    def test_offsets_cast_to_timestamptz_need_no_note(self, tmp_path) -> None:
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            "ts,x\n2025-01-15 10:00:00+05:00,a\n2025-01-16 11:00:00Z,b\n",
+            infer_types=False,
+            expected_schema=[{"name": "ts", "type": "timestamptz"}],
+        )
+        assert as_utc(result.rows["ts"]) == [utc(2025, 1, 15, 5), utc(2025, 1, 16, 11)]
+        assert result.column("ts").notes == ["cast to timestamptz per expected_schema"]
+
 
 class TestEndToEnd:
     def test_csv_column_is_timestamptz_with_the_note(self, tmp_path) -> None:
