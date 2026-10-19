@@ -32,7 +32,7 @@ from x402.mechanisms.svm.exact import ExactSvmServerScheme
 from x402.schemas import ResourceInfo
 from x402.schemas.config import ResourceConfig
 
-from aimart_parquet.artifacts import discard_withheld, track_puts
+from aimart_parquet.artifacts import discard_withheld, outputs_of
 from aimart_parquet.config import NetworkMode, Settings
 from aimart_parquet.payments.bazaar import EXAMPLES
 from aimart_parquet.payments.mcp_gate import X402McpGate
@@ -256,7 +256,7 @@ class Payments:
                     },
                     status_code=503,
                 )
-            with track_puts() as produced:
+            with outputs_of(store) as produced:
                 try:
                     response = await inner(request, call_next)
                 except BaseException:

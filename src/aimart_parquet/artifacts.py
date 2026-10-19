@@ -109,6 +109,13 @@ def track_puts() -> Iterator[list[str]]:
         _PUTS.reset(token)
 
 
+def outputs_of(store: ArtifactStore | None) -> contextlib.AbstractContextManager[list[str]]:
+    """``track_puts()`` for a paid call whose outputs will be committed to or deleted from
+    ``store``. Without a store nothing would ever commit them, and a provisional artifact is
+    never counted or evicted, so nothing is tracked at all."""
+    return track_puts() if store is not None else contextlib.nullcontext([])
+
+
 def _record(artifact_id: str) -> bool:
     """Report a stored artifact to the enclosing blocks; True if it is provisional."""
     blocks = _PUTS.get()

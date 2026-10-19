@@ -310,3 +310,40 @@ async def test_withheld_cleanup_failure_is_logged_not_raised(
         result = await _paid_mcp_call(h, "convert_to_parquet", args, {})
         assert result.structured_content["error"].startswith("Payment settlement failed")
     assert sum("withheld" in rec.message for rec in caplog.records) >= 2
+
+
+async def test_a_gate_without_a_store_leaves_no_output_provisional(
+    settings: Settings, tmp_path: Path
+) -> None:
+    # Outputs of a tracked call stay provisional (never counted, never evicted) until committed;
+    # a gate with nothing to commit them to must not track them, or they would stay so for good.
+    from types import SimpleNamespace
+
+    from mcp_types import CallToolResult
+
+    from aimart_parquet.artifacts import LocalArtifactStore
+    from aimart_parquet.payments import Payments
+
+    payments = Payments(settings, [kit.FakeFacilitator()])
+    gate = payments.mcp_extension()
+    op = payments.tool_operation("convert_to_parquet")
+    assert op is not None
+    reqs, resource = await payments.mcp_requirements(op)
+    pr = await payments.server.create_payment_required_response(reqs, resource, error="x")
+    meta = await kit.mcp_payment_meta(
+        kit.paying_client(), pr.model_dump(by_alias=True, exclude_none=True)
+    )
+    store = LocalArtifactStore(tmp_path / "s", ttl_s=60, max_total_bytes=10**6, secret=b"k")
+    out = tmp_path / "out.parquet"
+    out.write_bytes(b"x" * 10)
+
+    async def tool(_: Any) -> CallToolResult:
+        store.put(out, "x.parquet")
+        return CallToolResult(content=[], is_error=False)
+
+    params = SimpleNamespace(name="convert_to_parquet", arguments={}, meta=meta)
+    result = await gate.intercept_tool_call(params, None, tool)
+    assert not result.is_error
+    assert result.meta["x402/payment-response"]["success"] is True
+    assert len(store._folders()) == 1
+    assert store._provisional == set()

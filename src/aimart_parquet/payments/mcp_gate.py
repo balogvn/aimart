@@ -29,7 +29,7 @@ from mcp_types import CallToolResult, TextContent
 from x402 import parse_payment_payload
 from x402.schemas import PaymentPayload
 
-from aimart_parquet.artifacts import discard_withheld, track_puts
+from aimart_parquet.artifacts import discard_withheld, outputs_of
 from aimart_parquet.payments.pricing import active_operations
 
 if TYPE_CHECKING:
@@ -134,7 +134,7 @@ class X402McpGate(Extension):
                 reqs, resource, f"Payment invalid: {verified.invalid_reason or 'unknown reason'}"
             )
 
-        with track_puts() as produced:
+        with outputs_of(self._store) as produced:
             try:
                 result = await call_next(ctx)
             except BaseException:
