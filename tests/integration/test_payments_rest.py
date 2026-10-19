@@ -250,7 +250,9 @@ async def test_paid_call_succeeds_and_settles_the_quoted_amount_once(
         ("inspect", {}, 400, "invalid_request"),
         ("inspect", {"artifact_id": "bad id!"}, 404, "artifact_not_found"),
         ("query", {"artifact_id": "ARTIFACT", "sql": "DROP TABLE data"}, 400, "query_rejected"),
-        ("preview", {"artifact_id": "ARTIFACT", "limit": 0}, 400, "invalid_request"),
+        # A schema-invalid body ("limit": 0) is now refused before any quote (see
+        # test_fix_money_gate.py); this one passes the schema and fails in the service.
+        ("preview", {"artifact_id": "ARTIFACT", "columns": ["nope"]}, 400, "invalid_request"),
         ("convert", {"url": "http://127.0.0.1/data.csv"}, 422, "url_not_allowed"),
         ("convert", {"url": "ftp://example.com/data.csv"}, 422, "url_not_allowed"),
         (

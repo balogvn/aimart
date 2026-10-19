@@ -1,0 +1,312 @@
+"""Outputs nobody paid for, asserted on the wire and on disk.
+
+M1: an output bigger than the artifact budget is refused (413, not settled) instead of being
+stored, evicted, and charged for as a dead download link.
+M2: when the result is withheld (settlement failed, or the call failed after the file was
+stored), the stored file is deleted: unpaid outputs must not sit in the budget and push out
+paying customers' artifacts.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+import anyio
+import pytest
+from x402 import SettleResponse, parse_payment_required
+
+import aimart_testkit as kit
+from aimart_parquet.engine.models import ConvertOptions
+from aimart_parquet.service import SourceRef
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+    from aimart_parquet.config import Settings
+
+pytestmark = pytest.mark.anyio
+
+# 2,000 rows: about 6.6 KB of Parquet, so a budget of a few KB holds exactly one of these.
+CSV = b"a,b\n" + b"".join(f"{i},{i * 7}\n".encode() for i in range(2000))
+SMALL_CSV = b"a,b\n1,2\n3,4\n"
+
+
+def convert_body(data: bytes = CSV, name: str = "x.csv") -> dict[str, Any]:
+    return {"json": {"content_base64": kit.b64(data), "filename": name}}
+
+
+def stored(settings: Settings) -> set[str]:
+    root = settings.artifact_dir
+    return {p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")}
+
+
+async def download_status(h: kit.AppHarness, artifact: dict[str, Any]) -> int:
+    url = artifact["download_url"].removeprefix(kit.BASE_URL)
+    return (await h.http.get(url)).status_code
+
+
+@dataclass
+class NonceFacilitator(kit.FakeFacilitator):
+    """Settles each signed authorization once, like the chain does (the nonce is spent)."""
+
+    spent: set[str] = field(default_factory=set)
+
+    async def settle(self, payload: Any, requirements: Any) -> SettleResponse:
+        self.settled.append((payload, requirements))
+        await anyio.sleep(0.01)  # let concurrent requests reach settlement together
+        nonce = json.dumps(payload.payload, sort_keys=True)
+        if nonce in self.spent:
+            return SettleResponse(
+                success=False,
+                error_reason="nonce_used",
+                transaction="",
+                network=requirements.network,
+            )
+        self.spent.add(nonce)
+        return SettleResponse(
+            success=True,
+            transaction=kit.TX_HASH,
+            network=requirements.network,
+            payer=kit.PAYER,
+            amount=requirements.amount,
+        )
+
+
+# ------------------------------------------------------------------------------ M1
+async def test_output_over_the_artifact_budget_is_413_and_never_settled(
+    make_settings: Callable[..., Settings],
+) -> None:
+    # Before: 200, settled, and the download_url in the body was already a 404.
+    settings = make_settings(artifact_max_total_bytes=4000)
+    fake = kit.FakeFacilitator()
+    async with kit.running_app(settings, facilitator=fake) as h:
+        r = await h.paying.post("/v1/convert", **convert_body())
+    assert r.status_code == 413, r.text
+    error = r.json()["error"]
+    assert error["code"] == "input_too_large"
+    assert "artifact budget" in error["message"]
+    assert "not charged" in error["hint"]
+    assert "payment-response" not in r.headers
+    assert len(fake.verified) == 1
+    assert fake.settled == []
+    assert stored(settings) == set()
+
+
+async def test_output_that_fits_is_stored_and_downloadable(
+    make_settings: Callable[..., Settings],
+) -> None:
+    settings = make_settings(artifact_max_total_bytes=12_000)
+    async with kit.running_app(settings) as h:
+        first = (await h.paying.post("/v1/convert", **convert_body(name="1.csv"))).json()
+        second = (await h.paying.post("/v1/convert", **convert_body(name="2.csv"))).json()
+        assert await download_status(h, second["artifact"]) == 200
+        # The budget holds one: the older paid artifact made room, the new one never does.
+        assert stored(settings) == {second["artifact"]["id"]}
+        assert await download_status(h, first["artifact"]) == 404
+
+
+# ------------------------------------------------------------------------------ M2, REST
+async def test_rest_settlement_failure_deletes_the_withheld_output(
+    make_settings: Callable[..., Settings],
+) -> None:
+    settings = make_settings(artifact_max_total_bytes=12_000)
+    fake = kit.FakeFacilitator()
+    async with kit.running_app(settings, facilitator=fake) as h:
+        paid = await h.paying.post("/v1/convert", **convert_body(name="paid.csv"))
+        assert paid.status_code == 200
+        art = paid.json()["artifact"]
+        assert kit.payment_response(paid)["success"] is True
+
+        fake.settle_ok = False  # the next caller's settlement fails: nothing is charged...
+        unpaid = await h.paying.post("/v1/convert", **convert_body(name="unpaid.csv"))
+        assert unpaid.status_code == 402
+        assert "artifact" not in unpaid.text
+
+        # ...so its output is gone, and the paying customer's artifact was not evicted for it.
+        assert stored(settings) == {art["id"]}
+        assert await download_status(h, art) == 200
+        fake.settle_ok = True
+        inspect = await h.paying.post("/v1/inspect", json={"artifact_id": art["id"]})
+        assert inspect.status_code == 200, inspect.text
+
+
+async def test_rest_settlement_exception_deletes_the_withheld_output(
+    paid_app: kit.AppHarness, facilitator: kit.FakeFacilitator
+) -> None:
+    facilitator.settle_error = RuntimeError("chain congested")
+    r = await paid_app.paying.post("/v1/convert", **convert_body())
+    assert r.status_code == 402
+    assert stored(paid_app.settings) == set()
+
+
+async def test_rest_paid_call_keeps_its_output(
+    paid_app: kit.AppHarness, facilitator: kit.FakeFacilitator
+) -> None:
+    for path, kwargs in (
+        ("/v1/convert", convert_body()),
+        ("/v1/convert/upload", {"files": {"file": ("u.csv", SMALL_CSV, "text/csv")}}),
+    ):
+        r = await paid_app.paying.post(path, **kwargs)
+        assert r.status_code == 200, r.text
+        art = r.json()["artifact"]
+        assert art["id"] in stored(paid_app.settings)
+        assert await download_status(paid_app, art) == 200
+    assert len(facilitator.settled) == 2
+
+
+async def test_rest_upload_settlement_failure_deletes_the_output(
+    paid_app: kit.AppHarness, facilitator: kit.FakeFacilitator
+) -> None:
+    facilitator.settle_ok = False
+    r = await paid_app.paying.post(
+        "/v1/convert/upload", files={"file": ("u.csv", SMALL_CSV, "text/csv")}
+    )
+    assert r.status_code == 402
+    assert stored(paid_app.settings) == set()
+
+
+async def test_rest_failure_after_the_output_was_stored_deletes_it(
+    paid_app: kit.AppHarness, facilitator: kit.FakeFacilitator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The file is stored, then building the response fails: the caller is not charged (>= 400)
+    # and must not leave an orphan in the budget either.
+    from aimart_parquet.errors import AimartError
+
+    store = paid_app.app.state.service.store
+
+    def broken_link(*_: Any) -> str:
+        raise AimartError("Could not sign the download link.", hint="Retry.")
+
+    monkeypatch.setattr(store, "download_url", broken_link)
+    r = await paid_app.paying.post("/v1/convert", **convert_body())
+    assert r.status_code == 500
+    assert facilitator.settled == []
+    assert stored(paid_app.settings) == set()
+
+
+async def test_one_signed_payment_replayed_concurrently_leaves_one_output(
+    make_settings: Callable[..., Settings],
+) -> None:
+    # Each copy of the same authorization verifies and runs; only one settles. Before, every
+    # unpaid copy's artifact stayed stored and evicted paying customers' artifacts first.
+    settings = make_settings()
+    fake = NonceFacilitator()
+    async with kit.running_app(settings, facilitator=fake) as h:
+        quote = await h.http.post("/v1/convert", **convert_body(SMALL_CSV))
+        required = parse_payment_required(base64.b64decode(quote.headers["payment-required"]))
+        payload = await kit.paying_client().create_payment_payload(required)
+        signature = base64.b64encode(
+            json.dumps(payload.model_dump(by_alias=True, exclude_none=True)).encode()
+        ).decode()
+        statuses: list[int] = []
+        bodies: list[dict[str, Any]] = []
+
+        async def replay() -> None:
+            r = await h.http.post(
+                "/v1/convert",
+                **convert_body(SMALL_CSV),
+                headers={"payment-signature": signature},
+            )
+            statuses.append(r.status_code)
+            if r.status_code == 200:
+                bodies.append(r.json())
+
+        async with anyio.create_task_group() as tg:
+            for _ in range(4):
+                tg.start_soon(replay)
+    assert sorted(statuses) == [200, 402, 402, 402]
+    assert len(fake.spent) == 1
+    assert stored(settings) == {bodies[0]["artifact"]["id"]}
+
+
+# ------------------------------------------------------------------------------ M2, MCP
+async def _paid_mcp_call(
+    h: kit.AppHarness, tool: str, args: dict[str, Any], setup: dict[str, Any]
+) -> Any:
+    async with kit.mcp_over_http(h.app) as client:
+        unpaid = await client.call_tool(tool, args)
+        meta = await kit.mcp_payment_meta(kit.paying_client(), unpaid.structured_content)
+        assert h.facilitator is not None
+        for name, value in setup.items():
+            setattr(h.facilitator, name, value)
+        return await client.call_tool(tool, args, meta=meta)
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [{"settle_ok": False}, {"settle_error": RuntimeError("nonce reused")}],
+    ids=["settle-false", "settle-raises"],
+)
+async def test_mcp_settlement_failure_deletes_the_withheld_output(
+    setup: dict[str, Any], paid_app: kit.AppHarness
+) -> None:
+    keep = await paid_app.app.state.service.convert(
+        SourceRef(content_base64=kit.b64(SMALL_CSV), filename="keep.csv"), ConvertOptions()
+    )
+    args = {"content_base64": kit.b64(SMALL_CSV), "filename": "x.csv"}
+    result = await _paid_mcp_call(paid_app, "convert_to_parquet", args, setup)
+    assert result.is_error
+    assert result.structured_content["error"].startswith("Payment settlement failed")
+    assert stored(paid_app.settings) == {keep.artifact.id}
+
+
+async def test_mcp_paid_call_keeps_its_output(paid_app: kit.AppHarness) -> None:
+    args = {"content_base64": kit.b64(SMALL_CSV), "filename": "x.csv"}
+    result = await _paid_mcp_call(paid_app, "convert_to_parquet", args, {})
+    assert not result.is_error, result.structured_content
+    art = result.structured_content["artifact"]
+    assert stored(paid_app.settings) == {art["id"]}
+    assert await download_status(paid_app, art) == 200
+
+
+async def test_mcp_tool_error_after_the_output_was_stored_deletes_it(
+    paid_app: kit.AppHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The SDK rejects the tool's output after the file was stored (the result becomes isError,
+    # so nothing is settled); the stored file must go too.
+    from pydantic import BaseModel
+
+    service = paid_app.app.state.service
+    real = service.convert
+
+    class WrongShape(BaseModel):
+        unexpected: int = 1
+
+    async def convert_then_fail(*args: Any, **kwargs: Any) -> Any:
+        await real(*args, **kwargs)
+        return WrongShape()
+
+    monkeypatch.setattr(service, "convert", convert_then_fail)
+    args = {"content_base64": kit.b64(SMALL_CSV), "filename": "x.csv"}
+    result = await _paid_mcp_call(paid_app, "convert_to_parquet", args, {})
+    assert result.is_error
+    assert paid_app.facilitator is not None
+    assert paid_app.facilitator.settled == []
+    assert stored(paid_app.settings) == set()
+
+
+async def test_withheld_cleanup_failure_is_logged_not_raised(
+    make_settings: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    settings = make_settings()
+    fake = kit.FakeFacilitator(settle_ok=False)
+    async with kit.running_app(settings, facilitator=fake) as h:
+        store = h.app.state.service.store
+
+        def broken_delete(_: str) -> None:
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(store, "delete", broken_delete)
+        r = await h.paying.post("/v1/convert", **convert_body(SMALL_CSV))
+        assert r.status_code == 402  # the caller still gets the settlement error, not a 500
+        args = {"content_base64": kit.b64(SMALL_CSV), "filename": "x.csv"}
+        result = await _paid_mcp_call(h, "convert_to_parquet", args, {})
+        assert result.structured_content["error"].startswith("Payment settlement failed")
+    assert sum("withheld" in rec.message for rec in caplog.records) >= 2

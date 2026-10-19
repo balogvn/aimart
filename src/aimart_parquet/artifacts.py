@@ -18,9 +18,10 @@ their GCS blobs; blobs whose local record was lost with an instance are found by
 listing at most every six hours; the bucket's 1-day lifecycle rule is the final backstop.
 
 Money: ``put`` raising an ``AimartError`` is what keeps a caller from paying for an output
-that could not be kept, and ``track_puts`` + ``delete`` let the payment layers remove an
-output whose result was withheld (settlement failed), so unpaid files never sit in the
-budget evicting paying customers' artifacts.
+that could not be kept. Outputs stored during a paid call (inside ``track_puts``) are
+provisional: they neither evict nor can be evicted until the payment layer either commits them
+(settled) or deletes them (result withheld, e.g. settlement failed), so an unpaid output never
+pushes out a paying customer's artifact.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from aimart_parquet.errors import AimartError, ArtifactNotFound, InputTooLarge
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator
+    from collections.abc import Iterable, Iterator
     from pathlib import Path
 
 log = logging.getLogger("aimart.artifacts")
@@ -77,6 +78,7 @@ class Artifact:
 class ArtifactStore(Protocol):
     def put(self, src: Path, filename: str) -> Artifact: ...
     def get(self, artifact_id: str) -> tuple[Artifact, Path]: ...
+    def commit(self, artifact_ids: Iterable[str]) -> None: ...
     def delete(self, artifact_id: str) -> None: ...
     def download_url(self, base_url: str, art: Artifact) -> str: ...
     def verify(self, artifact_id: str, expires_at: int, signature: str) -> bool: ...
@@ -94,8 +96,10 @@ _PUTS: contextvars.ContextVar[tuple[list[str], ...]] = contextvars.ContextVar(
 def track_puts() -> Iterator[list[str]]:
     """Collect the ids of artifacts stored inside the block, including by tasks it starts.
 
-    The payment layers wrap a paid call in this, so that when its result is withheld they
-    know exactly which files nobody paid for. An inner block reports to the outer ones too.
+    The payment layers wrap a paid call in this. What is stored inside stays provisional until
+    they call ``store.commit(ids)`` (paid) or ``discard_withheld`` (not paid): an output whose
+    settlement then failed used to evict paying customers' artifacts the moment it was stored.
+    An inner block reports to the outer ones too.
     """
     produced: list[str] = []
     token = _PUTS.set((*_PUTS.get(), produced))
@@ -105,19 +109,20 @@ def track_puts() -> Iterator[list[str]]:
         _PUTS.reset(token)
 
 
-def _record(artifact_id: str) -> None:
-    for produced in _PUTS.get():
+def _record(artifact_id: str) -> bool:
+    """Report a stored artifact to the enclosing blocks; True if it is provisional."""
+    blocks = _PUTS.get()
+    for produced in blocks:
         produced.append(artifact_id)
+    return bool(blocks)
 
 
-def discard_withheld(
-    delete: Callable[[str], None], artifact_ids: Iterable[str], *, reason: str
-) -> None:
+def discard_withheld(store: ArtifactStore, artifact_ids: Iterable[str], *, reason: str) -> None:
     """Delete outputs whose result was not delivered. Logs, never raises: the caller is owed a
     clean error response (and no charge), not a 500 about our cleanup."""
     for artifact_id in artifact_ids:
         try:
-            delete(artifact_id)
+            store.delete(artifact_id)
         except Exception:
             log.exception(
                 "could not delete a withheld output",
@@ -140,6 +145,8 @@ class LocalArtifactStore:
         self.max_total_bytes = max_total_bytes
         self._secret = secret
         self._last_sweep = 0.0
+        # Stored during a paid call whose settlement is not known yet (see track_puts).
+        self._provisional: set[str] = set()
         root.mkdir(parents=True, exist_ok=True)
 
     def maybe_sweep(self, interval_s: float = 60.0) -> None:
@@ -176,9 +183,18 @@ class LocalArtifactStore:
             )
         art = self._store_local(src, filename)
         self._persist(art)
-        self.enforce_capacity(keep=art.id)
-        _record(art.id)
+        if _record(art.id):
+            self._provisional.add(art.id)  # capacity is enforced when the payment commits it
+        else:
+            self.enforce_capacity(keep=art.id)
         return art
+
+    def commit(self, artifact_ids: Iterable[str]) -> None:
+        """The call that stored these was paid for: they now count, and may evict, as usual."""
+        ids = [i for i in artifact_ids if i in self._provisional]
+        self._provisional.difference_update(ids)
+        if ids:
+            self.enforce_capacity(keep=ids)
 
     def _store_local(self, src: Path, filename: str) -> Artifact:
         artifact_id = self.new_id()
@@ -242,6 +258,7 @@ class LocalArtifactStore:
 
     def delete(self, artifact_id: str) -> None:
         """Remove an artifact now. Unknown or malformed ids are a no-op."""
+        self._provisional.discard(artifact_id)
         if _ID.match(artifact_id):
             self._remove(self.root / artifact_id)
 
@@ -259,19 +276,24 @@ class LocalArtifactStore:
                 removed += 1
         return removed
 
-    def enforce_capacity(self, *, keep: str | None = None) -> None:
+    def enforce_capacity(self, *, keep: str | Iterable[str] = ()) -> None:
         """Evict oldest artifacts until total size fits the budget (free disks are small).
 
-        ``keep`` is never evicted: it is the artifact just written, whose id is about to be
-        handed to a paying caller. Evicting it charged them for a dead link.
+        ``keep`` is never evicted: the artifact just written, whose id is about to be handed
+        to a paying caller (evicting it charged them for a dead link). Provisional artifacts
+        are neither counted nor evicted: their call has not settled yet.
         """
-        folders = sorted(self._folders(), key=lambda f: f.stat().st_mtime)
+        spared = {keep} if isinstance(keep, str) else set(keep)
+        pending = set(self._provisional) - spared
+        folders = sorted(
+            (f for f in self._folders() if f.name not in pending), key=lambda f: f.stat().st_mtime
+        )
         sizes = {f: sum(p.stat().st_size for p in f.iterdir() if p.is_file()) for f in folders}
         total = sum(sizes.values())
         for folder in folders:
             if total <= self.max_total_bytes:
                 break
-            if folder.name == keep:
+            if folder.name in spared:
                 continue
             total -= sizes[folder]
             self._remove(folder)

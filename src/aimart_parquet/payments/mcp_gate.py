@@ -10,10 +10,12 @@ Wire format (x402 specs/transports-v2/mcp.md):
 * The client retries with the signed payload in ``params._meta["x402/payment"]``.
 * Success -> the tool's normal result plus ``_meta["x402/payment-response"]`` (the settlement).
 * Settlement failure after the tool ran -> only the payment error; the tool's output is
-  withheld, because it was not paid for.
+  withheld, because it was not paid for, and any file the tool stored is deleted.
 
 Order of operations is the money invariant: verify -> run tool -> settle only if the tool
-returned a non-error result. Free tools and protocol messages never touch this code.
+returned a non-error result. Free tools, tools this deployment does not serve, and protocol
+messages never touch this code; arguments that fail the tool's own validation are rejected
+before a price is quoted, as the REST API rejects an invalid body before its 402.
 """
 
 from __future__ import annotations
@@ -27,11 +29,15 @@ from mcp_types import CallToolResult, TextContent
 from x402 import parse_payment_payload
 from x402.schemas import PaymentPayload
 
+from aimart_parquet.artifacts import discard_withheld, track_puts
 from aimart_parquet.payments.pricing import active_operations
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from x402.schemas import PaymentRequirements, ResourceInfo
 
+    from aimart_parquet.artifacts import ArtifactStore
     from aimart_parquet.payments import Payments
 
 log = logging.getLogger("aimart.payments.mcp")
@@ -51,9 +57,18 @@ def _result(body: dict[str, Any]) -> CallToolResult:
 class X402McpGate(Extension):
     identifier = "io.github.balogvn/x402"
 
-    def __init__(self, payments: Payments) -> None:
+    def __init__(self, payments: Payments, *, store: ArtifactStore | None = None) -> None:
         super().__init__()
         self.payments = payments
+        self._store = store  # commits a settled call's outputs, deletes a withheld call's
+        # Set once the server's tools exist (mcp.server.argument_checker): the SDK validates
+        # arguments only after this gate has quoted and verified, so a call that could never
+        # run was asked to pay first.
+        self.check_arguments: Callable[[str, dict[str, Any]], str | None] | None = None
+
+    def _withhold(self, produced: list[str], reason: str) -> None:
+        if self._store is not None and produced:
+            discard_withheld(self._store, list(produced), reason=reason)
 
     def settings(self) -> dict[str, Any]:
         prices: dict[str, str] = {}
@@ -77,8 +92,16 @@ class X402McpGate(Extension):
         op = self.payments.tool_operation(params.name)
         if op is None:
             return await call_next(ctx)
-        reqs, resource = await self.payments.mcp_requirements(op)
         raw = (params.meta or {}).get(PAYMENT_META_KEY)
+        # A call with no arguments and no payment is a price probe: it gets the quote, as the
+        # REST API quotes an empty body. Anything else is validated before it is quoted.
+        if self.check_arguments is not None and (raw is not None or params.arguments):
+            problem = self.check_arguments(params.name, params.arguments or {})
+            if problem is not None:
+                return CallToolResult(
+                    content=[TextContent(type="text", text=problem)], is_error=True
+                )
+        reqs, resource = await self.payments.mcp_requirements(op)
         if raw is None:
             return await self._payment_required(reqs, resource, "Payment required")
         try:
@@ -111,19 +134,29 @@ class X402McpGate(Extension):
                 reqs, resource, f"Payment invalid: {verified.invalid_reason or 'unknown reason'}"
             )
 
-        result = await call_next(ctx)
-        if not isinstance(result, CallToolResult) or result.is_error:
-            return result  # failed work is never settled
+        with track_puts() as produced:
+            try:
+                result = await call_next(ctx)
+            except BaseException:
+                self._withhold(produced, "tool_raised")
+                raise
+            if not isinstance(result, CallToolResult) or result.is_error:
+                self._withhold(produced, "tool_failed")
+                return result  # failed work is never settled
 
-        try:
-            settled = await server.settle_payment(payload, matched)
-        except Exception as exc:
-            log.exception("settle raised", extra={"tool": params.name})
-            return self._settle_failed(reqs, resource, matched.network, str(exc))
-        if not settled.success:
-            return self._settle_failed(
-                reqs, resource, matched.network, settled.error_reason or "unknown"
-            )
+            try:
+                settled = await server.settle_payment(payload, matched)
+            except Exception as exc:
+                log.exception("settle raised", extra={"tool": params.name})
+                self._withhold(produced, "settle_failed")
+                return self._settle_failed(reqs, resource, matched.network, str(exc))
+            if not settled.success:
+                self._withhold(produced, "settle_failed")
+                return self._settle_failed(
+                    reqs, resource, matched.network, settled.error_reason or "unknown"
+                )
+            if self._store is not None and produced:
+                self._store.commit(produced)
         log.info(
             "payment settled",
             extra={

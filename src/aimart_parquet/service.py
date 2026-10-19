@@ -328,7 +328,7 @@ class Service:
         except BaseException:
             # Stored, but the caller gets an error and pays nothing: the file must not sit in
             # the budget until its TTL, evicting paying customers' artifacts.
-            discard_withheld(self.store.delete, [art.id], reason="publish_failed")
+            discard_withheld(self.store, [art.id], reason="publish_failed")
             raise
 
     def _local_target(self, src: SourceRef, output_path: str | None, filename: str) -> Path:

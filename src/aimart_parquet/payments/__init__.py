@@ -5,6 +5,11 @@ to our payTo address; we ask the facilitator to *verify* it before doing any wor
 operation; only if it succeeded do we ask the facilitator to *settle* (move the funds). A
 failed operation is never settled, so a caller is never charged for an error.
 
+Two rules on either side of that: a request that cannot succeed (an invalid body or tool
+arguments, a tool this deployment does not serve) is refused before any price is quoted, and
+an output whose result is withheld (settlement failed, or the call failed after storing it)
+is deleted, because nobody paid for it and it would otherwise evict paying customers' files.
+
 The server holds no private key. A facilitator submits the transfer and pays the gas.
 """
 
@@ -27,10 +32,11 @@ from x402.mechanisms.svm.exact import ExactSvmServerScheme
 from x402.schemas import ResourceInfo
 from x402.schemas.config import ResourceConfig
 
+from aimart_parquet.artifacts import discard_withheld, track_puts
 from aimart_parquet.config import NetworkMode, Settings
 from aimart_parquet.payments.bazaar import EXAMPLES
 from aimart_parquet.payments.mcp_gate import X402McpGate
-from aimart_parquet.payments.pricing import BY_TOOL, Operation, active_operations, usd_to_atomic
+from aimart_parquet.payments.pricing import Operation, active_operations, usd_to_atomic
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -38,6 +44,8 @@ if TYPE_CHECKING:
     from fastapi import Request, Response
     from x402 import FacilitatorClient
     from x402.schemas import PaymentRequirements
+
+    from aimart_parquet.artifacts import ArtifactStore
 
 log = logging.getLogger("aimart.payments")
 
@@ -57,8 +65,15 @@ DEFAULT_FACILITATORS: dict[NetworkMode, tuple[str, ...]] = {
     NetworkMode.MAINNET: ("https://facilitator.heurist.xyz", "https://x402.dexter.cash"),
 }
 
+# Where a paying client puts its signed payload (v2, then v1): what the SDK middleware reads.
+PAYMENT_HEADERS = ("payment-signature", "x-payment")
+
 SERVICE_NAME = "AImart Parquet"  # <= 32 ASCII chars, or facilitator catalogs drop it
 TAGS = ["data", "parquet", "etl", "csv", "mcp"]  # <= 5 tags
+
+
+def carries_payment(request: Request) -> bool:
+    return any(request.headers.get(name) for name in PAYMENT_HEADERS)
 
 
 def facilitator_urls(settings: Settings) -> list[str]:
@@ -91,6 +106,11 @@ class Payments:
         self._initialized = False
         self._init_lock = anyio.Lock()
         self._mcp_requirements: dict[str, list[PaymentRequirements]] = {}
+        # Only what this deployment serves: the quantum tools (off by default) used to be
+        # quoted at $0.50/$1.00 and verified, and only then answered "Unknown tool".
+        self._by_tool: dict[str, Operation] = {}
+        for op in active_operations(settings):
+            self._by_tool.setdefault(op.tool, op)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Payments:
@@ -189,35 +209,64 @@ class Payments:
 
     def http_middleware(
         self,
+        *,
+        prevalidate: Callable[[Request, bool], Awaitable[Response | None]] | None = None,
+        store: ArtifactStore | None = None,
     ) -> Callable[[Request, Callable[[Request], Awaitable[Response]]], Awaitable[Response]]:
         """The SDK middleware, built once, behind our lazy initialization.
 
         The SDK verifies before the route and settles after a < 400 response. With
         ``sync_facilitator_on_start=False`` it never initializes the resource server itself, so
         paid paths initialize here first; a facilitator outage becomes a 503 (nothing charged).
+
+        ``prevalidate(request, paying)`` answers a request that can never succeed (an invalid
+        body) before the SDK quotes a price for it or verifies its payment. Artifacts a paid
+        request stores are committed to ``store`` when its final status is < 400, and deleted
+        otherwise: a failed settlement turns the route's 200 into a 402 and withholds the body,
+        so that output was never paid for and must not stay, or have evicted anyone, in the
+        artifact budget.
         """
         inner = payment_middleware(self.routes(), self.server, sync_facilitator_on_start=False)
         paid = {(op.method, op.path) for op in active_operations(self.settings)}
 
+        def withhold(produced: list[str], reason: str) -> None:
+            if store is not None and produced:
+                discard_withheld(store, list(produced), reason=reason)
+
         async def middleware(
             request: Request, call_next: Callable[[Request], Awaitable[Response]]
         ) -> Response:
-            if (request.method, request.url.path) in paid:
+            if (request.method, request.url.path) not in paid:
+                return await inner(request, call_next)
+            if prevalidate is not None:
+                rejected = await prevalidate(request, carries_payment(request))
+                if rejected is not None:
+                    return rejected
+            try:
+                await self.ensure_initialized()
+            except Exception:
+                log.exception("facilitator initialization failed")
+                return JSONResponse(
+                    {
+                        "error": {
+                            "code": "payments_unavailable",
+                            "message": "The payment facilitator is unreachable.",
+                            "hint": "Retry shortly; you were not charged.",
+                        }
+                    },
+                    status_code=503,
+                )
+            with track_puts() as produced:
                 try:
-                    await self.ensure_initialized()
-                except Exception:
-                    log.exception("facilitator initialization failed")
-                    return JSONResponse(
-                        {
-                            "error": {
-                                "code": "payments_unavailable",
-                                "message": "The payment facilitator is unreachable.",
-                                "hint": "Retry shortly; you were not charged.",
-                            }
-                        },
-                        status_code=503,
-                    )
-            return await inner(request, call_next)
+                    response = await inner(request, call_next)
+                except BaseException:
+                    withhold(produced, "handler_raised")
+                    raise
+            if response.status_code >= 400:
+                withhold(produced, f"http_{response.status_code}")
+            elif store is not None and produced:
+                store.commit(produced)
+            return response
 
         return middleware
 
@@ -248,11 +297,12 @@ class Payments:
         )
         return reqs, resource
 
-    def mcp_extension(self) -> X402McpGate:
-        return X402McpGate(self)
+    def mcp_extension(self, *, store: ArtifactStore | None = None) -> X402McpGate:
+        return X402McpGate(self, store=store)
 
     def tool_operation(self, tool: str) -> Operation | None:
-        return BY_TOOL.get(tool)
+        """The paid operation behind an MCP tool, if this deployment serves it."""
+        return self._by_tool.get(tool)
 
     # ------------------------------------------------------------------ discovery
     def discovery_document(self) -> dict[str, Any]:
