@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 import anyio
 import pytest
 from x402 import SettleResponse, parse_payment_required
+from x402.http.clients.httpx import PaymentError
 
 import aimart_testkit as kit
 from aimart_parquet.engine.models import ConvertOptions
@@ -347,3 +348,57 @@ async def test_a_gate_without_a_store_leaves_no_output_provisional(
     assert result.meta["x402/payment-response"]["success"] is True
     assert len(store._folders()) == 1
     assert store._provisional == set()
+
+
+async def test_rest_handler_crash_after_the_output_was_stored_deletes_it(
+    paid_app: kit.AppHarness, facilitator: kit.FakeFacilitator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Not an AimartError: the exception escapes the route (a 500, never settled); the file it
+    # stored first must not stay behind.
+    service = paid_app.app.state.service
+    real = service.convert
+
+    async def convert_then_crash(*args: Any, **kwargs: Any) -> Any:
+        await real(*args, **kwargs)
+        raise RuntimeError("bug after storing")
+
+    monkeypatch.setattr(service, "convert", convert_then_crash)
+    # The paying client wraps what the in-process transport re-raises.
+    with pytest.raises(PaymentError, match="bug after storing"):
+        await paid_app.paying.post("/v1/convert", **convert_body(SMALL_CSV))
+    assert facilitator.settled == []
+    assert stored(paid_app.settings) == set()
+
+
+async def test_mcp_tool_crash_after_the_output_was_stored_deletes_it(
+    settings: Settings, tmp_path: Path
+) -> None:
+    from types import SimpleNamespace
+
+    from aimart_parquet.artifacts import LocalArtifactStore
+    from aimart_parquet.payments import Payments
+
+    fake = kit.FakeFacilitator()
+    payments = Payments(settings, [fake])
+    store = LocalArtifactStore(tmp_path / "s", ttl_s=60, max_total_bytes=10**6, secret=b"k")
+    gate = payments.mcp_extension(store=store)
+    op = payments.tool_operation("convert_to_parquet")
+    assert op is not None
+    reqs, resource = await payments.mcp_requirements(op)
+    pr = await payments.server.create_payment_required_response(reqs, resource, error="x")
+    meta = await kit.mcp_payment_meta(
+        kit.paying_client(), pr.model_dump(by_alias=True, exclude_none=True)
+    )
+    out = tmp_path / "out.parquet"
+    out.write_bytes(b"x" * 10)
+
+    async def tool(_: Any) -> Any:
+        store.put(out, "x.parquet")
+        raise anyio.get_cancelled_exc_class()  # e.g. the client went away mid-call
+
+    params = SimpleNamespace(name="convert_to_parquet", arguments={}, meta=meta)
+    with pytest.raises(anyio.get_cancelled_exc_class()):
+        await gate.intercept_tool_call(params, None, tool)
+    assert store._folders() == []
+    assert store._provisional == set()
+    assert fake.settled == []
