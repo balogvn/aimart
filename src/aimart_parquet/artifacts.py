@@ -193,8 +193,13 @@ class LocalArtifactStore:
         """The call that stored these was paid for: they now count, and may evict, as usual."""
         ids = [i for i in artifact_ids if i in self._provisional]
         self._provisional.difference_update(ids)
-        if ids:
+        if not ids:
+            return
+        try:
             self.enforce_capacity(keep=ids)
+        except Exception:
+            # Runs after settlement: the caller has paid, so their result must still go out.
+            log.exception("capacity enforcement failed", extra={"artifact_ids": ids})
 
     def _store_local(self, src: Path, filename: str) -> Artifact:
         artifact_id = self.new_id()
@@ -285,17 +290,23 @@ class LocalArtifactStore:
         """
         spared = {keep} if isinstance(keep, str) else set(keep)
         pending = set(self._provisional) - spared
-        folders = sorted(
-            (f for f in self._folders() if f.name not in pending), key=lambda f: f.stat().st_mtime
-        )
-        sizes = {f: sum(p.stat().st_size for p in f.iterdir() if p.is_file()) for f in folders}
-        total = sum(sizes.values())
-        for folder in folders:
+        entries: list[tuple[float, int, Path]] = []
+        for folder in self._folders():
+            if folder.name in pending:
+                continue
+            try:
+                size = sum(p.stat().st_size for p in folder.iterdir() if p.is_file())
+                entries.append((folder.stat().st_mtime, size, folder))
+            except OSError:  # removed meanwhile, e.g. by a sweep in a worker thread
+                continue
+        entries.sort(key=lambda e: e[0])
+        total = sum(size for _, size, _ in entries)
+        for _, size, folder in entries:
             if total <= self.max_total_bytes:
                 break
             if folder.name in spared:
                 continue
-            total -= sizes[folder]
+            total -= size
             self._remove(folder)
 
     def _folders(self) -> list[Path]:

@@ -105,6 +105,67 @@ def test_track_puts_records_only_inside_the_block(tmp_path: Path) -> None:
     assert after.id not in produced
 
 
+def test_provisional_outputs_neither_evict_nor_are_evicted_until_committed(
+    tmp_path: Path,
+) -> None:
+    # A paid call's output is stored before settlement. It used to evict older (paid) artifacts
+    # at once, and stayed when settlement then failed.
+    store = store_at(tmp_path / "store")
+    paid = store.put(src_file(tmp_path, DATA, "p"), "p.parquet")
+    store.max_total_bytes = len(DATA) + 200  # room for one artifact and its meta.json
+    with track_puts() as produced:
+        pending = store.put(src_file(tmp_path, DATA, "q"), "q.parquet")
+    assert folders(store) == {paid.id, pending.id}  # nothing evicted for an unsettled call
+    later = store.put(src_file(tmp_path, DATA, "l"), "l.parquet")
+    assert pending.id in folders(store)  # and an unsettled output is never evicted itself
+    assert folders(store) == {later.id, pending.id}
+    store.commit(produced)  # settled: it now counts, and the older one makes room
+    assert folders(store) == {pending.id}
+    store.get(pending.id)
+
+
+def test_a_deleted_provisional_output_is_forgotten(tmp_path: Path) -> None:
+    store = store_at(tmp_path / "store")
+    with track_puts() as produced:
+        art = store.put(src_file(tmp_path), "x.parquet")
+    store.delete(art.id)
+    store.commit(produced)  # a late commit of a withheld output stores nothing
+    assert folders(store) == set()
+    assert store._provisional == set()
+
+
+def test_commit_never_fails_a_settled_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # commit() runs after settlement: raising there turned a paid 200 into a 500.
+    store = store_at(tmp_path / "store")
+    with track_puts() as produced:
+        art = store.put(src_file(tmp_path), "x.parquet")
+
+    def broken(**_: Any) -> None:
+        raise OSError("disk hiccup")
+
+    monkeypatch.setattr(store, "enforce_capacity", broken)
+    store.commit(produced)
+    assert any("capacity enforcement failed" in r.message for r in caplog.records)
+    store.get(art.id)
+
+
+def test_enforce_capacity_tolerates_a_folder_removed_meanwhile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = store_at(tmp_path / "store")
+    a = store.put(src_file(tmp_path, DATA, "a"), "a.parquet")
+    b = store.put(src_file(tmp_path, DATA, "b"), "b.parquet")
+    ghost = store.root / ("G" * 24)  # listed, then swept by another thread before its stat
+    real = store._folders()
+    monkeypatch.setattr(store, "_folders", lambda: [ghost, *real])
+    store.max_total_bytes = len(DATA) + 200
+    store.enforce_capacity(keep=b.id)
+    assert folders(store) == {b.id}
+    assert a.id not in folders(store)
+
+
 def test_maybe_sweep_never_fails_the_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
