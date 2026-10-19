@@ -212,3 +212,57 @@ def test_agents_md_code_map_describes_artifact_deletion() -> None:
     code_map = section("AGENTS.md", "## Code map")
     assert "delete()" in code_map
     assert "lifecycle" in code_map
+
+
+# ------------------------------------------------------------------ D1 (review of 8197c71): schema text
+def schema_descriptions(node: object, path: str = "") -> list[tuple[str, str]]:
+    """Every ``description`` string in a JSON schema tree, with where it sits."""
+    found: list[tuple[str, str]] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "description" and isinstance(value, str):
+                found.append((path, value))
+            else:
+                found += schema_descriptions(value, f"{path}/{key}")
+    elif isinstance(node, list):
+        for i, value in enumerate(node):
+            found += schema_descriptions(value, f"{path}/{i}")
+    return found
+
+
+@pytest.mark.anyio
+@pytest.mark.xfail(
+    raises=AssertionError,
+    strict=True,
+    reason=(
+        "engine/models.py (not the docs area's file): ArtifactRef.expires_at still says the "
+        "artifact 'is deleted' at that time; see the cross-area request. Remove this marker in "
+        "the change that fixes the field."
+    ),
+)
+async def test_published_schemas_say_unreachable_at_expiry_not_deleted(
+    free_app: kit.AppHarness,
+) -> None:
+    # data_retention says an artifact becomes unreachable at the TTL and is deleted later (about
+    # a day at worst on GCS). The OpenAPI document and the MCP outputSchema are a second
+    # published contract; they said "deleted" at expires_at, which D1 removed everywhere else.
+    spec = (await free_app.http.get("/openapi.json")).json()
+    async with kit.mcp_over_http(free_app.app) as client:
+        tools = (await client.list_tools()).tools
+    published = schema_descriptions(spec, "openapi") + [
+        hit for t in tools for hit in schema_descriptions(t.model_dump(by_alias=True), t.name)
+    ]
+    expires = [text for path, text in published if path.endswith("/properties/expires_at")]
+    assert len(expires) >= 2  # /openapi.json and at least convert_to_parquet's outputSchema
+    promises = [
+        (path, text)
+        for path, text in published
+        if re.search(r"\b(is|are|gets|get) deleted\b", text) and "when the call" not in text
+    ]
+    assert not promises, promises
+    assert all("unreachable" in text for text in expires), expires
+
+
+def test_agents_guide_says_expires_at_is_when_the_artifact_becomes_unreachable() -> None:
+    look = section("docs/agents-guide.md", "## 4. Look, then ask")
+    assert re.search(r"`artifact\.expires_at`[^.]*unreachable", look)

@@ -75,7 +75,8 @@ layer) and password-protected PDFs are rejected with an error, so you are not ch
 ## 4. Look, then ask
 
 Keep using the `artifact_id`. Artifacts live for `AIMART_ARTIFACT_TTL_S`, one hour by default.
-`artifact.expires_at` gives the exact time.
+`artifact.expires_at` is the exact time it becomes unreachable, download link included; after
+that, convert again. Deletion follows (`data_retention` in `GET /pricing` says when).
 
 | need | call | price (defaults) |
 |---|---|---:|
