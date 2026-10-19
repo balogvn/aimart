@@ -1,5 +1,5 @@
 """Service fixes: caller Parquet is decoded in the isolated worker (S1), and URL downloads share
-one byte budget per call and wait for a job slot before they start (S3)."""
+one byte budget per call and, like uploads, wait for a job slot before they start (S3)."""
 
 from __future__ import annotations
 
@@ -245,4 +245,76 @@ async def test_a_failed_call_gives_its_job_slot_back(
         async with service._job():
             assert await service._execute(lambda: 7, timeout_s=1, isolate=False) == 7
     finish.set()
+    assert service._limiter.statistics().borrowed_tokens == 0
+
+
+class Upload:
+    """A multipart upload as the route sees it: counts how much was read from it."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.read_bytes = 0
+
+    async def read(self, size: int) -> bytes:
+        chunk = self.data[self.read_bytes : self.read_bytes + size]
+        self.read_bytes += len(chunk)
+        return chunk
+
+
+async def test_upload_is_copied_only_once_it_holds_a_job_slot(
+    make_settings: Callable[..., Settings],
+) -> None:
+    # Before: the route copied the whole upload onto the RAM-backed artifact disk and only then
+    # asked for a slot, so a busy server took up to 50 MB per caller before answering "busy".
+    service = make_service(make_settings(max_concurrent_jobs=1))
+    release = anyio.Event()
+    holding = anyio.Event()
+    queued = Upload(CSV)
+    refused = Upload(CSV)
+    results: list[int] = []
+
+    async def hold() -> None:
+        async with service._limiter:
+            holding.set()
+            await release.wait()
+
+    async def wait_in_line() -> None:
+        async with service._limiter:
+            pass
+
+    async def convert() -> None:
+        result = await service.convert_upload(queued.read, "q.csv", ConvertOptions())
+        results.append(result.report.rows)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(hold)
+        await holding.wait()
+        tg.start_soon(convert)
+        while service._limiter.statistics().tasks_waiting < 1:  # noqa: ASYNC110 - no event exists
+            await anyio.sleep(0.001)
+        assert queued.read_bytes == 0  # waiting for a slot, not copying meanwhile
+        for _ in range(4):
+            tg.start_soon(wait_in_line)
+        while service._limiter.statistics().tasks_waiting < 5:  # noqa: ASYNC110 - no event exists
+            await anyio.sleep(0.001)
+        with pytest.raises(Busy):
+            await service.convert_upload(refused.read, "r.csv", ConvertOptions())
+        assert refused.read_bytes == 0
+        release.set()
+    assert results == [3]
+    assert queued.read_bytes == len(CSV)
+    assert list(service._workroot.iterdir()) == []
+
+
+async def test_upload_over_the_input_limit_is_413_and_leaves_nothing(
+    make_settings: Callable[..., Settings],
+) -> None:
+    service = make_service(make_settings(max_input_bytes=2 * 1024 * 1024))
+    big = Upload(b"a,b\n" + b"1,2\n" * (1024 * 1024))  # 4 MB, read 1 MB at a time
+    with pytest.raises(InputTooLarge) as info:
+        await service.convert_upload(big.read, "big.csv", ConvertOptions())
+    assert info.value.http_status == 413
+    assert info.value.hint == "Split the file or pass a url."
+    assert big.read_bytes < len(big.data)  # stopped at the cap, not after reading it all
+    assert list(service._workroot.iterdir()) == []
     assert service._limiter.statistics().borrowed_tokens == 0

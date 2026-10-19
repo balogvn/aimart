@@ -51,7 +51,7 @@ from aimart_parquet.provenance import verify as verify_signature
 from aimart_parquet.sources import decode_base64, fetch_url, safe_filename
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
     from aimart_parquet.artifacts import ArtifactStore
     from aimart_parquet.config import Settings
@@ -248,6 +248,36 @@ class Service:
     ) -> ConvertResult:
         async with self._job():
             return await self._convert(src, options, output_path)
+
+    async def convert_upload(
+        self,
+        read: Callable[[int], Awaitable[bytes]],
+        filename: str | None,
+        options: ConvertOptions,
+    ) -> ConvertResult:
+        """Convert a multipart upload, copied to disk inside the job slot like a URL download.
+
+        The route used to copy all 50 MB onto the RAM-backed artifact disk first and only then
+        ask for a slot, so a busy server still took the copy before answering "busy".
+        """
+        async with self._job():
+            workdir = self._workdir()
+            try:
+                dest = workdir / "upload"
+                size = 0
+                with dest.open("wb") as out:
+                    while chunk := await read(1024 * 1024):
+                        size += len(chunk)
+                        if size > self.settings.max_input_bytes:
+                            raise InputTooLarge(
+                                f"Upload exceeds {self.settings.max_input_bytes // (1024 * 1024)} "
+                                "MB.",
+                                hint="Split the file or pass a url.",
+                            )
+                        out.write(chunk)
+                return await self._convert(SourceRef(upload=dest, filename=filename), options, None)
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
 
     async def _convert(
         self, src: SourceRef, options: ConvertOptions, output_path: str | None

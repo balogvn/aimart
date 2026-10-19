@@ -20,8 +20,6 @@ import email.message
 import hmac
 import json
 import logging
-import tempfile
-from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 from urllib.parse import urlsplit
 
@@ -56,13 +54,13 @@ from aimart_parquet.artifacts import ArtifactStore, build_store
 from aimart_parquet.config import Settings, get_settings
 from aimart_parquet.demand import CapabilityAck, CapabilityRequest, DemandSignals
 from aimart_parquet.engine.models import ConvertOptions, ConvertResult, InspectResult, TabularResult
-from aimart_parquet.errors import AimartError, ArtifactNotFound, InputTooLarge, InvalidRequest
+from aimart_parquet.errors import AimartError, ArtifactNotFound, InvalidRequest
 from aimart_parquet.logs import configure as configure_logging
 from aimart_parquet.mcp.server import argument_checker, build_mcp
 from aimart_parquet.payments.pricing import BY_KEY, quantum_enabled
 from aimart_parquet.provenance import Signer
 from aimart_parquet.quantum.models import PortfolioResult, QuantumCompressResult
-from aimart_parquet.service import Service, SourceRef
+from aimart_parquet.service import Service
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
@@ -360,19 +358,7 @@ def create_app(
             raise InvalidRequest(
                 "options is not valid ConvertOptions JSON.", hint=str(exc.errors()[:3])
             ) from exc
-        with tempfile.TemporaryDirectory(dir=settings.artifact_dir) as tmp:
-            dest = Path(tmp) / "upload"
-            size = 0
-            with dest.open("wb") as out:
-                while chunk := await file.read(1024 * 1024):
-                    size += len(chunk)
-                    if size > settings.max_input_bytes:
-                        raise InputTooLarge(
-                            f"Upload exceeds {settings.max_input_bytes // (1024 * 1024)} MB.",
-                            hint="Split the file or pass a url.",
-                        )
-                    out.write(chunk)
-            return await service.convert(SourceRef(upload=dest, filename=file.filename), parsed)
+        return await service.convert_upload(file.read, file.filename, parsed)
 
     @app.post(
         "/v1/inspect",
