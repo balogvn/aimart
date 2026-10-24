@@ -184,3 +184,65 @@ def test_a_number_is_its_true_value_or_a_counted_reject(cells, dialect: str, mod
     for value, (amount, style) in zip(got, cells, strict=True):
         assert value is None or value == float(amount), (dialect, mode, _money(amount, style))
     assert column.rejected_count == sum(v is None for v in got)
+
+
+def _number_text(value: Any, style: str) -> str:
+    if style == "int":
+        return str(int(value))
+    if style == "plain":
+        return f"{value:.2f}"
+    if style == "plain3":  # '1.230': a decimal, or 1230 with a dot group
+        return f"{value:.3f}"
+    if style in {"us_int", "eu_int"}:  # '1,234' / '1.234': thousands, or decimals
+        text = f"{int(value):,}"
+        return text.replace(",", ".") if style == "eu_int" else text
+    if style == "space":
+        return f"{value:,.2f}".replace(",", " ").replace(".", ",")
+    return _money(value, style)
+
+
+@settings(
+    max_examples=80,
+    deadline=None,
+    suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+)
+@given(
+    st.lists(
+        st.tuples(
+            _AMOUNTS,
+            st.sampled_from(["us", "eu", "plain", "plain3", "int", "us_int", "eu_int", "space"]),
+        ),
+        min_size=1,
+        max_size=60,
+    ),
+    st.booleans(),
+)
+def test_an_expected_schema_cast_agrees_with_inference(cells, decimal_comma: bool) -> None:
+    """A value must not depend on whether inference left its column as text.
+
+    expected_schema casts of text columns once read each value on its own, dialect first, so
+    one junk value (which keeps a column text) turned 1.234 into 1234 in a semicolon file.
+    """
+    from aimart_parquet.engine.duck import connect
+    from aimart_parquet.engine.infer import TypeInferrer
+    from aimart_parquet.engine.models import DateOrder
+
+    con = connect(memory_limit="256MB", threads=1)
+    con.execute("CREATE TABLE raw (c VARCHAR)")
+    con.executemany("INSERT INTO raw VALUES (?)", [(_number_text(a, s),) for a, s in cells])
+    inferrer = TypeInferrer(
+        con,
+        "raw",
+        extra_null_tokens=[],
+        date_order=DateOrder.AUTO,
+        prefer_decimal_comma=decimal_comma,
+    )
+    plan = inferrer.plan(["c"])["c"]
+    if plan.type_name not in {"int64", "float64"}:
+        return
+    sql_type = "BIGINT" if plan.type_name == "int64" else "DOUBLE"
+    cast = inferrer.cast_text("c", plan.type_name, sql_type)
+    rows = con.sql(f"SELECT c, {plan.expr}, {cast} FROM raw").fetchall()
+    for text, inferred, cast_value in rows:
+        if inferred is not None and cast_value is not None:
+            assert inferred == cast_value, (text, inferred, cast_value, decimal_comma)

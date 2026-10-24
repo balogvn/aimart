@@ -177,11 +177,15 @@ class TestCastTextKeepsTheConvention:
     """I2: expected_schema casts rewrite separators only for values in the file's convention."""
 
     @pytest.mark.parametrize(
-        ("type_name", "sql_type"), [("int64", "BIGINT"), ("float64", "DOUBLE")]
+        ("type_name", "sql_type", "expected"),
+        [("int64", "BIGINT", [None, None, None]), ("float64", "DOUBLE", [12.5, 3.75, None])],
     )
-    def test_comma_decimals_in_a_comma_file_are_rejects(self, type_name, sql_type) -> None:
+    def test_comma_decimals_in_a_comma_file_are_never_thousands(
+        self, type_name, sql_type, expected
+    ) -> None:
+        """Were 125 / 375 (10x and 100x off). '12,5' cannot be a thousands group: it is 12.5."""
         out = cast(["12,5", "3,75", "abc"], type_name, sql_type, decimal_comma=False)
-        assert out == [None, None, None]  # were 125 / 375 (10x and 100x off)
+        assert out == pytest.approx(expected)
 
     def test_us_grouping_in_a_semicolon_file_is_a_reject(self) -> None:
         out = cast(["1,234.5", "1.234,5", "2,5"], "float64", "DOUBLE", decimal_comma=True)
@@ -198,8 +202,8 @@ class TestCastTextKeepsTheConvention:
             1234,
             5,
         ]
-        assert cast(["1.234", "1,5", "2.5"], "float64", "DOUBLE", decimal_comma=True) == (
-            pytest.approx([1234.0, 1.5, 2.5])
+        assert cast(["1.234", "1,5", "2"], "float64", "DOUBLE", decimal_comma=True) == (
+            pytest.approx([1234.0, 1.5, 2.0])
         )
 
     def test_strict_schema_fails_instead_of_charging_for_10x_values(self, tmp_path) -> None:
@@ -219,7 +223,7 @@ class TestCastTextKeepsTheConvention:
     def test_non_strict_schema_counts_the_rejects(self, tmp_path) -> None:
         csv = 'v,w\n"12,5",a\n"3,75",b\nabc,c\n'
         result = kit.convert_bytes(
-            tmp_path, "a.csv", csv, expected_schema=[{"name": "v", "type": "float64"}]
+            tmp_path, "a.csv", csv, expected_schema=[{"name": "v", "type": "int64"}]
         )
         assert result.rows["v"] == [None, None, None]
         v = result.column("v")
@@ -235,7 +239,7 @@ class TestCastTextKeepsTheConvention:
         ],
     )
     def test_the_dialect_choice_is_reported(self, tmp_path, csv, rows, note) -> None:
-        """A per-value cast cannot see the column: the dialect decided, and the report says so."""
+        """'1.234' and '1,234' read either way: the report says which reading was taken."""
         result = kit.convert_bytes(
             tmp_path,
             "a.csv",
@@ -267,4 +271,83 @@ class TestCastTextKeepsTheConvention:
         assert (result.column("v").rejected_count, result.column("v").rejected_examples) == (
             1,
             ["1.5"],
+        )
+
+
+class TestCastTextDecidesTheConventionForTheColumn:
+    """RV2: expected_schema casts read each value on its own, with the dialect's grouping first.
+
+    In a semicolon file '1.234' became 1234 even when '1.5' and '2.75' in the same column prove
+    dot decimals, so one junk value (which leaves the column as text for this cast) turned
+    1.234 into 1234. The column decides, as inference does: values only one convention reads
+    are the evidence, the dialect breaks a tie, and values in the other convention are rejects.
+    """
+
+    def test_dot_decimals_in_a_semicolon_file_keep_1_234_a_decimal(self) -> None:
+        out = cast(["1.5", "1.234", "2.75"], "float64", "DOUBLE", decimal_comma=True)
+        assert out == pytest.approx([1.5, 1.234, 2.75])  # '1.234' was 1234.0
+
+    def test_comma_decimals_in_a_comma_file_keep_1_234_a_decimal(self) -> None:
+        out = cast(["1,5", "1,234", "2,75"], "float64", "DOUBLE", decimal_comma=False)
+        assert out == pytest.approx([1.5, 1.234, 2.75])  # were [None, 1234.0, None]
+
+    def test_values_in_the_minority_convention_are_rejects(self) -> None:
+        out = cast(["1,5", "2,5", "1.5", "1.234"], "float64", "DOUBLE", decimal_comma=False)
+        assert out == pytest.approx([1.5, 2.5, None, 1234.0])
+
+    @pytest.mark.parametrize(
+        ("decimal_comma", "expected"), [(False, [1.5, None]), (True, [None, 1.5])]
+    )
+    def test_the_dialect_breaks_a_tie(self, decimal_comma, expected) -> None:
+        assert cast(["1.5", "1,5"], "float64", "DOUBLE", decimal_comma=decimal_comma) == (
+            pytest.approx(expected)
+        )
+
+    def test_integer_target_uses_the_column_convention(self) -> None:
+        assert cast(["1.234", "2.5", "7"], "int64", "BIGINT", decimal_comma=True) == [
+            None,  # 1.234 is not a whole number: '2.5' shows the dot is decimal
+            None,
+            7,
+        ]
+        assert cast(["1.234", "2,5", "7"], "int64", "BIGINT", decimal_comma=True) == [
+            1234,
+            None,
+            7,
+        ]
+
+    @pytest.mark.parametrize("infer_types", [False, True])
+    def test_end_to_end_semicolon_csv(self, tmp_path, infer_types) -> None:
+        """With inference on, the junk 'n/v' leaves the column as text, so this cast reads it."""
+        csv = "price;x\n1.5;a\n1.234;b\n2.75;c\n" + ("n/v;d\n" if infer_types else "")
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            csv,
+            infer_types=infer_types,
+            strict=not infer_types,
+            expected_schema=[
+                {"name": "price", "type": "float64"},
+                {"name": "x", "type": "string"},
+            ],
+        )
+        assert result.rows["price"][:3] == pytest.approx([1.5, 1.234, 2.75])
+        assert result.column("price").rejected_count == (1 if infer_types else 0)
+
+    @pytest.mark.parametrize(
+        ("values", "decimal_comma"),
+        [
+            (["1.5", "1.234", "2.75"], True),
+            (["1,5", "1,234", "2,75"], False),
+            (["1.234", "2.500", "12.750"], True),
+            (["1,234", "5,678"], False),
+            (["1.234,5", "2,5", "12"], True),
+        ],
+    )
+    def test_agrees_with_inference(self, values, decimal_comma) -> None:
+        """The value must not depend on whether inference left the column as text."""
+        plan, inferred = infer(values, decimal_comma=decimal_comma)
+        assert plan.type_name in {"int64", "float64"}
+        sql_type = "BIGINT" if plan.type_name == "int64" else "DOUBLE"
+        assert cast(values, plan.type_name, sql_type, decimal_comma=decimal_comma) == (
+            pytest.approx(inferred)
         )

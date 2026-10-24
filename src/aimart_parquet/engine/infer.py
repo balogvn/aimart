@@ -367,15 +367,17 @@ class TypeInferrer:
     def cast_note(self, source: str, type_name: str, expr: str) -> str | None:
         """What a cast_text result assumed that its values do not say, for the report.
 
-        A per-value cast cannot see the column, so the file's dialect alone decided '1,234' and
-        '1.234'; a naive target holds an offset only by converting to UTC, and a timestamptz
+        '1,234' and '1.234' read either way: the column's other values or the dialect decided
+        which; a naive target holds an offset only by converting to UTC, and a timestamptz
         target holds a naive value only by assuming UTC. Inference says so in a note; the
         expected_schema cast must too.
         """
         if type_name in {"int64", "float64", "decimal"}:
-            style = "eu" if self.prefer_decimal_comma else "us"
             return self._separator_note(
-                source, style, expr, "declare it as string in expected_schema to keep the text"
+                source,
+                self._text_style(source),
+                expr,
+                "declare it as string in expected_schema to keep the text",
             )
         if type_name in {"date", "timestamp", "timestamptz"}:
             v = _Exprs.build(ident(source), self.tokens).v
@@ -477,27 +479,49 @@ class TypeInferrer:
         plan.rejected_count = self._reject_count(source, expr)
         return plan
 
+    def _text_style(self, source: str) -> str:
+        """The number convention of a text column ('us' or 'eu'), decided for the whole column.
+
+        Values only one convention reads are the evidence ('1.5' and '1,234.5' have a decimal
+        point, '1,5' and '1.234,5' a decimal comma); the dialect breaks a tie, including the
+        tie of no evidence at all. Reading each value on its own, dialect first, made '1.234'
+        1234 in a semicolon file whose '1.5' and '2.75' prove dot decimals, while inference read
+        the same column as 1.234: the value depended on whether inference left it as text.
+        """
+        e = _Exprs.build(ident(source), self.tokens)
+        point, comma = _style_fit(e.n, "us"), _style_fit(e.n, "eu")
+        row = self.con.sql(
+            f"SELECT count_if({point} AND NOT {comma}), count_if({comma} AND NOT {point}) "
+            f"FROM {self.table}"
+        ).fetchone()
+        point_only, comma_only = (int(row[0]), int(row[1])) if row else (0, 0)
+        if point_only != comma_only:
+            return "us" if point_only > comma_only else "eu"
+        return "eu" if self.prefer_decimal_comma else "us"
+
     def cast_text(self, source: str, type_name: str, sql_type: str) -> str:
         """Best-effort cast of a text column to a caller-mandated type (expected_schema)."""
         e = _Exprs.build(ident(source), self.tokens)
-        style = "eu" if self.prefer_decimal_comma else "us"
-        # Separators are rewritten only in values written in a convention: the dialect's
-        # grouping (first, so '1.234' is 1234 in a decimal-comma file, as inference reads it),
-        # plain numbers, space groups. Anything else is a reject. Rewriting every value made
-        # '12,5' in a comma file 125, and '1,234.5' in a semicolon file 1.2345.
-        readings = [
-            (_match(e.n, _RE_EU if style == "eu" else _RE_US), _numeric_conversion(e.n, style)),
-            (_match(e.n, _RE_PLAIN), e.n),
-            (_match(e.n, _RE_SPACE), _numeric_conversion(e.n, "space")),
-        ]
-        if type_name == "int64":
-            whens = " ".join(
-                f"WHEN {fit} THEN (CASE WHEN {_match(c, _RE_INT)} THEN TRY_CAST({c} AS BIGINT) END)"
-                for fit, c in readings
-            )
-            return f"(CASE {whens} END)"
-        if type_name in {"float64", "decimal"}:
-            whens = " ".join(f"WHEN {fit} THEN TRY_CAST({c} AS {sql_type})" for fit, c in readings)
+        if type_name in {"int64", "float64", "decimal"}:
+            style = self._text_style(source)
+            # Separators are rewritten only in values written in the column's convention, or in
+            # space groups (which read the same in both). Anything else is a reject. Rewriting
+            # every value made '12,5' in a comma file 125, and '1,234.5' in a semicolon file
+            # 1.2345.
+            readings = [
+                (_style_fit(e.n, style), _numeric_conversion(e.n, style)),
+                (_match(e.n, _RE_SPACE), _numeric_conversion(e.n, "space")),
+            ]
+            if type_name == "int64":
+                whens = " ".join(
+                    f"WHEN {fit} THEN "
+                    f"(CASE WHEN {_match(c, _RE_INT)} THEN TRY_CAST({c} AS BIGINT) END)"
+                    for fit, c in readings
+                )
+            else:
+                whens = " ".join(
+                    f"WHEN {fit} THEN TRY_CAST({c} AS {sql_type})" for fit, c in readings
+                )
             return f"(CASE {whens} END)"
         if type_name == "bool":
             true_list = ", ".join(map(literal, (*TRUE_TOKENS, "1")))
