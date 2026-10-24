@@ -16,8 +16,11 @@ Correctness beats cleverness on purpose:
 * Null tokens such as ``NA`` are only applied to columns that become typed. In a text column
   ``NA`` may be Namibia, so text keeps it unless the caller lists it in ``null_values``.
 * When ``03/04/2025`` parses both ways and no value disambiguates, ``date_order`` decides and
-  the report says so. Likewise ``1,234`` and ``1.234`` (thousands or decimals?): the file's
-  dialect decides (decimal comma in semicolon files) and the report says so.
+  the report says so. Likewise ``1,234`` and ``1.234`` (thousands or decimals?): when no value
+  in the column settles it, the file's dialect decides (decimal comma in semicolon files) and
+  the report says so. The expected_schema cast of a text column decides the same way, for the
+  whole column, so a value never depends on whether inference left its column as text.
+* A decimal cast never rounds: a digit beyond the requested scale makes the value a reject.
 * A UTC offset is never dropped. DuckDB's ``TIMESTAMP`` cast silently discards it, so text
   with an offset or zone is only ever read as ``TIMESTAMPTZ``. And only such text: that cast
   reads a naive value in the zone named by an earlier row ('10:00' after '09:00 EST' is EST).
