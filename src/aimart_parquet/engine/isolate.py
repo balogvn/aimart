@@ -1,4 +1,4 @@
-"""Run a job in a short-lived child process: crash isolation and a hard deadline.
+"""Run a job in a short-lived child process: crash isolation, a hard deadline, a memory cap.
 
 Why a process and not a thread:
 
@@ -8,6 +8,13 @@ Why a process and not a thread:
 * Threads cannot be killed. pyreadstat and calamine ignore DuckDB's interrupt, so a thread
   timeout only stops *waiting*; the CPU burn continues. A child is killed at the deadline.
 * Memory is returned to the OS when the child exits, which matters on 2 GiB instances.
+* Memory is capped per job. A 1.6 KB PDF drawing 1M glyphs took a child to 2 GB in 15 s, and
+  a query returning huge strings or a Parquet dictionary bomb in preview does the same: on a
+  2 GiB instance running two jobs and the API, one such job kills every in-flight request.
+  The parent polls the child's resident memory and kills it over ``job_memory_limit_mb``,
+  raising ``InputTooLarge`` (unpaid). ``RLIMIT_AS``/``RLIMIT_DATA`` cannot do this: measured
+  on Linux, a child starts at 2 GB virtual (DuckDB, Arrow, PennyLane and glibc arenas reserve
+  address space) with 160 MB resident, and a 1.5 GB limit already failed a 200k-row CSV.
 
 Children fork from a ``forkserver`` that has already imported the engine, so a job costs a
 fork (milliseconds), not a fresh interpreter importing pyarrow and DuckDB.
@@ -15,12 +22,18 @@ fork (milliseconds), not a fresh interpreter importing pyarrow and DuckDB.
 
 from __future__ import annotations
 
+import ctypes
+import functools
 import multiprocessing as mp
 import os
 import signal
+import sys
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from aimart_parquet import errors
+from aimart_parquet.config import Settings
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -54,6 +67,88 @@ if _METHOD == "forkserver":
             "pennylane",  # the quantum modules import it lazily; preload it explicitly
             "pdfplumber",
         ]
+    )
+
+
+# The parent checks the child's memory this often. A job allocating as fast as it can gains
+# a few hundred MB between checks; the default limit leaves that much headroom on 2 GiB.
+_POLL_S = 0.1
+DEFAULT_MEMORY_LIMIT_MB: int = Settings.model_fields["job_memory_limit_mb"].default
+_PROC = Path("/proc")
+_LIBPROC = "/usr/lib/libproc.dylib"
+_PROC_PIDTASKINFO = 4  # proc_pidinfo flavor returning struct proc_taskinfo
+
+
+def _rss_from_proc(pid: int) -> int | None:
+    """Linux: ``VmRSS`` from ``/proc/<pid>/status``, in bytes (None once the child is gone)."""
+    try:
+        status = (_PROC / str(pid) / "status").read_text()
+    except OSError:
+        return None
+    for line in status.splitlines():
+        if line.startswith("VmRSS:"):
+            return int(line.split()[1]) * 1024
+    return None
+
+
+@functools.cache
+def _libproc() -> ctypes.CDLL:
+    lib = ctypes.CDLL(_LIBPROC)
+    lib.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    return lib
+
+
+def _rss_from_libproc(pid: int) -> int | None:
+    """macOS: ``pti_resident_size`` (the second field of the 96-byte ``proc_taskinfo``)."""
+    info = (ctypes.c_uint64 * 12)()
+    got = _libproc().proc_pidinfo(pid, _PROC_PIDTASKINFO, 0, info, ctypes.sizeof(info))
+    return int(info[1]) if got == ctypes.sizeof(info) else None
+
+
+_RSS_READERS: dict[str, Callable[[int], int | None]] = {
+    "linux": _rss_from_proc,
+    "darwin": _rss_from_libproc,
+}
+
+
+def _read_rss(pid: int) -> int | None:
+    """Resident bytes of ``pid``; None where the platform offers no cheap way to ask.
+
+    Linux (production) and macOS (development) only. On Linux the figure includes the pages the
+    child shares with the forkserver (~160 MB of preloaded engine); macOS counts them elsewhere.
+    """
+    reader = _RSS_READERS.get(sys.platform)
+    return reader(pid) if reader is not None else None
+
+
+def _wait_for_report(receiver: Any, pid: int, timeout_s: float, memory_limit_mb: int) -> Any:
+    """The child's message, or None if it died without one. Enforces the deadline and memory."""
+    deadline = time.monotonic() + timeout_s
+    while (remaining := deadline - time.monotonic()) > 0:
+        if receiver.poll(min(remaining, _POLL_S) if memory_limit_mb else remaining):
+            try:
+                return receiver.recv()
+            except EOFError:
+                return None  # the child died before reporting: a crash
+        rss = _read_rss(pid) if memory_limit_mb else None
+        if rss is not None and rss > memory_limit_mb * 1024 * 1024:
+            raise errors.InputTooLarge(
+                f"The job exceeded its memory budget ({memory_limit_mb} MB) and was stopped.",
+                hint=(
+                    "Send a smaller file (for a PDF, fewer pages via pdf_pages), or a query that "
+                    "returns less data; you were not charged."
+                ),
+                limit_bytes=memory_limit_mb * 1024 * 1024,
+            )
+    raise errors.Timeout(
+        f"The operation did not finish within {timeout_s:g} seconds.",
+        hint="Send a smaller file or a simpler query; you were not charged.",
     )
 
 
@@ -99,24 +194,24 @@ def _rebuild(
     return cls(message, hint=hint, **details)
 
 
-def run_isolated[T](fn: Callable[..., T], *args: Any, timeout_s: float, **kwargs: Any) -> T:
-    """Run ``fn(*args, **kwargs)`` in a child process. Blocking; call from a worker thread."""
+def run_isolated[T](
+    fn: Callable[..., T],
+    *args: Any,
+    timeout_s: float,
+    memory_limit_mb: int = DEFAULT_MEMORY_LIMIT_MB,
+    **kwargs: Any,
+) -> T:
+    """Run ``fn(*args, **kwargs)`` in a child process. Blocking; call from a worker thread.
+
+    The child is killed at ``timeout_s`` (``Timeout``) or once its resident memory exceeds
+    ``memory_limit_mb`` (``InputTooLarge``; 0 disables the cap).
+    """
     receiver, sender = _CTX.Pipe(duplex=False)
     proc = _CTX.Process(target=_child, args=(sender, fn, args, kwargs), daemon=True)
     proc.start()
     sender.close()
-    message: Any = None
     try:
-        if receiver.poll(timeout_s):
-            try:
-                message = receiver.recv()
-            except EOFError:
-                message = None  # the child died before reporting: a crash
-        else:
-            raise errors.Timeout(
-                f"The operation did not finish within {timeout_s:g} seconds.",
-                hint="Send a smaller file or a simpler query; you were not charged.",
-            )
+        message = _wait_for_report(receiver, proc.pid, timeout_s, memory_limit_mb)
     finally:
         receiver.close()
         if proc.is_alive():

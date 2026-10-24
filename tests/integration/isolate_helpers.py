@@ -52,3 +52,15 @@ def record_pid_then_sleep(pid_file: str, seconds: float) -> str:
     Path(pid_file).write_text(str(os.getpid()))
     time.sleep(seconds)
     return "woke up"
+
+
+def own_rss() -> int | None:
+    from aimart_parquet.engine.isolate import _read_rss
+
+    return _read_rss(os.getpid())
+
+
+def allocate(total_mb: int, step_mb: int = 20) -> int:
+    # Random bytes, so no page is shared, deduplicated or compressed away by the OS.
+    blocks = [os.urandom(step_mb * 1024 * 1024) for _ in range(total_mb // step_mb)]
+    return len(blocks)

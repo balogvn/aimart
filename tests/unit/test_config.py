@@ -61,3 +61,16 @@ def test_signing_key_must_be_a_32_byte_seed() -> None:
     with pytest.raises(ValueError, match="32-byte seed"):
         Signer.from_b64("!!!not base64!!!")
     assert Signer.from_b64(base64.b64encode(b"\x01" * 32).decode()).ephemeral is False
+
+
+def test_job_memory_limit_defaults_to_700_mb_and_reads_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Two 700 MB jobs, the API and the forkserver fit a 2 GiB instance (review P1: a 1.6 KB PDF
+    # took one uncapped job to 2 GB). 0 disables the cap; a negative value is a typo, not a cap.
+    assert Settings(_env_file=None).job_memory_limit_mb == 700
+    monkeypatch.setenv("AIMART_JOB_MEMORY_LIMIT_MB", "0")
+    assert Settings(_env_file=None).job_memory_limit_mb == 0
+    monkeypatch.setenv("AIMART_JOB_MEMORY_LIMIT_MB", "-1")
+    with pytest.raises(ValueError, match="job_memory_limit_mb"):
+        Settings(_env_file=None)

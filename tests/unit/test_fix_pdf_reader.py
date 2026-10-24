@@ -300,8 +300,9 @@ def test_p5_reference_cycle_is_invalid_input_not_a_hang(tmp_path: Path) -> None:
     src = _refcycle(tmp_path / "refcycle.pdf")
     work = tmp_path / "work"
     work.mkdir()
-    started = time.monotonic()
-    # In a child with a deadline, so the unfixed hang fails this test instead of the suite.
+    # In a child with a deadline, so the unfixed hang fails this test (as a Timeout, not an
+    # InvalidInput) instead of hanging the suite. No wall-clock assertion: under a loaded
+    # machine the forkserver's first start alone took longer than the fixed parse.
     with pytest.raises(InvalidInput, match="reference") as info:
         run_isolated(
             convert_file,
@@ -313,7 +314,6 @@ def test_p5_reference_cycle_is_invalid_input_not_a_hang(tmp_path: Path) -> None:
             limits=Limits(),
             timeout_s=20,
         )
-    assert time.monotonic() - started < 15
     assert info.value.http_status == 422
 
 
