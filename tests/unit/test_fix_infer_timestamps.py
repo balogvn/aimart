@@ -380,3 +380,39 @@ class TestNamedZonesDoNotLeakIntoNaiveValues:
             want = zoned[i][1] if i in zoned else utc(2025, 1, 15, i % 24)
             assert got == want, (i, values[i], got)
             assert wall == want.replace(tzinfo=None), (i, values[i], wall)
+
+
+class TestInstantsPastYear9999:
+    """RV4: applying an offset to a 9999-12-31 sentinel lands in year 10000, which Python's
+    datetime cannot hold. The report read the footer max as a datetime and convert failed with
+    a bare 500 (OverflowError); before offsets were applied, the same file converted."""
+
+    SENTINEL = "9999-12-31 23:59:59-05:00"
+
+    def _micros(self, result: kit.Converted, name: str) -> list[int | None]:
+        return result.table.column(name).cast("int64").to_pylist()
+
+    def test_expected_schema_timestamp(self, tmp_path) -> None:
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            f"ts,x\n{self.SENTINEL},1\n2025-01-15 10:00:00,2\n",
+            infer_types=False,
+            expected_schema=[{"name": "ts", "type": "timestamp"}],
+        )
+        assert result.column("ts").type == "timestamp[us]"
+        assert result.column("ts").null_count == 0
+        # 10000-01-01 04:59:59: the instant the sentinel names, five hours past 9999-12-31.
+        assert self._micros(result, "ts")[0] == (253402300799 + 5 * 3600) * 10**6
+
+    def test_inferred_instants(self, tmp_path) -> None:
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            f"ts,x\n{self.SENTINEL},1\n2025-01-15 10:00:00+01:00,2\n2025-01-15 10:00:00,3\n",
+        )
+        assert "tz=" in result.column("ts").type
+        assert self._micros(result, "ts")[1:] == [
+            int(utc(2025, 1, 15, 9).timestamp()) * 10**6,
+            int(utc(2025, 1, 15, 10).timestamp()) * 10**6,
+        ]
