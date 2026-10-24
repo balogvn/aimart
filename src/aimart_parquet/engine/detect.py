@@ -6,6 +6,7 @@ as .xls), so magic bytes win over extensions wherever a format has a reliable si
 
 from __future__ import annotations
 
+import os
 import zipfile
 from pathlib import Path
 
@@ -13,6 +14,10 @@ from aimart_parquet.engine.models import InputFormat
 from aimart_parquet.errors import UnsupportedFormat
 
 _SAS7BDAT_MAGIC = bytes.fromhex("000000000000000000000000c2ea8160b31411cfbd92080009c7318c181f1011")
+_BOM = b"\xef\xbb\xbf"
+# PDF readers accept the '%PDF-' header anywhere in the first 1024 bytes and look for the
+# trailer ('startxref', '%%EOF') in the last 1024.
+_PDF_WINDOW = 1024
 
 _EXTENSIONS: dict[str, InputFormat] = {
     ".csv": InputFormat.CSV,
@@ -72,10 +77,35 @@ def _zip_office_format(path: Path) -> InputFormat | None:
     return None
 
 
+def _read_window(path: Path, *, tail: bool) -> bytes:
+    try:
+        with path.open("rb") as fh:
+            if tail:
+                fh.seek(max(0, fh.seek(0, os.SEEK_END) - _PDF_WINDOW))
+            return fh.read(_PDF_WINDOW)
+    except OSError:
+        return b""
+
+
+def _pdf_after_junk(path: Path, magic: bytes) -> bool:
+    """A PDF whose header follows junk: a UTF-8 BOM, an HTTP or PJL header, binary bytes.
+
+    Detection once looked at offset 0 only, so such a file (which pdfminer reads fine) was
+    parsed as CSV and charged for rows of PDF syntax. The header alone is not enough here: a
+    CSV may hold the text '%PDF-1.4' in a cell within its first KB. A PDF also ends with its
+    trailer, which no CSV does, so both are required. (A file named .pdf is trusted by name.)
+    """
+    head = magic if len(magic) >= _PDF_WINDOW else _read_window(path, tail=False) or magic
+    if b"%PDF-" not in head[:_PDF_WINDOW]:
+        return False
+    end = _read_window(path, tail=True)
+    return b"startxref" in end or b"%%EOF" in end
+
+
 def format_from_magic(path: Path, magic: bytes) -> InputFormat | None:
     if magic.startswith(b"PAR1"):
         return InputFormat.PARQUET
-    if magic.lstrip(b"\x00\t\r\n ")[:5] == b"%PDF-":
+    if magic.removeprefix(_BOM).lstrip(b"\x00\t\r\n ")[:5] == b"%PDF-":
         return InputFormat.PDF
     if magic.startswith(b"$FL3"):
         return InputFormat.ZSAV
@@ -93,6 +123,8 @@ def format_from_magic(path: Path, magic: bytes) -> InputFormat | None:
         return InputFormat.DTA
     if b"SPSSPORT" in magic:
         return InputFormat.POR
+    if _pdf_after_junk(path, magic):
+        return InputFormat.PDF
     return None
 
 
@@ -131,6 +163,11 @@ def detect_format(
         return by_magic
     if by_name in {InputFormat.DTA, InputFormat.POR, InputFormat.XPT, InputFormat.SAS7BDAT}:
         return by_name  # binary formats whose older variants lack a reliable signature
+    if by_name is InputFormat.PDF:
+        # Readers skip junk before the header, so a .pdf without a signature we recognise is
+        # still most likely a PDF. If it is not one, the PDF reader fails with a 422 that names
+        # options.format; sniffed as text it became CSV rows of PDF syntax, and a 200.
+        return by_name
     if _looks_binary(magic):
         if by_name is not None:
             return by_name
