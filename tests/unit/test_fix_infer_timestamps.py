@@ -230,3 +230,153 @@ class TestEndToEnd:
                 ],
                 strict=True,
             )
+
+
+class TestNamedZonesDoNotLeakIntoNaiveValues:
+    """RV1: DuckDB's text-to-TIMESTAMPTZ cast leaks a zone name into later rows.
+
+    Within one vector, a value such as '09:00 EST' sets the cast's calendar zone, and every
+    later value without a zone of its own is read in that zone. Zones were detected by
+    comparing that cast with the TIMESTAMP cast, so naive values after a zone name were taken
+    for zoned ones and shifted by hours (dates by a day), with no reject and no note, or a
+    false one, and strict passed.
+    """
+
+    EST = "2025-01-01 09:00:00 EST"
+    NAIVE = [f"2025-01-{d:02d} 10:00:00" for d in range(2, 29)] * 2  # 54 values
+
+    def _cast(self, values: list[str | None], type_name: str, sql_type: str) -> list[Any]:
+        con = _con(values)
+        return _values(con, _inferrer(con).cast_text("c", type_name, sql_type))
+
+    def test_inference_keeps_naive_values_after_a_zone_name(self) -> None:
+        plan, out = infer([self.EST, *self.NAIVE])
+        assert plan.type_name == "timestamp"
+        assert out[1:] == [dt.datetime.fromisoformat(v) for v in self.NAIVE]  # were 15:00
+        assert out[0] is None
+        assert (plan.rejected_count, plan.rejected_examples) == (1, [self.EST])
+        assert any(n.startswith(f"{OFFSETS_REJECTED} (1 of 55)") for n in plan.notes)
+
+    def test_strict_naive_schema_fails_instead_of_charging_for_shifted_times(
+        self, tmp_path
+    ) -> None:
+        csv = "ts,x\n" + "".join(f"{v},{i}\n" for i, v in enumerate([self.EST, *self.NAIVE]))
+        with pytest.raises(SchemaViolation):
+            kit.convert_bytes(
+                tmp_path,
+                "a.csv",
+                csv,
+                expected_schema=[
+                    {"name": "ts", "type": "timestamp"},
+                    {"name": "x", "type": "int64"},
+                ],
+                strict=True,
+            )
+
+    def test_instants_read_naive_values_as_utc_not_as_the_last_zone(self) -> None:
+        plan, out = infer(
+            [
+                "2025-01-15 10:00:00 Asia/Tokyo",
+                "2025-01-15 10:00:00+05:00",
+                "2025-01-15 10:00:00+01:00",
+                "2025-01-15 10:00:00",
+            ]
+        )
+        assert plan.type_name == "timestamptz"
+        assert as_utc(out) == [
+            utc(2025, 1, 15, 1),
+            utc(2025, 1, 15, 5),
+            utc(2025, 1, 15, 9),
+            utc(2025, 1, 15, 10),  # was 01:00, read in Tokyo time
+        ]
+        assert f"{READ_AS_UTC} (1 of 4)" in plan.notes
+
+    def test_a_column_of_zones_reads_each_value_in_its_own_zone(self) -> None:
+        plan, out = infer(
+            [
+                "2025-01-15 10:00:00 EST",
+                "2025-01-15 10:00:00 UTC",
+                "2025-01-15 10:00:00+05:00",
+                "2025-01-15 10:00:00 Asia/Tokyo",
+                "2025-01-15 10:00:00Z",
+            ]
+        )
+        assert plan.type_name == "timestamptz"
+        assert as_utc(out) == [
+            utc(2025, 1, 15, 15),
+            utc(2025, 1, 15, 10),
+            utc(2025, 1, 15, 5),
+            utc(2025, 1, 15, 1),
+            utc(2025, 1, 15, 10),
+        ]
+
+    def test_timestamp_cast_converts_only_the_zoned_value(self) -> None:
+        out = self._cast(
+            ["2025-01-15 10:00:00 America/New_York", "2025-01-15 10:00:00", "2025-01-16 10:00:00"],
+            "timestamp",
+            "TIMESTAMP",
+        )
+        assert out == [  # were all 15:00
+            dt.datetime(2025, 1, 15, 15),
+            dt.datetime(2025, 1, 15, 10),
+            dt.datetime(2025, 1, 16, 10),
+        ]
+
+    def test_date_cast_keeps_the_naive_dates(self) -> None:
+        out = self._cast(
+            ["2025-01-15 10:00:00 Asia/Tokyo", "2025-01-15", "2025-01-16"], "date", "DATE"
+        )
+        assert out == [dt.date(2025, 1, 15), dt.date(2025, 1, 15), dt.date(2025, 1, 16)]  # off by 1
+
+    def test_timestamptz_cast_reads_naive_values_as_utc(self) -> None:
+        out = self._cast(
+            ["2025-01-15 10:00:00", self.EST, "2025-01-15 10:00:00", "15/01/2025 10:00"],
+            "timestamptz",
+            "TIMESTAMPTZ",
+        )
+        assert as_utc(out) == [
+            utc(2025, 1, 15, 10),
+            utc(2025, 1, 1, 14),
+            utc(2025, 1, 15, 10),  # was 15:00, read as EST
+            utc(2025, 1, 15, 10),
+        ]
+
+    @pytest.mark.parametrize(
+        ("type_name", "note"),
+        [
+            ("timestamp", "values with a UTC offset were converted to UTC (1 of 3)"),
+            ("timestamptz", f"{READ_AS_UTC} (2 of 3)"),
+        ],
+    )
+    def test_the_report_counts_what_was_converted(self, tmp_path, type_name, note) -> None:
+        """The notes said '3 of 3' converted, and '1 of 4' read as UTC when 3 of 4 were."""
+        rows = ["2025-01-15 10:00:00 America/New_York", "2025-01-15 10:00:00", "2025-01-16"]
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            "ts,x\n" + "".join(f"{v},{i}\n" for i, v in enumerate(rows)),
+            infer_types=False,
+            expected_schema=[{"name": "ts", "type": type_name}],
+        )
+        assert note in result.column("ts").notes
+
+    def test_across_vectors_every_value_matches_its_own_reading(self) -> None:
+        """DuckDB works in 2048-row vectors: zone names at and around the boundaries."""
+        zoned = {
+            0: ("2025-01-15 10:00:00 EST", utc(2025, 1, 15, 15)),
+            2047: ("2025-01-15 10:00:00 Asia/Tokyo", utc(2025, 1, 15, 1)),
+            2048: ("2025-01-15 10:00:00 Europe/Paris", utc(2025, 1, 15, 9)),
+            3000: ("2025-01-15 10:00:00-08:00", utc(2025, 1, 15, 18)),
+            4500: ("2025-01-15 10:00:00 Etc/GMT+5", utc(2025, 1, 15, 15)),
+        }
+        values = [
+            zoned[i][0] if i in zoned else f"2025-01-15 {i % 24:02d}:00:00" for i in range(5000)
+        ]
+        con = _con(values)
+        inferrer = _inferrer(con)
+        cast = as_utc(_values(con, inferrer.cast_text("c", "timestamptz", "TIMESTAMPTZ")))
+        naive = _values(con, inferrer.cast_text("c", "timestamp", "TIMESTAMP"))
+        for i, (got, wall) in enumerate(zip(cast, naive, strict=True)):
+            want = zoned[i][1] if i in zoned else utc(2025, 1, 15, i % 24)
+            assert got == want, (i, values[i], got)
+            assert wall == want.replace(tzinfo=None), (i, values[i], wall)

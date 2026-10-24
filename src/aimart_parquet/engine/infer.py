@@ -19,7 +19,8 @@ Correctness beats cleverness on purpose:
   the report says so. Likewise ``1,234`` and ``1.234`` (thousands or decimals?): the file's
   dialect decides (decimal comma in semicolon files) and the report says so.
 * A UTC offset is never dropped. DuckDB's ``TIMESTAMP`` cast silently discards it, so text
-  with an offset or zone is only ever read as ``TIMESTAMPTZ``.
+  with an offset or zone is only ever read as ``TIMESTAMPTZ``. And only such text: that cast
+  reads a naive value in the zone named by an earlier row ('10:00' after '09:00 EST' is EST).
 """
 
 from __future__ import annotations
@@ -159,13 +160,29 @@ def _has_zone(v: str) -> str:
 
     DuckDB's TIMESTAMP cast drops an offset without applying it ('10:00+05:00' and
     '10:00-08:00' both become 10:00, 13 hours apart made equal), and returns NULL for zone
-    names; either way it disagrees with the TIMESTAMPTZ cast, which applies them.
+    names other than UTC; the TIMESTAMPTZ cast applies both.
+
+    The TIMESTAMPTZ cast of text must never see a value without a zone in the same call as
+    one with a zone name: a name such as 'EST' becomes the zone of every later naive value in
+    its 2048-row vector (DuckDB 1.5.6), so '10:00' after '09:00 EST' reads as 15:00 UTC.
+    Comparing it with the TIMESTAMP cast over the whole column took those naive values for
+    zoned ones and shifted them, silently. So each CASE branch below casts a set that cannot
+    leak: values the TIMESTAMP cast rejects (zone names, and junk that both casts reject; a
+    leak changes which zone a value is read in, never whether it parses), or values it reads,
+    whose only possible zone name is UTC, the session zone that duck.connect pins anyway.
+    DuckDB runs a CASE branch only on the rows that take it.
     """
+    naive = f"TRY_CAST({v} AS TIMESTAMP)"
     tz = f"TRY_CAST({v} AS TIMESTAMPTZ)"
     return (
-        f"({tz} IS NOT NULL AND ({_match(v, _RE_TZ_SUFFIX)} "
-        f"OR TRY_CAST({v} AS TIMESTAMP) IS DISTINCT FROM {tz}::TIMESTAMP))"
+        f"(CASE WHEN {naive} IS NULL THEN {tz} IS NOT NULL "
+        f"ELSE {_match(v, _RE_TZ_SUFFIX)} OR {tz}::TIMESTAMP != {naive} END)"
     )
+
+
+def _zoned_ts(v: str) -> str:
+    """Text with a zone as an instant; NULL for anything else, which the cast would misread."""
+    return f"(CASE WHEN {_has_zone(v)} THEN TRY_CAST({v} AS TIMESTAMPTZ) END)"
 
 
 def naive_as_utc_note(naive: int, total: int) -> str:
@@ -178,6 +195,14 @@ def _parse_ts(v: str, formats: list[str]) -> str:
     return (
         f"(CASE WHEN NOT {_has_zone(v)} THEN "
         f"coalesce(TRY_CAST({v} AS TIMESTAMP), try_strptime({v}, {_fmt_list(formats)})) END)"
+    )
+
+
+def _instant(v: str, formats: list[str]) -> str:
+    """Text as an instant: a zone where it has one, UTC where it has none (say so in a note)."""
+    return (
+        f"(CASE WHEN {_has_zone(v)} THEN TRY_CAST({v} AS TIMESTAMPTZ) "
+        f"ELSE timezone('UTC', {_parse_ts(v, formats)}) END)"
     )
 
 
@@ -401,8 +426,7 @@ class TypeInferrer:
         text = self.text_plan(source)
         tolerant = n >= MIN_ROWS_FOR_TOLERANCE
         if n and n_tz == n:
-            expr = f"TRY_CAST({v} AS TIMESTAMPTZ)"
-            return ColumnPlan(source, expr, "timestamptz")
+            return ColumnPlan(source, _zoned_ts(v), "timestamptz")
         # Offsets mixed with naive values (the naive parse below never sees an offset). Mostly
         # offsets: the column holds instants and the naive values are read as UTC, said in a
         # note. Mostly naive: an offset has no honest naive reading, so it is a counted reject.
@@ -436,11 +460,7 @@ class TypeInferrer:
         formats = self.dmy_formats if order == "dmy" else self.mdy_formats
         parsed = _parse_ts(v, formats)
         if instants:
-            expr = (
-                f"(CASE WHEN {_has_zone(v)} THEN TRY_CAST({v} AS TIMESTAMPTZ) "
-                f"ELSE timezone('UTC', {parsed}) END)"
-            )
-            type_name = "timestamptz"
+            expr, type_name = _instant(v, formats), "timestamptz"
             naive = n_dmy if order == "dmy" else n_mdy
             if naive:
                 notes.append(naive_as_utc_note(naive, n))
@@ -486,8 +506,8 @@ class TypeInferrer:
                 f"(CASE WHEN lower({e.v}) IN ({true_list}) THEN true "
                 f"WHEN lower({e.v}) IN ({false_list}) THEN false END)"
             )
+        formats = self.mdy_formats if self.date_order is DateOrder.MDY else self.dmy_formats
         if type_name in {"date", "timestamp"}:
-            formats = self.mdy_formats if self.date_order is DateOrder.MDY else self.dmy_formats
             # An offset is applied (UTC, as a timestamptz column cast to timestamp is), never
             # dropped by the TIMESTAMP cast.
             parsed = (
@@ -496,7 +516,8 @@ class TypeInferrer:
             )
             return f"CAST({parsed} AS DATE)" if type_name == "date" else parsed
         if type_name == "timestamptz":
-            return f"TRY_CAST({e.v} AS TIMESTAMPTZ)"
+            # Not TRY_CAST over the column: naive values after '09:00 EST' read as EST.
+            return _instant(e.v, formats)
         return f"TRY_CAST({e.v} AS {sql_type})"
 
     # ------------------------------------------------------------------ helpers
