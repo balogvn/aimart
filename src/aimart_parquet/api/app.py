@@ -148,8 +148,13 @@ def _body_check(app: FastAPI) -> Callable[[Request, bool], Awaitable[JSONRespons
                 ("multipart/form-data", "application/x-www-form-urlencoded")
             ):
                 return None
-            length = request.headers.get("content-length", "")
-            tiny = length.isdigit() and int(length) <= 16  # never buffer a real upload here
+            length = request.headers.get("content-length")
+            if length is None:
+                # Neither Content-Length nor chunked: HTTP/1.1 has no body (RFC 9112 6.3), as
+                # in `curl -X POST <route>`. Treated as a large body, that probe got a 400.
+                tiny = "transfer-encoding" not in request.headers
+            else:
+                tiny = length.isdigit() and int(length) <= 16  # never buffer a real upload here
             if not paying and tiny and _price_probe(await request.body()):
                 return None
             return _invalid_body({"loc": (name,), "msg": "Field required"} for name in forms[key])

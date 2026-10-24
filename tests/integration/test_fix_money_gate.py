@@ -262,3 +262,79 @@ async def test_mcp_paid_call_with_invalid_arguments_is_not_verified(
     assert ok.structured_content["error"]["code"] == "artifact_not_found"
     assert len(facilitator.verified) == 1  # only the valid call was verified
     assert facilitator.settled == []
+
+
+# ------------------------------------------------------------------------------ Q1: probes
+# Validating before the quote must never turn a price probe into a 400: catalogs (x402scan)
+# and `make smoke` learn prices that way, and a route that answers 400 drops out of them.
+async def _bare_post(app: Any, path: str, headers: list[tuple[bytes, bytes]]) -> tuple[int, bool]:
+    """POST with no body through the whole ASGI stack, with exactly these headers (httpx always
+    adds Content-Length: 0, which is not what `curl -X POST` sends)."""
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", b"test"), *headers],
+        "client": ("203.0.113.9", 4000),
+        "server": ("test", 80),
+    }
+    await app(scope, receive, send)
+    start = sent[0]
+    return start["status"], any(k == b"payment-required" for k, _ in start["headers"])
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [[], [(b"content-length", b"0")]],
+    ids=["no-content-length", "content-length-0"],
+)
+async def test_a_bodiless_price_probe_is_quoted_on_every_paid_route(
+    headers: list[tuple[bytes, bytes]], paid_app: kit.AppHarness
+) -> None:
+    # Before: /v1/convert/upload answered `curl -X POST` (no Content-Length) with a 400.
+    from aimart_parquet.payments.pricing import active_operations
+
+    for op in active_operations(paid_app.settings):
+        status, quoted = await _bare_post(paid_app.app, op.path, headers)
+        assert (status, quoted) == (402, True), op.path
+
+
+async def test_a_chunked_non_form_body_to_the_upload_route_is_refused_unread(
+    paid_app: kit.AppHarness, facilitator: kit.FakeFacilitator
+) -> None:
+    status, quoted = await _bare_post(
+        paid_app.app, "/v1/convert/upload", [(b"transfer-encoding", b"chunked")]
+    )
+    assert (status, quoted) == (400, False)
+    assert facilitator.verified == []
+
+
+async def test_every_bazaar_example_input_is_quoted_not_rejected(
+    paid_app: kit.AppHarness,
+) -> None:
+    # Catalogs may replay the advertised example body: it must reach its 402.
+    from aimart_parquet.payments.bazaar import EXAMPLES
+    from aimart_parquet.payments.pricing import active_operations
+
+    for op in active_operations(paid_app.settings):
+        example = EXAMPLES[op.key]["input"]
+        if op.key == "convert_upload":
+            r = await paid_app.http.post(op.path, data=example)
+        else:
+            r = await paid_app.http.post(op.path, json=example)
+        assert r.status_code == 402, (op.path, r.text)
+        assert kit.payment_required(r)["accepts"][0]["amount"]

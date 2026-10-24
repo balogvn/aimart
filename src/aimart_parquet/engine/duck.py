@@ -1,6 +1,6 @@
 """DuckDB connections that are safe to point at untrusted input and untrusted SQL.
 
-Two rules hold everywhere a connection is made:
+Three rules hold everywhere a connection is made:
 
 1. File access is locked to directories we created for this job (``allowed_directories``)
    with ``enable_external_access`` off, so neither a crafted file name nor a caller's SQL can

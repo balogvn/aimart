@@ -211,23 +211,33 @@ class LocalArtifactStore:
     def _store_local(self, src: Path, filename: str) -> Artifact:
         artifact_id = self.new_id()
         folder = self.root / artifact_id
-        folder.mkdir(parents=True)
-        dst = folder / "data.parquet"
-        shutil.move(src, dst)
-        digest = hashlib.sha256()
-        with dst.open("rb") as fh:
-            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-                digest.update(chunk)
-        now = time.time()
-        art = Artifact(
-            id=artifact_id,
-            filename=filename,
-            size_bytes=dst.stat().st_size,
-            sha256=digest.hexdigest(),
-            created_at=now,
-            expires_at=now + self.ttl_s,
-        )
-        self._write_meta(folder, art)
+        try:
+            folder.mkdir(parents=True)
+            dst = folder / "data.parquet"
+            shutil.move(src, dst)
+            digest = hashlib.sha256()
+            with dst.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            now = time.time()
+            art = Artifact(
+                id=artifact_id,
+                filename=filename,
+                size_bytes=dst.stat().st_size,
+                sha256=digest.hexdigest(),
+                created_at=now,
+                expires_at=now + self.ttl_s,
+            )
+            self._write_meta(folder, art)
+        except OSError as exc:
+            # A full (RAM) disk or a failed write: a typed error that cancels the payment, not
+            # a bare 500 and a half-written folder counted against the budget.
+            self._remove(folder)
+            log.exception("storing an output failed", extra={"artifact_id": artifact_id})
+            raise StorageUnavailable(
+                "Could not store the output file.",
+                hint="Retry in a minute; you were not charged.",
+            ) from exc
         return art
 
     @staticmethod
@@ -282,7 +292,10 @@ class LocalArtifactStore:
             try:
                 expires = json.loads((folder / "meta.json").read_text())["expires_at"]
             except (OSError, ValueError, KeyError):
-                expires = folder.stat().st_mtime + self.ttl_s  # half-written: age out by mtime
+                try:
+                    expires = folder.stat().st_mtime + self.ttl_s  # half-written: by mtime
+                except OSError:  # removed meanwhile: the other sweeper (threads) or a delete
+                    continue
             if expires < now:
                 self.delete(folder.name)
                 removed += 1
@@ -314,7 +327,11 @@ class LocalArtifactStore:
             if folder.name in spared:
                 continue
             total -= size
-            self._remove(folder)
+            self._evict(folder)
+
+    def _evict(self, folder: Path) -> None:
+        """Free disk for the budget. Here the folder is the artifact, so it is gone for good."""
+        self._remove(folder)
 
     def _folders(self) -> list[Path]:
         return [p for p in self.root.iterdir() if p.is_dir() and _ID.match(p.name)]
@@ -344,7 +361,8 @@ class GcsArtifactStore(LocalArtifactStore):
 
     The local folder is a cache: capacity eviction drops only the local copy (the blob stays
     valid until its TTL), while expiry and ``delete`` remove the blob too. GCS deletes are free
-    operations, so expired blobs are deleted as soon as a sweep sees them.
+    operations, so expired blobs are deleted as soon as a sweep sees them, including blobs whose
+    cached copy was evicted (remembered in ``_uncached``, as no folder is left to find them by).
     """
 
     def __init__(
@@ -365,6 +383,9 @@ class GcsArtifactStore(LocalArtifactStore):
         self._bucket = client.bucket(bucket)
         self._next_listing = 0.0  # this instance's own throttle on reading the bucket marker
         self._listing = threading.Lock()  # sweeps run in worker threads; list once at a time
+        # id -> expires_at of blobs whose cached copy capacity eviction dropped. Without it they
+        # outlived the TTL by up to six hours (the listing sweep) although we knew their expiry.
+        self._uncached: dict[str, float] = {}
 
     @staticmethod
     def _key(artifact_id: str) -> str:
@@ -428,13 +449,23 @@ class GcsArtifactStore(LocalArtifactStore):
         folder.mkdir(parents=True, exist_ok=True)
         blob.download_to_filename(str(folder / "data.parquet"))
         self._write_meta(folder, art)
+        self._uncached.pop(artifact_id, None)  # cached again: the local sweep finds it
         self.enforce_capacity(keep=artifact_id)  # the cache shares the RAM disk's budget
         return art, folder / "data.parquet"
 
     def delete(self, artifact_id: str) -> None:
         if _ID.match(artifact_id):
+            self._uncached.pop(artifact_id, None)
             super().delete(artifact_id)
             self._delete_blob(self._key(artifact_id))
+
+    def _evict(self, folder: Path) -> None:
+        # Only the cached copy goes; the blob stays downloadable until its TTL, when the sweep
+        # must still delete it.
+        art = self._local_record(folder.name)
+        if art is not None:
+            self._uncached[art.id] = art.expires_at
+        self._remove(folder)
 
     def _delete_blob(self, key: str) -> None:
         try:
@@ -448,7 +479,13 @@ class GcsArtifactStore(LocalArtifactStore):
     def sweep(self) -> int:
         """Delete expired artifacts locally and in the bucket, then (rationed) list the bucket
         for expired blobs this instance has no record of: written by an instance that is gone."""
-        return super().sweep() + self._sweep_bucket()
+        removed = super().sweep()
+        now = time.time()
+        for artifact_id, expires in list(self._uncached.items()):
+            if expires < now and self._uncached.pop(artifact_id, None) is not None:
+                self._delete_blob(self._key(artifact_id))
+                removed += 1
+        return removed + self._sweep_bucket()
 
     def _sweep_bucket(self) -> int:
         now = time.time()

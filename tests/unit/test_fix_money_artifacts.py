@@ -484,3 +484,77 @@ def test_gcs_rehydration_respects_the_local_budget(tmp_path: Path) -> None:
     got, path = cold.get(first.id)
     assert got.id == first.id
     assert path.read_bytes() == DATA
+
+
+def test_gcs_blob_of_an_evicted_cache_copy_is_deleted_at_its_ttl(
+    tmp_path: Path, clock: list[float]
+) -> None:
+    # Capacity eviction drops only the cached copy. Before, the request-path sweep found
+    # expired artifacts by their folders, so such a blob waited for the six-hourly listing.
+    client = FakeClient()
+    bucket = client.the_bucket
+    store = gcs_store(tmp_path / "cache", client, ttl_s=3600, max_total_bytes=len(DATA) + 400)
+    first = store.put(src_file(tmp_path, DATA, "1"), "1.parquet")
+    clock[0] += 10
+    second = store.put(src_file(tmp_path, DATA, "2"), "2.parquet")
+    assert folders(store) == {second.id}  # first's cached copy made room...
+    assert key(first.id) in bucket.blobs  # ...and its blob is still served until the TTL
+    store.sweep()  # the listing sweep runs now, then not again for six hours
+    assert key(first.id) in bucket.blobs
+
+    clock[0] += 3595  # first is past its TTL, second (10 s younger) is not
+    assert store.sweep() == 1
+    assert key(first.id) not in bucket.blobs
+    assert key(second.id) in bucket.blobs
+    assert len(bucket.ops("list")) == 1  # found without listing the bucket again
+    assert store._uncached == {}
+
+
+def test_gcs_a_recached_or_deleted_artifact_is_no_longer_tracked_as_evicted(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    store = gcs_store(tmp_path / "cache", client, max_total_bytes=len(DATA) + 400)
+    first = store.put(src_file(tmp_path, DATA, "1"), "1.parquet")
+    second = store.put(src_file(tmp_path, DATA, "2"), "2.parquet")
+    assert set(store._uncached) == {first.id}
+    store.get(first.id)  # rehydrated: its folder is back (and second's copy made room)
+    assert set(store._uncached) == {second.id}
+    store.delete(second.id)
+    assert store._uncached == {}
+    assert key(second.id) not in client.the_bucket.blobs
+
+
+def test_a_failed_local_write_is_a_structured_error_and_leaves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # e.g. the RAM-backed disk is full: before, a bare OSError (a 500) and a half-written folder.
+    import errno
+
+    store = store_at(tmp_path / "store")
+
+    def full_disk(*_: Any) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(artifacts.shutil, "move", full_disk)
+    with track_puts() as produced, pytest.raises(AimartError) as info:
+        store.put(src_file(tmp_path), "x.parquet")
+    assert info.value.http_status == 503
+    assert info.value.hint
+    assert "not charged" in info.value.hint
+    assert folders(store) == set()
+    assert produced == []
+
+
+def test_sweep_tolerates_a_folder_removed_meanwhile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock: list[float]
+) -> None:
+    # The background sweeper and the request-path sweep run in different threads.
+    store = store_at(tmp_path / "store", ttl_s=60)
+    art = store.put(src_file(tmp_path), "x.parquet")
+    ghost = store.root / ("G" * 24)  # listed, then removed before its meta.json was read
+    real = store._folders()
+    monkeypatch.setattr(store, "_folders", lambda: [ghost, *real])
+    clock[0] += 61
+    assert store.sweep() == 1
+    assert art.id not in folders(store)
