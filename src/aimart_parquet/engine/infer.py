@@ -26,7 +26,7 @@ Correctness beats cleverness on purpose:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from aimart_parquet.engine.duck import ident, literal
 from aimart_parquet.engine.models import DateOrder
@@ -69,6 +69,10 @@ _RE_EU = r"[+-]?[1-9]\d{0,2}(\.\d{3})+(,\d+)?|[+-]?\d+,\d+"
 _RE_SPACE = r"[+-]?[1-9]\d{0,2}([ \x{00A0}\x{202F}]\d{3})+([.,]\d+)?"
 _RE_LEADING_ZERO = r"[+-]?0\d+"
 _STYLES = ("plain", "us", "eu", "space")
+_NUMERIC_TYPES = frozenset(
+    {"tinyint", "smallint", "integer", "bigint", "hugeint", "float", "double", "decimal"}
+    | {"utinyint", "usmallint", "uinteger", "ubigint", "uhugeint"}
+)
 _RE_DATE_LIKE = (
     r"\d{1,4}[-/. ]\d{1,2}[-/. ]\d{1,4}.*|.*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec).*"
 )
@@ -148,6 +152,20 @@ def _numeric_conversion(n: str, style: str) -> str:
     if style == "space":
         return f"replace(regexp_replace({n}, '[ \\x{{00A0}}\\x{{202F}}]', '', 'g'), ',', '.')"
     return n
+
+
+def _unrounded_decimal(c: str, sql_type: str, scale: int) -> str:
+    """Plain number text c as a decimal, or NULL where the cast would round it.
+
+    DuckDB rounds to the scale without a word: '12.5' at scale 0 is 13, '12.345' at scale 2 is
+    12.35. The int64 cast makes a fraction a counted reject, and with scale 0 honoured a
+    decimal quietly did what an integer may not (strict passed and charged for 13). Text shows
+    every digit, so one beyond the scale is visible; with an exponent, DOUBLE is the judge.
+    """
+    cast = f"TRY_CAST({c} AS {sql_type})"
+    within = _match(c, rf"[+-]?(\d+\.?\d{{0,{scale}}}0*|\.\d{{0,{scale}}}0*)")
+    exponent = f"(regexp_matches({c}, '[eE]') AND {cast} = TRY_CAST({c} AS DOUBLE))"
+    return f"(CASE WHEN {within} OR {exponent} THEN {cast} END)"
 
 
 def _date_formats(order: DateOrder) -> tuple[list[str], list[str]]:
@@ -518,6 +536,12 @@ class TypeInferrer:
                     f"(CASE WHEN {_match(c, _RE_INT)} THEN TRY_CAST({c} AS BIGINT) END)"
                     for fit, c in readings
                 )
+            elif type_name == "decimal":
+                scale = self._decimal_scale(sql_type)
+                whens = " ".join(
+                    f"WHEN {fit} THEN {_unrounded_decimal(c, sql_type, scale)}"
+                    for fit, c in readings
+                )
             else:
                 whens = " ".join(
                     f"WHEN {fit} THEN TRY_CAST({c} AS {sql_type})" for fit, c in readings
@@ -545,6 +569,15 @@ class TypeInferrer:
         return f"TRY_CAST({e.v} AS {sql_type})"
 
     # ------------------------------------------------------------------ helpers
+    def is_number(self, expr: str) -> bool:
+        """Whether expr over this table is a numeric DuckDB type (natives may be anything)."""
+        kind = self.con.sql(f"SELECT {expr} FROM {self.table} LIMIT 0").types[0].id
+        return kind in _NUMERIC_TYPES
+
+    def _decimal_scale(self, sql_type: str) -> int:
+        children = dict(self.con.sql(f"SELECT NULL::{sql_type}").types[0].children)
+        return cast("int", children["scale"])  # DECIMAL's children: precision and scale
+
     def _reject_count(self, source: str, expr: str) -> int:
         v = _Exprs.build(ident(source), self.tokens).v
         row = self.con.sql(

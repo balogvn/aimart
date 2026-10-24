@@ -113,10 +113,8 @@ def unwrap(
     return src, filename
 
 
-def _sql_type(col: ExpectedColumn) -> str:
-    """The DuckDB type for an expected_schema column; an impossible decimal is the caller's error."""
-    if col.type != "decimal":
-        return SQL_TYPES[col.type]
+def _decimal(col: ExpectedColumn) -> tuple[int, int]:
+    """(precision, scale) of an expected_schema decimal; an impossible one is the caller's error."""
     # Explicit None checks: scale 0 is a real request. `col.scale or 2` made DECIMAL(10, 0) a
     # DECIMAL(10, 2), so 1234567890 overflowed to NULL and strict failed on matching data.
     precision = 18 if col.precision is None else col.precision
@@ -130,7 +128,25 @@ def _sql_type(col: ExpectedColumn) -> str:
             "(scale 0 for whole numbers).",
             column=col.name,
         )
+    return precision, scale
+
+
+def _sql_type(col: ExpectedColumn) -> str:
+    """The DuckDB type for an expected_schema column."""
+    if col.type != "decimal":
+        return SQL_TYPES[col.type]
+    precision, scale = _decimal(col)
     return f"DECIMAL({precision}, {scale})"
+
+
+def _unrounded(x: str, target: str) -> str:
+    """A number cast to a decimal target, or NULL (a counted reject) where the cast rounds it.
+
+    DuckDB rounds to the scale without a word: DECIMAL(10, 0) of 12.5 is 13. With scale 0
+    honoured, strict passed and charged for 13. (Text is judged in TypeInferrer.cast_text.)
+    """
+    cast = f"TRY_CAST({x} AS {target})"
+    return f"(CASE WHEN {cast} = {x} THEN {cast} END)"
 
 
 def _check_expected_schema(options: ConvertOptions) -> None:
@@ -145,11 +161,13 @@ def _expected_expr(inferrer: TypeInferrer, out: _Output, col: ExpectedColumn) ->
         return out.plan.expr
     if out.plan.type_name == "string" and out.raw is not None:
         return inferrer.cast_text(out.raw.source, col.type, target)
+    x = f"({out.plan.expr})"
     if col.type == "int64" and out.plan.type_name in {"float64", "decimal", "native"}:
         # DuckDB rounds 12.5 to 12 on cast; a fractional value must be a counted reject instead.
-        x = f"({out.plan.expr})"
         return f"(CASE WHEN TRY_CAST({x} AS DOUBLE) = floor(TRY_CAST({x} AS DOUBLE)) THEN TRY_CAST({x} AS BIGINT) END)"
-    return f"TRY_CAST(({out.plan.expr}) AS {target})"
+    if col.type == "decimal" and inferrer.is_number(out.plan.expr):
+        return _unrounded(x, target)
+    return f"TRY_CAST({x} AS {target})"
 
 
 def _cast_rejects(con: duckdb.DuckDBPyConnection, table: str, before: str, after: str) -> list[str]:
@@ -183,10 +201,15 @@ def _apply_expected_schema(
             result.append(_Output(col.name, None, plan, ["added as all-null: missing from input"]))
             continue
         typed = out.plan.type_name != "string"
-        if col.type == "string" and typed and out.raw is not None and out.raw.text:
+        from_text = col.type == "string" or (
+            col.type == "decimal" and out.plan.type_name in {"int64", "float64"}
+        )
+        if from_text and typed and out.raw is not None and out.raw.text:
             # Declaring a text column string asks for its text. Casting the inferred value back
             # rewrote it ('1.50' -> '1.5', '15/01/2025' -> '2025-01-15', '1.234' -> '1234') and
             # lost what the 98% tolerance had nulled ('oops' -> null, charged under strict).
+            # A decimal is read from the text too: through the inferred DOUBLE,
+            # '1234567890123456.78' became 1234567890123456.80.
             out = _Output(out.name, out.raw, inferrer.text_plan(out.raw.source), [])
         expr = _expected_expr(inferrer, out, col)
         row = con.sql(
