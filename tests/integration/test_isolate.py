@@ -161,7 +161,7 @@ def test_memory_cap_is_on_by_default_at_the_settings_default(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     default = Settings(_env_file=None).job_memory_limit_mb
-    assert default == isolate.DEFAULT_MEMORY_LIMIT_MB == 700
+    assert default == 700
     checked: list[int] = []
 
     def at_the_limit(pid: int) -> int:
@@ -184,6 +184,35 @@ def test_memory_cap_is_on_by_default_at_the_settings_default(
     assert time.monotonic() - started < 10
     with pytest.raises(ProcessLookupError):
         os.kill(int(pid_file.read_text()), 0)  # killed and reaped, not left allocating
+
+
+def test_memory_cap_follows_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Round-2 review: Service does not pass the setting, so every job was capped at the 700 MB
+    # field default and AIMART_JOB_MEMORY_LIMIT_MB (including 0 to disable) did nothing. With
+    # no explicit cap, run_isolated now reads the settings the server runs with.
+    from aimart_parquet.config import get_settings
+
+    reads: list[int] = []
+
+    def rss(pid: int) -> int:
+        reads.append(pid)
+        return 124 * _MB
+
+    monkeypatch.setattr(isolate, "_read_rss", rss)
+    monkeypatch.setenv("AIMART_JOB_MEMORY_LIMIT_MB", "123")
+    get_settings.cache_clear()
+    with pytest.raises(errors.InputTooLarge, match=r"memory budget \(123 MB\)"):
+        run_isolated(helpers.record_pid_then_sleep, os.devnull, 5, timeout_s=30)
+    monkeypatch.setenv("AIMART_JOB_MEMORY_LIMIT_MB", "0")
+    get_settings.cache_clear()
+    reads.clear()
+    assert run_isolated(helpers.record_pid_then_sleep, os.devnull, 0.3, timeout_s=30) == "woke up"
+    assert reads == []
+    # An explicit cap still wins over the environment.
+    with pytest.raises(errors.InputTooLarge, match=r"memory budget \(100 MB\)"):
+        run_isolated(
+            helpers.record_pid_then_sleep, os.devnull, 5, timeout_s=30, memory_limit_mb=100
+        )
 
 
 def test_memory_cap_zero_disables_it(monkeypatch: pytest.MonkeyPatch) -> None:

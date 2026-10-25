@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from aimart_parquet import errors
-from aimart_parquet.config import Settings
+from aimart_parquet.config import get_settings
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -73,7 +73,6 @@ if _METHOD == "forkserver":
 # The parent checks the child's memory this often. A job allocating as fast as it can gains
 # a few hundred MB between checks; the default limit leaves that much headroom on 2 GiB.
 _POLL_S = 0.1
-DEFAULT_MEMORY_LIMIT_MB: int = Settings.model_fields["job_memory_limit_mb"].default
 _PROC = Path("/proc")
 _LIBPROC = "/usr/lib/libproc.dylib"
 _PROC_PIDTASKINFO = 4  # proc_pidinfo flavor returning struct proc_taskinfo
@@ -198,14 +197,19 @@ def run_isolated[T](
     fn: Callable[..., T],
     *args: Any,
     timeout_s: float,
-    memory_limit_mb: int = DEFAULT_MEMORY_LIMIT_MB,
+    memory_limit_mb: int | None = None,
     **kwargs: Any,
 ) -> T:
     """Run ``fn(*args, **kwargs)`` in a child process. Blocking; call from a worker thread.
 
     The child is killed at ``timeout_s`` (``Timeout``) or once its resident memory exceeds
-    ``memory_limit_mb`` (``InputTooLarge``; 0 disables the cap).
+    ``memory_limit_mb`` (``InputTooLarge``; 0 disables the cap). None means the configured
+    ``job_memory_limit_mb`` of ``get_settings()``, the settings the server runs with: callers
+    that pass nothing (``Service`` among them) were held at the field's 700 MB default, and
+    ``AIMART_JOB_MEMORY_LIMIT_MB`` did nothing.
     """
+    if memory_limit_mb is None:
+        memory_limit_mb = get_settings().job_memory_limit_mb
     receiver, sender = _CTX.Pipe(duplex=False)
     proc = _CTX.Process(target=_child, args=(sender, fn, args, kwargs), daemon=True)
     proc.start()
