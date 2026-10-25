@@ -60,7 +60,14 @@ def own_rss() -> int | None:
     return _read_rss(os.getpid())
 
 
-def allocate(total_mb: int, step_mb: int = 20) -> int:
+def allocate(total_mb: int, step_mb: int = 20, hold_s: float = 0.0) -> int:
     # Random bytes, so no page is shared, deduplicated or compressed away by the OS.
     blocks = [os.urandom(step_mb * 1024 * 1024) for _ in range(total_mb // step_mb)]
+    # Then keep reading every page for hold_s: on a busy macOS host the pages of a job that
+    # allocated and returned were paged out before the parent's poll saw them resident, and
+    # the cap test failed with "DID NOT RAISE" under parallel load.
+    until = time.monotonic() + hold_s
+    while time.monotonic() < until:
+        for block in blocks:
+            _ = block[::4096]  # one byte a page brings the page back in
     return len(blocks)

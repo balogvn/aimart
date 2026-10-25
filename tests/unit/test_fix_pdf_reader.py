@@ -527,6 +527,111 @@ def test_p4_page_limit_still_applies_after_clamping() -> None:
         parse_pages("1-99999999999", 400)
 
 
+# ---------------------------------------------------------------- RV5: table-search cost
+
+
+def _ruled_grid(path: Path, lines: int) -> Path:
+    # `lines` long ruled lines each way, 4 pt apart (more than pdfplumber's 3 pt snap).
+    ops = [b"BT /F1 10 Tf 20 770 Td (x) Tj ET", b"0.1 w"]
+    for i in range(lines):
+        at = 20 + 4 * i
+        ops.append(b"20 %d m %d %d l S" % (at, 20 + 4 * lines, at))
+        ops.append(b"%d 20 m %d %d l S" % (at, at, 20 + 4 * lines))
+    path.write_bytes(_raw_pdf(_PAGE % b"5 0 R", content=b"\n".join(ops)))
+    return path
+
+
+def test_rv5_ruled_grid_is_refused_before_the_cell_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Round-2 review: 140 ruled lines each way in a 2 KB page took 5.6 s in pdfplumber's cell
+    # search (for each crossing it scans every later one), growing as lines**4 toward the
+    # convert deadline with memory flat, far inside the object budget. 120 x 120 lines are
+    # 14,400 crossings: refused, unpaid, before that search runs.
+    from pdfplumber import table as plumber_table
+
+    def cell_search(_: object) -> None:
+        raise AssertionError("the cell search ran")
+
+    src = _ruled_grid(tmp_path / "grid.pdf", 120)
+    assert src.stat().st_size < 3_000
+    monkeypatch.setattr(plumber_table, "intersections_to_cells", cell_search)
+    with pytest.raises(InputTooLarge, match="page 1 rules a grid of 14,400 line crossings") as info:
+        _convert(src, tmp_path)
+    assert info.value.http_status == 413
+    assert "pdf_pages to skip page 1" in (info.value.hint or "")
+
+
+def test_rv5_edge_pairs_are_refused_before_the_pair_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The pair loop before it is h x v steps whether or not the edges cross.
+    monkeypatch.setattr(pdf_reader, "MAX_GRID_PAIRS", 30 * 30 - 1)
+    with pytest.raises(InputTooLarge, match=r"page 1 has more ruling edges .*\(900 edge pairs"):
+        _convert(_ruled_grid(tmp_path / "grid.pdf", 30), tmp_path)
+
+
+def test_rv5_document_budget_sums_the_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Pages each under the page limit cannot add up to the deadline either.
+    pdf = FPDF()
+    for _ in range(3):
+        pdf.add_page()
+        _bordered_rows(pdf, _ROWS)
+    src = tmp_path / "three.pdf"
+    pdf.output(str(src))
+    found: list[int] = []
+    charge = pdf_reader._Budget.crossings
+
+    def spy(budget: pdf_reader._Budget, crossings: int) -> None:
+        found.append(crossings)
+        charge(budget, crossings)
+
+    monkeypatch.setattr(pdf_reader._Budget, "crossings", spy)
+    report, _ = _convert(src, tmp_path)
+    assert report.rows == 36  # one table, its header repeated on each page
+    assert len(found) == 3  # one ruled search a page; no text search once a ruled table is found
+    monkeypatch.setattr(pdf_reader, "MAX_DOC_GRID_WORK", found[0] ** 2 + found[1] ** 2)
+    with pytest.raises(InputTooLarge, match=r"more table grid .*stopped on page 3"):
+        _convert(src, tmp_path)
+
+
+def test_rv5_dense_real_tables_stay_under_the_limits(tmp_path: Path) -> None:
+    # The other direction: an 80 x 20 table, ruled (1,701 crossings) and borderless (3,360 in
+    # its text-alignment search), converts as before.
+    rows = [[f"c{c}" for c in range(20)]]
+    rows += [[f"r{r}"] + [str(r * c) for c in range(1, 20)] for r in range(79)]
+    for bordered in (True, False):
+        pdf = FPDF(format=(20 * 14 + 20, 80 * 4 + 20))
+        pdf.set_auto_page_break(auto=False)
+        pdf.add_page()
+        pdf.set_font("Helvetica", size=6)
+        for j, row in enumerate(rows):
+            for k, cell in enumerate(row):
+                pdf.set_xy(10 + k * 14, 10 + j * 4)
+                pdf.cell(14 if bordered else 13, 4, cell, border=int(bordered))
+        src = tmp_path / f"dense_{bordered}.pdf"
+        pdf.output(str(src))
+        report, out = _convert(src, tmp_path)
+        assert (report.rows, len(report.columns)) == (79, 20)
+        assert out[-1]["c19"] == 78 * 19
+
+
+def test_rv5_search_hook_is_idempotent_and_inert_outside_read_pdf() -> None:
+    from pdfplumber import table as plumber_table
+
+    before = plumber_table.edges_to_intersections
+    pdf_reader._bound_table_search()
+    assert plumber_table.edges_to_intersections is before
+    edges = [
+        {"orientation": "h", "x0": 0, "x1": 10, "top": 5, "bottom": 5},
+        {"orientation": "v", "x0": 5, "x1": 5, "top": 0, "bottom": 10},
+    ]
+    assert pdf_reader._SEARCHING.get() is None
+    assert list(plumber_table.edges_to_intersections(edges)) == [(5, 5)]
+
+
 # ---------------------------------------------------------------- P5: reference cycles
 
 

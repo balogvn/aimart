@@ -27,8 +27,9 @@ Hostile PDFs are bounded before they cost memory or time: every glyph, shape and
 the interpreter draws counts against a page and a document budget (pdfplumber builds a ~2 KB
 Python object per glyph, so 1M glyphs in a 1.6 KB file took a worker to 2 GB); pages are built
 one at a time, only those read, and released once their tables are read; the page count is
-capped at ``MAX_DOCUMENT_PAGES``; and indirect-reference chains are cut at ``MAX_REF_HOPS``,
-because pdfminer follows them with no cycle check.
+capped at ``MAX_DOCUMENT_PAGES``; indirect-reference chains are cut at ``MAX_REF_HOPS``,
+because pdfminer follows them with no cycle check; and the table search, whose time grows with
+the square of the line crossings on a page, is charged to the same budget before it runs.
 
 Scanned PDFs (pages that are only images) have no text to read and are rejected with a clear
 error rather than an empty table. Cells keep text only; types come from the shared type ladder.
@@ -39,6 +40,7 @@ from __future__ import annotations
 import re
 import sys
 from bisect import bisect_right
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from itertools import pairwise
 from typing import TYPE_CHECKING, Any, NoReturn
@@ -52,6 +54,7 @@ from pdfminer.pdfpage import PDFPage
 from pdfminer.pdfparser import PDFSyntaxError
 from pdfminer.pdftypes import PDFObjRef, resolve1
 from pdfplumber import pdf as plumber_pdf
+from pdfplumber import table as plumber_table
 from pdfplumber.page import Page, PDFPageAggregatorWithMarkedContent
 from pdfplumber.table import Table, TableSettings
 from pdfplumber.utils.exceptions import PdfminerException
@@ -84,6 +87,17 @@ MAX_DOCUMENT_PAGES = 100_000
 # parse time near 30 s, inside the convert deadline. Module constants so tests can lower them.
 MAX_PAGE_OBJECTS = 100_000
 MAX_DOC_OBJECTS = 2_000_000
+# pdfplumber's table search (ruling lines and text alignment alike) pairs every horizontal edge
+# with every vertical one (~70 ns a pair), then scans, for each crossing it found, every later
+# crossing (~15-20 ns each, so N crossings cost about N**2). 140 ruled lines each way in a 2 KB
+# page took 5.6 s, and the time grows as the fourth power of the lines, toward the deadline,
+# with memory flat and a few hundred shapes, far inside the object budget. Measured on real
+# layouts: a ruled 120 x 30 table has 3,751 crossings and its text-alignment search 7,440
+# (0.9 s); 12k crossings bound one search near 2.5 s, 10M pairs near 0.7 s. The document budget
+# is on the sum of crossings squared, ~40 s; 300 pages of 60 x 12 borderless tables use 0.7e9.
+MAX_GRID_PAIRS = 10_000_000
+MAX_GRID_CROSSINGS = 12_000
+MAX_DOC_GRID_WORK = 2_000_000_000
 # A real PDF never chains references more than a hop or two; 32 is generous and still instant.
 MAX_REF_HOPS = 32
 # Parts one nested object may unfold to when pdfminer resolves it whole (a font's /W widths or
@@ -202,6 +216,7 @@ class _Budget:
         self.page = 0
         self.on_page = 0
         self.total = 0
+        self.grid = 0
 
     def start(self, page: int) -> None:
         self.page = page
@@ -224,6 +239,67 @@ class _Budget:
                 hint="Pass pdf_pages to read fewer pages per call, e.g. '1-50'.",
                 limit=MAX_DOC_OBJECTS,
             )
+
+    def search(self, pairs: int) -> None:
+        """Before one table search pairs ``pairs`` horizontal and vertical edges."""
+        if pairs > MAX_GRID_PAIRS:
+            raise InputTooLarge(
+                f"PDF page {self.page} has more ruling edges than this service can search for "
+                f"tables ({pairs:,} edge pairs; the limit is {MAX_GRID_PAIRS:,}).",
+                hint=f"Pass pdf_pages to skip page {self.page}, or export the table as CSV/Excel.",
+                limit=MAX_GRID_PAIRS,
+            )
+
+    def crossings(self, found: int) -> None:
+        """Before the cell search scans ``found`` crossings, about ``found**2`` steps."""
+        if found > MAX_GRID_CROSSINGS:
+            raise InputTooLarge(
+                f"PDF page {self.page} rules a grid of {found:,} line crossings; the limit is "
+                f"{MAX_GRID_CROSSINGS:,}, and searching it for tables would take minutes.",
+                hint=f"Pass pdf_pages to skip page {self.page}, or export the table as CSV/Excel.",
+                limit=MAX_GRID_CROSSINGS,
+            )
+        self.grid += found * found
+        if self.grid > MAX_DOC_GRID_WORK:
+            raise InputTooLarge(
+                "The pages read hold more table grid than one call can search "
+                f"(stopped on page {self.page}).",
+                hint="Pass pdf_pages to read fewer pages per call, e.g. '1-50'.",
+                limit=MAX_DOC_GRID_WORK,
+            )
+
+
+# The budget of the PDF being read in this thread (or job), for the table-search hook below.
+_SEARCHING: ContextVar[_Budget | None] = ContextVar("aimart_pdf_budget", default=None)
+
+
+def _bound_table_search() -> None:
+    """Charge pdfplumber's table search to the ``_Budget`` of the PDF being read.
+
+    ``TableFinder`` looks ``edges_to_intersections`` up in its module on every search, so
+    wrapping that one function sees the edges before the pair loop and the crossings before
+    the cell search, for ruling lines and text alignment alike, at no extra cost. Outside
+    ``read_pdf`` (no budget set) it is pdfplumber's own. Applied at import, idempotently.
+    """
+    original = plumber_table.edges_to_intersections
+    if getattr(original, _BOUNDED_MARK, False):
+        return
+
+    def edges_to_intersections(edges: Any, x_tolerance: Any = 1, y_tolerance: Any = 1) -> Any:
+        budget = _SEARCHING.get()
+        if budget is not None:
+            vertical = sum(1 for edge in edges if edge["orientation"] == "v")
+            budget.search((len(edges) - vertical) * vertical)
+        found = original(edges, x_tolerance, y_tolerance)
+        if budget is not None:
+            budget.crossings(len(found))
+        return found
+
+    setattr(edges_to_intersections, _BOUNDED_MARK, True)
+    setattr(plumber_table, "edges_to_intersections", edges_to_intersections)  # noqa: B010
+
+
+_bound_table_search()
 
 
 class _CountingAggregator(PDFPageAggregatorWithMarkedContent):
@@ -607,6 +683,15 @@ def _scan(doc: PDF, pages: list[int]) -> _Scan:
     if not pages:  # a document without pages
         return scan
     budget = _Budget()
+    searching = _SEARCHING.set(budget)
+    try:
+        _scan_pages(doc, pages, budget, scan)
+    finally:
+        _SEARCHING.reset(searching)
+    return scan
+
+
+def _scan_pages(doc: PDF, pages: list[int], budget: _Budget, scan: _Scan) -> None:
     wanted = set(pages)
     bordered_table = False
     for number, page_obj in enumerate(PDFPage.create_pages(doc.doc), 1):
@@ -629,7 +714,6 @@ def _scan(doc: PDF, pages: list[int]) -> _Scan:
                 scan.aligned.extend(_aligned_tables(page, number))
         finally:
             page.close()  # release its glyph objects before the next page is parsed
-    return scan
 
 
 def _continues(table: _Table, rows: list[list[str]]) -> bool:

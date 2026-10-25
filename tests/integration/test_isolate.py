@@ -127,8 +127,8 @@ def test_memory_cap_kills_a_job_that_keeps_allocating() -> None:
     cap = _baseline_mb() + 150
     started = time.monotonic()
     with pytest.raises(errors.InputTooLarge, match=r"memory budget \(\d+ MB\)") as info:
-        run_isolated(helpers.allocate, cap + 600, timeout_s=60, memory_limit_mb=cap)
-    assert time.monotonic() - started < 30
+        run_isolated(helpers.allocate, cap + 600, 20, 40, timeout_s=60, memory_limit_mb=cap)
+    assert time.monotonic() - started < 40  # killed while it holds the memory, not at the end
     assert info.value.http_status == 413
     assert "not charged" in (info.value.hint or "")
     assert info.value.details == {"limit_bytes": cap * _MB}
