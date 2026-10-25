@@ -233,3 +233,20 @@ async def test_gcs_query_joining_artifacts_bigger_than_the_cache_together(
     )
     assert result.rows == [[4000]]
     assert sum(on_disk(store).values()) <= settings.artifact_max_total_bytes
+
+
+def test_a_failed_trim_after_a_call_never_fails_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The trim runs as the call's job ends, after its result exists: a disk error is logged.
+    store = store_at(tmp_path / "store", max_total_bytes=10**6)
+    art = store.put(src_file(tmp_path, "a"), "a.parquet")
+
+    def broken(**_: object) -> None:
+        raise OSError("disk hiccup")
+
+    monkeypatch.setattr(store, "enforce_capacity", broken)
+    with store.hold():
+        store.get(art.id)
+    assert store._pins == {}
+    assert any("capacity enforcement failed" in r.message for r in caplog.records)
