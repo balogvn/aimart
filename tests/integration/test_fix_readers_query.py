@@ -2,6 +2,7 @@
 
 A bare 500 carries no ``error.code`` or hint, so the calling agent cannot tell a bad input from
 an outage. Every caller-triggerable failure must be an ``AimartError`` (>= 400, not charged).
+Also: inputs are scanned by DuckDB's own Parquet reader, in-process and in the isolated worker.
 """
 
 from __future__ import annotations
@@ -202,3 +203,43 @@ async def test_query_on_text_that_is_not_utf8_is_a_typed_422(
     assert "UTF-8" in error["hint"]
     assert good.status_code == 200, good.text
     assert good.json()["rows"] == [[1], [2]]
+
+
+def _dictionary_bomb_bytes(rows: int = 20_000, width: int = 65_536) -> bytes:
+    """Under a kilobyte on disk; ``rows * width`` bytes of text once decoded as plain values."""
+    values = pa.DictionaryArray.from_arrays(
+        pa.array([0] * rows, pa.int32()), pa.array(["x" * width])
+    )
+    buf = io.BytesIO()
+    pq.write_table(pa.table({"s": values}), buf, store_schema=False, compression="zstd")
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("isolate", [False, True], ids=["in-process", "isolated"])
+async def test_query_reads_an_input_with_duckdbs_own_reader(
+    make_settings: Callable[..., Settings], isolate: bool
+) -> None:
+    # The Arrow dataset scan decoded the whole row group as plain strings, outside
+    # memory_limit: 3.3 GB for this count. Now a view over a link in the query's own directory,
+    # from the worker too; nothing of it is left behind, and the SQL cannot read anything else.
+    bomb = _dictionary_bomb_bytes()
+    assert len(bomb) < 1024
+    async with kit.running_app(make_settings(isolate_jobs=isolate), paid=False) as app:
+        body = {"content_base64": kit.b64(bomb), "filename": "t.parquet"}
+        counted = await app.http.post(
+            "/v1/query",
+            json={**body, "sql": "SELECT count(*) AS n, max(length(s)) AS w FROM data"},
+        )
+        views = await app.http.post(
+            "/v1/query",
+            json={**body, "sql": "SELECT view_name FROM duckdb_views() WHERE NOT internal"},
+        )
+        outside = await app.http.post(
+            "/v1/query",
+            json={**body, "sql": "SELECT * FROM read_text('/etc/hosts')"},
+        )
+    assert counted.status_code == 200, counted.text
+    assert counted.json()["rows"] == [[20_000, 65_536]]
+    assert views.json()["rows"] == [["data"]]
+    error = _assert_typed_error(outside, 422, "query_failed")
+    assert "Permission Error" in error["message"]
