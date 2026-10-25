@@ -463,6 +463,25 @@ class TestQueryInputsAreReadByDuckDB:
         ]
         assert scans == [False, False]
 
+    def test_a_column_chunk_too_big_to_read_whole_keeps_the_arrow_scan(
+        self, tmp_path, scans, monkeypatch
+    ) -> None:
+        # DuckDB's reader allocates a column chunk whole: 95 MB of images under memory_limit=256MB
+        # failed with 'Out of Memory Error: failed to allocate data of size 128.0 MiB'.
+        path = tmp_path / "t.parquet"
+        pq.write_table(
+            pa.table({"id": range(40), "img": [bytes([i]) * 4000 for i in range(40)]}),
+            path,
+            row_group_size=20,
+            compression="none",
+        )
+        monkeypatch.setattr(tabular, "_MAX_NATIVE_CHUNK", 60_000)  # one chunk is 80 KB
+        result = run({"data": path}, "SELECT id, octet_length(img) AS n FROM data WHERE id > 37")
+        assert result.rows == [[38, 4000], [39, 4000]]
+        monkeypatch.setattr(tabular, "_MAX_NATIVE_CHUNK", 100_000)
+        assert run({"data": path}, "SELECT count(*) FROM data").rows == [[40]]
+        assert scans == [True]  # only the second query tried DuckDB's reader
+
     def test_sql_reads_only_the_query_s_own_links(self, tmp_path, joined, monkeypatch) -> None:
         made: list[Path] = []
         real = tabular.tempfile.mkdtemp

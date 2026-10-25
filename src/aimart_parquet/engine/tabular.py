@@ -1,7 +1,8 @@
 """Read rows back out of Parquet for an LLM: previews and sandboxed read-only SQL.
 
 The SQL path runs caller-written queries, so it gets the strictest connection in the codebase:
-no filesystem access at all (data arrives only as registered Arrow datasets), exactly one
+no file access but the query's own throwaway directory (its spill files, and links to its
+inputs, which DuckDB scans with its own Parquet reader; see ``_native_view``), exactly one
 statement which must be a SELECT, a row cap, and a watchdog that interrupts DuckDB at the
 deadline. Results are rendered compactly — JSON rows, a Markdown table, or CSV — with long
 cells truncated, because every byte returned is a token the agent pays to read.
@@ -11,10 +12,12 @@ hands back, the Python rows ``render`` builds, or a preview's Parquet decode. So
 decode in bounded batches, cut long text (top-level or nested in lists, structs, maps and
 unions) before it is kept, inside DuckDB for queries, and refuse a result over
 ``MAX_RESULT_BYTES`` with a typed error instead of growing until the process dies. Preview reads
-dictionary-encoded text as dictionaries, so a value that every row points at is decoded once.
-Still unbounded here: DuckDB's Arrow scan of a query's input (a dictionary-bomb Parquet file
-is decoded a whole row group at a time once registered), and single pages that inflate to
-gigabytes; only the job's memory cap in the isolated worker stops those.
+dictionary-encoded text as dictionaries, and DuckDB's reader keeps them, so a value that every
+row points at is decoded once. Still unbounded here: an input whose types DuckDB's reader would
+change (INT96 timestamps, durations, UUID, INTERVAL), which keeps the Arrow scan that decodes a
+whole row group at a time; single pages that inflate to gigabytes; and values a query builds
+itself (``repeat()``, BLOB slices, which DuckDB copies whole first). Only the job's memory cap
+in the isolated worker stops those.
 """
 
 from __future__ import annotations
@@ -86,6 +89,11 @@ _QUERY_BATCH_ROWS = 256
 # 6 MB file of 5M distinct strings; DuckDB's reader keeps dictionaries and reads 2048 rows at a
 # time (25 MB and 31 MB). An input on another filesystem is copied, if it is not bigger than this.
 _MAX_INPUT_COPY = 256 * 1024 * 1024
+# DuckDB's reader reads a column chunk's compressed bytes whole, into one buffer rounded up to a
+# power of two: a 95 MB chunk of 2 MB images could not be read under memory_limit=256MB, which the
+# Arrow scan streams page by page. Files with a bigger chunk keep the Arrow scan; hosted inputs
+# (at most 50 MB) never have one.
+_MAX_NATIVE_CHUNK = 64 * 1024 * 1024
 _TYPE_PROBE = "aimart-type-probe"  # never a table name (TABLE_NAME_PATTERN has no "-")
 _NESTED = frozenset({"list", "array", "map", "struct"})
 _EXACT_CASTS = frozenset(
@@ -590,14 +598,15 @@ def _register(con: duckdb.DuckDBPyConnection, name: str, path: Path, local: Path
     """
     try:
         # Extensions off: the types the Arrow scan below sees (UUID and JSON as bytes and text).
-        schema = pq.read_schema(path, arrow_extensions_enabled=False)
+        with pq.ParquetFile(path, arrow_extensions_enabled=False) as pf:
+            schema, meta = pf.schema_arrow, pf.metadata
     except (pa.ArrowException, OSError) as exc:  # its message names the server path
         raise InvalidInput(
             f"Table {name!r} is not a readable Parquet file.",
             hint="Convert it first (/v1/convert or the convert tool) and pass the "
             "returned artifact_id.",
         ) from exc
-    view = _native_view(con, path, schema, local)
+    view = None if _has_big_chunk(path, meta) else _native_view(con, path, schema, local)
     if view is not None:
         con.execute(f"CREATE VIEW {ident(name)} AS {view}")
         return
@@ -704,6 +713,16 @@ def _widens(have: DuckDBPyType, want: DuckDBPyType) -> bool:
     if have.id == "array" and have.children[1] != want.children[1]:
         return False  # (size, n)
     return all(a == b and _widens(x, y) for (a, x), (b, y) in zip(ours, theirs, strict=True))
+
+
+def _has_big_chunk(path: Path, meta: pq.FileMetaData) -> bool:
+    if path.stat().st_size <= _MAX_NATIVE_CHUNK:  # no chunk is bigger than its file
+        return False
+    return any(
+        meta.row_group(g).column(c).total_compressed_size > _MAX_NATIVE_CHUNK
+        for g in range(meta.num_row_groups)
+        for c in range(meta.num_columns)
+    )
 
 
 def _link(path: Path, local: Path) -> bool:
