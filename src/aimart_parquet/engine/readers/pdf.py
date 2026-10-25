@@ -11,12 +11,15 @@ exact and cheap. Strategy:
    costs ~3x a page's ruling-line pass, and running it on every such page took a 300-page
    report from 30 s to 76 s, toward the deadline. The report names those pages instead, so the
    caller can point ``pdf_pages`` at them.
-3. The header is the widest row above the first data row: a title line above a table (or a
-   merged title cell) is dropped and reported, not used as column names; a section row ('North'
-   alone) between the header and the data stays a data row.
+3. The header is the row above the first data row naming the most typed columns, the topmost
+   of equals: a title line above a table (a merged title cell, or a long line that text
+   alignment cut into one piece per column) is dropped and reported, not used as column names;
+   a section row ('North' alone) or a first row holding a value ('Total', 'TBD', '9999.00')
+   stays a data row.
 4. A table that continues across pages is merged in page order: by its repeated header (the
    repeats dropped), or, with no repeated header, when the next page's table has the same width
-   and starts with a row typed like the body (numbers where the body has numbers).
+   and starts with a row typed like the body (numbers where the body has numbers), down to a
+   single row spilled onto the next page.
 5. The largest table wins unless the caller picks one (``pdf_table``); every table found is
    listed in the report, so nothing is chosen silently.
 
@@ -34,8 +37,9 @@ error rather than an empty table. Cells keep text only; types come from the shar
 from __future__ import annotations
 
 import re
-from collections import Counter
+from bisect import bisect_right
 from dataclasses import dataclass, field
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any, NoReturn
 
 import pdfplumber
@@ -46,6 +50,7 @@ from pdfminer.pdfpage import PDFPage
 from pdfminer.pdfparser import PDFSyntaxError
 from pdfminer.pdftypes import PDFObjRef
 from pdfplumber.page import Page, PDFPageAggregatorWithMarkedContent
+from pdfplumber.table import Table, TableSettings
 from pdfplumber.utils.exceptions import PdfminerException
 
 from aimart_parquet.engine.duck import ident
@@ -56,6 +61,7 @@ from aimart_parquet.engine.readers.delimited import _cell_kind
 from aimart_parquet.errors import AimartError, InputTooLarge, InvalidInput, InvalidRequest
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     import duckdb
@@ -255,9 +261,12 @@ def parse_pages(spec: str | None, total: int) -> list[int]:
     return sorted(pages)
 
 
+def _cells(raw: list[list[Any]]) -> list[list[str]]:
+    return [[" ".join(str(c).split()) if c is not None else "" for c in row] for row in raw]
+
+
 def _clean(raw: list[list[Any]]) -> list[list[str]]:
-    rows = [[" ".join(str(c).split()) if c is not None else "" for c in row] for row in raw]
-    return [r for r in rows if any(r)]
+    return [r for r in _cells(raw) if any(r)]
 
 
 def _usable(rows: list[list[str]]) -> bool:
@@ -303,10 +312,6 @@ def _values(rows: list[list[str]], col: int) -> list[str]:
     return [v for r in rows if _kind(v := _cell(r, col)) not in {"empty", "missing"}]
 
 
-def _filled(row: list[str]) -> int:
-    return sum(1 for c in row if c)
-
-
 def _year_names(row: list[str], typed: list[int], body: list[list[str]]) -> bool:
     """Years as column names ('Region', '2023', '2024'): a header the type check reads as data.
 
@@ -337,23 +342,49 @@ def _data_row(row: list[str], typed: list[int], body: list[list[str]]) -> bool:
     return not _year_names(row, typed, body)
 
 
-def _split_captions(rows: list[list[str]]) -> tuple[list[list[str]], list[str]]:
+def _names(row: list[str], typed: list[int], body: list[list[str]]) -> int:
+    """How many typed columns ``row`` names: text under them and a value under none, or years
+    when it is a header of years (``_year_names``). A row with a value is body, whatever else
+    it holds ('Total', 'TBD', '9999.00')."""
+    if _year_names(row, typed, body):
+        return sum(1 for c in typed if _cell(row, c))
+    kinds = [_kind(_cell(row, c)) for c in typed]
+    if any(k in _TYPED for k in kinds):
+        return 0
+    return sum(k not in _DATA for k in kinds)
+
+
+def _never(_: int) -> bool:
+    return False
+
+
+def _split_captions(
+    rows: list[list[str]], running: Callable[[int], bool] = _never
+) -> tuple[list[list[str]], list[str]]:
     """Drop rows above the header: titles, and merged title cells of bordered tables.
 
     Text alignment returns the whole page as one table, so a title line above a borderless
     table was rows[0] and became the column names ('quarterly_sales_by_regi', 'on', ...), with
     the real header as a data row that turned every numeric column into strings: a 200 for bad
-    data. The header is the widest row above the first data row (``_data_row``: a number, date
-    or missing-value token under a typed column and no text under any), the lowest of equals.
-    Widest, not merely the row directly above: a section row ('North', '', '') under a header
-    with a blank corner ('', 'Units', 'Revenue') became the header and the real one was dropped.
-    Typed columns are judged on the bottom half of the rows, which is body as long as there are
-    no more leading rows than data rows.
+    data. Above the first data row (``_data_row``: a number, date or missing-value token under
+    a typed column and no text under any), the header is the row naming the most typed columns
+    (``_names``), the topmost of equals; every row above it is a title and is dropped.
 
-    Rows are only dropped when every one is narrower than the body (fewer filled cells than
-    most data rows), as titles and merged cells are: a body row with text where numbers belong
-    ('pending' under an amount) must not make the real header and the rows above it vanish. In
-    every unclear case nothing is dropped and rows[0] stays the header, as before.
+    Measured on the earlier rules. The row directly above the first data row: a section row
+    ('North', '', '') under a header with a blank corner became the header. The widest row: a
+    first body row ('Total', 'TBD', '9999.00') outranked that header, which was dropped as a
+    title. Only rows narrower than the body: a long title, cut by the alignment pass into one
+    piece per column, is as wide as the body and stayed the header. So width is not the test:
+    a merged or short title names at most one typed column and a header names them all; a
+    value marks a body row; and the topmost of equals keeps 'pending' rows (text where numbers
+    belong) under their header. A title cut into text under every column ties with the header,
+    which only positions tell apart: ``running(i)`` says whether row i is one line of running
+    text (``_running_text``), which never names columns. It is asked only about rows that could
+    become the header, as reading positions costs a pass over the page's glyphs.
+
+    Typed columns are judged on the bottom half of the rows, which is body as long as there are
+    no more leading rows than data rows. With no row naming a typed column nothing is dropped
+    and rows[0] stays the header, as before. A header of two lines keeps its first line.
     """
     if len(rows) < 3:
         return rows, []
@@ -362,31 +393,94 @@ def _split_captions(rows: list[list[str]]) -> tuple[list[list[str]], list[str]]:
     if not typed:
         return rows, []
     first = next((i for i, row in enumerate(rows) if _data_row(row, typed, tail)), None)
-    if not first:  # no data row, or data from the first row on: nothing to choose
+    if first is None or first < 2:  # one row above the data at most: nothing to choose
         return rows, []
-    widest = max(_filled(r) for r in rows[:first])
-    header = max(i for i in range(first) if _filled(rows[i]) == widest)
+    names = [_names(rows[i], typed, tail) for i in range(first)]
+    ranked = sorted((i for i in range(first) if names[i]), key=lambda i: (-names[i], i))
+    header = next((i for i in ranked if not running(i)), 0)
     if header == 0:
-        return rows, []
-    body_width = Counter(_filled(r) for r in rows[header + 1 :]).most_common(1)[0][0]
-    if any(_filled(r) >= body_width for r in rows[:header]):
         return rows, []
     return rows[header:], [" ".join(c for c in r if c) for r in rows[:header]]
 
 
+def _running_text(table: Table, words: list[dict[str, Any]]) -> set[int]:
+    """Rows of a text-alignment table that are one line of running text, cut at column edges.
+
+    A title as wide as the table comes back as one piece per column ('Sales by region and
+    product l', 'ine for the fiscal year, in US d', 'ollars'), text under every column like a
+    header. Its words fall in two or more cells with no gap wider than a word space between
+    them (half the text height; Helvetica's space is 0.28 em), where a header or body row has a
+    column gap between its cells.
+    """
+    rows = [row.bbox for row in table.rows]
+    tops = [bbox[1] for bbox in rows]
+    lines: dict[int, list[dict[str, Any]]] = {}
+    for word in words:
+        mid = (word["top"] + word["bottom"]) / 2
+        i = bisect_right(tops, mid) - 1
+        if i >= 0 and mid <= rows[i][3] and word["x1"] > rows[i][0] and word["x0"] < rows[i][2]:
+            lines.setdefault(i, []).append(word)
+    running = set()
+    for i, line in lines.items():
+        line.sort(key=lambda w: w["x0"])
+        cells = [c for c in table.rows[i].cells if c is not None]
+        hit = {
+            j for w in line for j, c in enumerate(cells) if c[0] <= (w["x0"] + w["x1"]) / 2 < c[2]
+        }
+        height = max(w["bottom"] - w["top"] for w in line)
+        gaps = [b["x0"] - a["x1"] for a, b in pairwise(line)]
+        if len(hit) >= 2 and max(gaps) <= height / 2:
+            running.add(i)
+    return running
+
+
 def _ruled_tables(page: Page, number: int) -> list[_Found]:
+    """Bordered pieces two or more columns wide, 1-row ones included: those are no table, but
+    may be the last row of the previous page's table (``_merge`` decides)."""
     found = []
     for raw in page.extract_tables():
         rows, captions = _split_captions(_clean(raw))
-        if _usable(rows):
+        if rows and len(rows[0]) >= 2:
             found.append(_Found(number, rows, "ruling lines", captions))
     return found
 
 
+class _Words:
+    """A page's words, extracted on first use: only a titled borderless table needs them."""
+
+    def __init__(self, page: Page) -> None:
+        self.page = page
+        self._words: list[dict[str, Any]] | None = None
+
+    def get(self) -> list[dict[str, Any]]:
+        if self._words is None:
+            self._words = self.page.extract_words()
+        return self._words
+
+
+def _aligned_table(
+    table: Table, words: _Words, settings: TableSettings
+) -> tuple[list[list[str]], list[str]]:
+    cells = _cells(table.extract(**(settings.text_settings or {})))
+    kept = [i for i, row in enumerate(cells) if any(row)]
+    running: set[int] | None = None
+
+    def is_running(k: int) -> bool:
+        nonlocal running
+        if running is None:
+            running = _running_text(table, words.get())
+        return kept[k] in running
+
+    return _split_captions([cells[i] for i in kept], is_running)
+
+
 def _aligned_tables(page: Page, number: int) -> list[_Found]:
+    # page.extract_tables(_TEXT_STRATEGY), keeping the Table objects for their row positions.
+    settings = TableSettings.resolve(_TEXT_STRATEGY)
+    words = _Words(page)
     found = []
-    for raw in page.extract_tables(_TEXT_STRATEGY):
-        rows, captions = _split_captions(_clean(raw))
+    for table in page.find_tables(settings):
+        rows, captions = _aligned_table(table, words, settings)
         if _looks_tabular(rows):
             found.append(_Found(number, rows, "text alignment", captions))
     return found
@@ -397,7 +491,7 @@ class _Scan:
     has_text: bool = False
     ruled: list[_Found] = field(default_factory=list)
     aligned: list[_Found] = field(default_factory=list)
-    unruled: list[int] = field(default_factory=list)  # pages with text, no usable bordered table
+    text_pages: list[int] = field(default_factory=list)
 
 
 def _count_pages(doc: PDF) -> int:
@@ -424,6 +518,7 @@ def _scan(doc: PDF, pages: list[int]) -> _Scan:
         return scan
     budget = _Budget()
     wanted = set(pages)
+    bordered_table = False
     for number, page_obj in enumerate(PDFPage.create_pages(doc.doc), 1):
         if number > pages[-1]:
             break
@@ -435,12 +530,13 @@ def _scan(doc: PDF, pages: list[int]) -> _Scan:
             if not page.chars:
                 continue
             scan.has_text = True
+            scan.text_pages.append(number)
             bordered = _ruled_tables(page, number)
             scan.ruled.extend(bordered)
-            if not bordered:
-                scan.unruled.append(number)
-                if not scan.ruled:  # pointless once a bordered table exists: it wins
-                    scan.aligned.extend(_aligned_tables(page, number))
+            # Pointless once a bordered table exists: it wins.
+            bordered_table = bordered_table or any(_usable(f.rows) for f in bordered)
+            if not bordered_table:
+                scan.aligned.extend(_aligned_tables(page, number))
         finally:
             page.close()  # release its glyph objects before the next page is parsed
     return scan
@@ -489,6 +585,11 @@ def _merge(found: list[_Found]) -> list[_Table]:
             last.rows.extend(item.rows)
             last.pages.append(item.page)
             last.captions.extend(item.captions)
+        elif not _usable(item.rows):
+            # A 1-row box that continues nothing (a note, a signature block) is not a table,
+            # nor the first table on its page. Dropping such pieces before merging lost the
+            # last row of a table whenever it alone spilled onto the next page.
+            continue
         else:
             last = _Table(
                 header=header,
@@ -572,15 +673,19 @@ def read_pdf(
             "The PDF has no text layer (scanned pages are images).",
             hint="Only digital PDFs are supported; scanned documents need OCR, which this service does not do.",
         )
-    if scan.ruled and scan.unruled:
+    tables = _merge(scan.ruled)
+    if tables:
         # Text alignment also reads a table of contents or figure-heavy prose as a "table",
         # often a larger one, so a bordered table wins; say where borderless ones may be.
-        span = _span(scan.unruled)
-        warnings.append(
-            f"page(s) {span} have no ruled table; borderless tables are read only when no page "
-            f"has one, so pass pdf_pages='{span}' to read those pages"
-        )
-    tables = _merge(scan.ruled or scan.aligned)
+        covered = {page for table in tables for page in table.pages}
+        if unruled := [page for page in scan.text_pages if page not in covered]:
+            span = _span(unruled)
+            warnings.append(
+                f"page(s) {span} have no ruled table; borderless tables are read only when no "
+                f"page has one, so pass pdf_pages='{span}' to read those pages"
+            )
+    else:
+        tables = _merge(scan.aligned)
     if not tables:
         raise InvalidInput(
             "No tables were found in the PDF.",

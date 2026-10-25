@@ -391,6 +391,125 @@ def test_p2_years_are_names_only_where_the_body_is_not_years() -> None:
     assert pdf_reader._split_captions(repeated) == (repeated, [])
 
 
+def _table_pdf(path: Path, rows: list[list[str]], *, bordered: bool, title: str = "") -> Path:
+    pdf = FPDF()
+    pdf.add_page()
+    if title:
+        pdf.set_font("Helvetica", size=11)
+        if bordered:
+            pdf.cell(150, 7, title, border=1)  # one merged cell across the table
+            pdf.ln()
+        else:
+            pdf.set_xy(20, 30)
+            pdf.cell(150, 6, title)
+    (_bordered_rows if bordered else _borderless_rows)(pdf, rows)
+    pdf.output(str(path))
+    return path
+
+
+_CORNER = ["", "Units", "Revenue"]
+
+
+@pytest.mark.parametrize("bordered", [True, False], ids=["bordered", "borderless"])
+@pytest.mark.parametrize(
+    "first", [["Total", "TBD", "9999.00"], ["North", "1204*", "9999.00"]], ids=["tbd", "footnote"]
+)
+@pytest.mark.parametrize("title", ["", "Quarterly sales"], ids=["untitled", "titled"])
+def test_rv1_blank_corner_header_beats_a_wider_first_row(
+    tmp_path: Path, bordered: bool, first: list[str], title: str
+) -> None:
+    # Round-2 review: the header was the widest row above the first data row, so a first body
+    # row with text under a numeric column ('TBD', '1204*') outranked a header with a blank
+    # corner: columns total/tbd/c_9999_00, the 'Total' row gone, the header reported as a title.
+    # A row holding a value under a typed column is body; it never names the columns. Titled:
+    # the other direction, the title above that header is still dropped.
+    rows = [_CORNER, first, *_ROWS[1:]]
+    src = _table_pdf(tmp_path / "corner.pdf", rows, bordered=bordered, title=title)
+    report, out = _convert(src, tmp_path)
+    assert [c.name for c in report.columns] == ["column_1", "units", "revenue"]
+    assert report.rows == 13
+    assert out[0]["column_1"] == first[0]
+    assert out[0]["revenue"] == 9999.0
+    assert out[1]["column_1"] == "Area0"
+    dropped = [w for w in report.warnings if "above the header" in w]
+    assert dropped == ([f"dropped 1 line(s) above the header: {title!r}"] if title else [])
+
+
+@pytest.mark.parametrize("bordered", [True, False], ids=["bordered", "borderless"])
+def test_rv1_text_only_first_row_does_not_outrank_a_blank_corner_header(
+    tmp_path: Path, bordered: bool
+) -> None:
+    # The same with no value at all in the first body row: it is as wide as the body and wider
+    # than the header, and still not the header.
+    rows = [_CORNER, ["Total", "TBD", "TBD"], *_ROWS[1:]]
+    report, out = _convert(_table_pdf(tmp_path / "t.pdf", rows, bordered=bordered), tmp_path)
+    assert [c.name for c in report.columns] == ["column_1", "units", "revenue"]
+    assert report.rows == 13
+    assert out[0]["column_1"] == "Total"
+    assert not any("above the header" in w for w in report.warnings)
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        # Cut into three cells, the last one '024': a number under Revenue.
+        "Quarterly sales by region and product line for fiscal year 2024",
+        # Cut into three text cells: 'Sales by region and product l', 'ine for the ...', ...
+        "Sales by region and product line for the fiscal year, in US dollars",
+    ],
+    ids=["number-cut", "text-cut"],
+)
+def test_rv2_title_as_wide_as_a_borderless_table_is_not_the_header(
+    tmp_path: Path, title: str
+) -> None:
+    # Round-2 review: text alignment cuts a long title at the column edges, so it was as wide
+    # as the body and the caption check gave up: columns quarterly_sales_by_region_and,
+    # product_line_for_fiscal_year_2, c_024, every column string, the header a data row.
+    src = _table_pdf(tmp_path / "wide_title.pdf", _ROWS, bordered=False, title=title)
+    report, rows = _convert(src, tmp_path)
+    assert [c.name for c in report.columns] == ["region", "units", "revenue"]
+    assert [c.type for c in report.columns] == ["string", "int64", "double"]
+    assert report.rows == 12
+    assert rows[0] == {"region": "Area0", "units": 100, "revenue": 1000.5}
+    dropped = [w for w in report.warnings if "above the header" in w]
+    assert len(dropped) == 1
+    assert title[:20] in dropped[0]
+
+
+def test_rv2_title_over_a_numeric_column_is_dropped(tmp_path: Path) -> None:
+    # Aligned with the Units column, so the alignment pass reads ['', 'Sales', ''] as a row:
+    # text under one numeric column, where the header has text under both.
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", size=11)
+    pdf.set_xy(70, 30)
+    pdf.cell(40, 6, "Sales")
+    _borderless_rows(pdf, _ROWS)
+    src = tmp_path / "over_units.pdf"
+    pdf.output(str(src))
+    report, rows = _convert(src, tmp_path)
+    assert [c.name for c in report.columns] == ["region", "units", "revenue"]
+    assert report.rows == 12
+    assert rows[0] == {"region": "Area0", "units": 100, "revenue": 1000.5}
+    assert any("above the header: 'Sales'" in w for w in report.warnings)
+
+
+def test_rv2_header_choice_on_rows() -> None:
+    body = _ROWS[1:]
+    header = _ROWS[0]
+    # A row of text under every typed column, above another such row: the upper one names the
+    # columns ('pending' rows are body), unless it is running text cut by the alignment pass.
+    pending = [header, ["North", "pending", "pending"], *body]
+    assert pdf_reader._split_captions(pending) == (pending, [])
+    title = ["Sales by region and product l", "ine for the fiscal year, in US d", "ollars"]
+    titled = [title, header, *body]
+    assert pdf_reader._split_captions(titled) == (titled, [])  # no positions: unclear, kept
+    assert pdf_reader._split_captions(titled, running={0}.__contains__) == (
+        [header, *body],
+        [" ".join(title)],
+    )
+
+
 # ---------------------------------------------------------------- P4: page ranges
 
 
@@ -684,6 +803,55 @@ def test_p7_year_table_continuing_without_its_header_is_merged(tmp_path: Path) -
     assert report.rows == 12
     assert {"region": "Area7", "c_2023": 107, "c_2024": 1049.5} in rows
     assert len(report.available_sheets or []) == 1
+
+
+def _spill(path: Path, first: list[list[str]], rest: list[list[str]]) -> Path:
+    pdf = FPDF()
+    pdf.add_page()
+    _bordered_rows(pdf, first)
+    pdf.add_page()
+    _bordered_rows(pdf, rest)
+    pdf.output(str(path))
+    return path
+
+
+def test_rv3_last_row_spilling_onto_the_next_page_is_merged(tmp_path: Path) -> None:
+    # Round-2 review: a continuation of one row (the most common spill) was dropped as "not a
+    # table" before merging, so Area11 was lost, and the warning sent the caller to page 2,
+    # which alone yields nothing.
+    report, rows = _convert(_spill(tmp_path / "spill.pdf", _ROWS[:12], _ROWS[12:]), tmp_path)
+    assert report.rows == 12
+    assert rows[-1] == {"region": "Area11", "units": 111, "revenue": 1077.5}
+    assert report.available_sheets == ["table 0: pages 1-2, 12 rows x 3 columns"]
+    assert any("continues across 2 pages" in w for w in report.warnings)
+    assert not any("no ruled table" in w for w in report.warnings)
+
+
+@pytest.mark.parametrize(
+    "box",
+    [["Note", "see", "appendix"], ["Area11", "111"]],
+    ids=["text-under-numbers", "other-width"],
+)
+def test_rv3_one_row_box_that_is_not_more_body_stays_out(tmp_path: Path, box: list[str]) -> None:
+    report, rows = _convert(_spill(tmp_path / "box.pdf", _ROWS[:12], [box]), tmp_path)
+    assert report.rows == 11
+    assert report.available_sheets == ["table 0: page 1, 11 rows x 3 columns"]
+    assert all(r["region"] != box[0] for r in rows)
+    # The box is no table: page 2 is named as one without a usable ruled table, as before.
+    assert any("page(s) 2 have no ruled table" in w for w in report.warnings)
+
+
+def test_rv3_one_row_pieces_never_start_a_table(tmp_path: Path) -> None:
+    pdf = FPDF()
+    pdf.add_page()
+    _bordered_rows(pdf, [["Invoice", "1042"]])  # a 1-row box, then a borderless table
+    _borderless_rows(pdf, _ROWS, y0=60)
+    src = tmp_path / "box_then_table.pdf"
+    pdf.output(str(src))
+    report, rows = _convert(src, tmp_path)
+    assert report.rows == 12
+    assert rows[0] == {"region": "Area0", "units": 100, "revenue": 1000.5}
+    assert any("text alignment" in w for w in report.warnings)
 
 
 # ---------------------------------------------------------------- P8: encrypted PDFs
