@@ -402,3 +402,51 @@ async def test_mcp_tool_crash_after_the_output_was_stored_deletes_it(
     assert store._folders() == []
     assert store._provisional == set()
     assert fake.settled == []
+
+
+@dataclass
+class CancelledSettle(kit.FakeFacilitator):
+    """The client goes away while the facilitator settles: the gate sees a cancellation."""
+
+    async def settle(self, payload: Any, requirements: Any) -> SettleResponse:
+        self.settled.append((payload, requirements))
+        raise anyio.get_cancelled_exc_class()
+
+
+async def test_mcp_settlement_cancelled_deletes_the_withheld_output(
+    settings: Settings, tmp_path: Path
+) -> None:
+    # A cancellation is not an Exception, so the settle handler's `except Exception` missed it
+    # and the output stayed provisional (uncounted, never evicted) until its TTL, although no
+    # caller would ever receive its id.
+    from types import SimpleNamespace
+
+    from mcp_types import CallToolResult
+
+    from aimart_parquet.artifacts import LocalArtifactStore
+    from aimart_parquet.payments import Payments
+
+    fake = CancelledSettle()
+    payments = Payments(settings, [fake])
+    store = LocalArtifactStore(tmp_path / "s", ttl_s=60, max_total_bytes=10**6, secret=b"k")
+    gate = payments.mcp_extension(store=store)
+    op = payments.tool_operation("convert_to_parquet")
+    assert op is not None
+    reqs, resource = await payments.mcp_requirements(op)
+    pr = await payments.server.create_payment_required_response(reqs, resource, error="x")
+    meta = await kit.mcp_payment_meta(
+        kit.paying_client(), pr.model_dump(by_alias=True, exclude_none=True)
+    )
+    out = tmp_path / "out.parquet"
+    out.write_bytes(b"x" * 10)
+
+    async def tool(_: Any) -> CallToolResult:
+        store.put(out, "x.parquet")
+        return CallToolResult(content=[], is_error=False)
+
+    params = SimpleNamespace(name="convert_to_parquet", arguments={}, meta=meta)
+    with pytest.raises(anyio.get_cancelled_exc_class()):
+        await gate.intercept_tool_call(params, None, tool)
+    assert len(fake.settled) == 1
+    assert store._folders() == []
+    assert store._provisional == set()

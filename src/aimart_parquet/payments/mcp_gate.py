@@ -137,19 +137,22 @@ class X402McpGate(Extension):
         with outputs_of(self._store) as produced:
             try:
                 result = await call_next(ctx)
+                if not isinstance(result, CallToolResult) or result.is_error:
+                    self._withhold(produced, "tool_failed")
+                    return result  # failed work is never settled
+
+                try:
+                    settled = await server.settle_payment(payload, matched)
+                except Exception as exc:
+                    log.exception("settle raised", extra={"tool": params.name})
+                    self._withhold(produced, "settle_failed")
+                    return self._settle_failed(reqs, resource, matched.network, str(exc))
             except BaseException:
+                # A crash, or a cancellation (the client went away) in the tool or in the
+                # settlement: no result goes out, so nobody holds the output's id. A cancelled
+                # settle is no Exception and used to leave it provisional until its TTL.
                 self._withhold(produced, "tool_raised")
                 raise
-            if not isinstance(result, CallToolResult) or result.is_error:
-                self._withhold(produced, "tool_failed")
-                return result  # failed work is never settled
-
-            try:
-                settled = await server.settle_payment(payload, matched)
-            except Exception as exc:
-                log.exception("settle raised", extra={"tool": params.name})
-                self._withhold(produced, "settle_failed")
-                return self._settle_failed(reqs, resource, matched.network, str(exc))
             if not settled.success:
                 self._withhold(produced, "settle_failed")
                 return self._settle_failed(
