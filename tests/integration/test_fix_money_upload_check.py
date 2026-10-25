@@ -10,6 +10,7 @@ example input, which is a form with ``options`` only, to learn the price.
 
 from __future__ import annotations
 
+import io
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -123,7 +124,16 @@ async def test_a_valid_upload_is_quoted_paid_and_reaches_the_route_intact(
         r = await paid_app.paying.post(UPLOAD, **kwargs)
         assert r.status_code == 200, r.text
         assert r.json()["report"]["rows"] == body.count(b"\n") - 1
-    assert len(facilitator.settled) == 2
+    # Streamed in 64 KB messages (a file object), the pre-check stops at its 1 MiB with the
+    # file part unfinished: that is not a missing file, and the paid upload must go through.
+    r = await paid_app.http.post(
+        UPLOAD,
+        files={"file": ("big.csv", io.BytesIO(big), "text/csv")},
+        headers=await signature(paid_app),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["report"]["rows"] == big.count(b"\n") - 1
+    assert len(facilitator.settled) == 3
 
 
 async def test_a_form_without_a_file_is_still_a_price_probe(
