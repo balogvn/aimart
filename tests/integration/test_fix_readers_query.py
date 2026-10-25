@@ -52,6 +52,14 @@ UNREGISTRABLE = {
 }
 
 
+def _invalid_utf8_parquet_bytes() -> bytes:
+    """A string column holding bytes that are not UTF-8 (written unchecked, as some tools do)."""
+    text = pa.array([b"ok", b"\xff\xfe"], pa.binary()).view(pa.string())
+    buf = io.BytesIO()
+    pq.write_table(pa.table({"s": text, "n": [1, 2]}), buf)
+    return buf.getvalue()
+
+
 def _corrupt_parquet_bytes() -> bytes:
     """A valid footer over a data page whose header is garbage: it fails only when read."""
     data = bytearray(_parquet_bytes())
@@ -178,3 +186,19 @@ async def test_query_on_a_column_type_duckdb_cannot_read_is_a_typed_422(
         f"Table 'data' has columns of a type SQL queries cannot read: h ({shown})."
     )
     assert "Cast" in error["hint"]
+
+
+@pytest.mark.parametrize("isolate", [False, True], ids=["in-process", "isolated"])
+async def test_query_on_text_that_is_not_utf8_is_a_typed_422(
+    make_settings: Callable[..., Settings], isolate: bool
+) -> None:
+    # Arrow raised 'Invalid UTF8 sequence in input' outside the duckdb.Error handler: a 500.
+    async with kit.running_app(make_settings(isolate_jobs=isolate), paid=False) as app:
+        body = {"content_base64": kit.b64(_invalid_utf8_parquet_bytes()), "filename": "t.parquet"}
+        bad = await app.http.post("/v1/query", json={**body, "sql": "SELECT * FROM data"})
+        good = await app.http.post("/v1/query", json={**body, "sql": "SELECT n FROM data"})
+    error = _assert_typed_error(bad, 422, "query_failed")
+    assert "UTF8" in error["message"]
+    assert "UTF-8" in error["hint"]
+    assert good.status_code == 200, good.text
+    assert good.json()["rows"] == [[1], [2]]

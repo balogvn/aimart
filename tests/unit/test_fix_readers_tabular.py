@@ -444,3 +444,11 @@ class TestValuesWithoutAPythonObject:
             tabular.render(table, fmt="json", truncated=False, max_chars=99)
         assert info.value.hint is not None
         assert "CAST" in info.value.hint
+
+
+def test_preview_errors_never_name_the_server_path(tmp_path) -> None:
+    # Arrow quotes paths with ' (DuckDB with "): "Failed to open local file '/srv/...'".
+    for path in (tmp_path / "missing.parquet", tmp_path):
+        with pytest.raises(InvalidInput, match="Not a readable Parquet file") as info:
+            preview(path, columns=None, offset=0, limit=5, fmt="json", max_chars=9)
+        assert str(tmp_path) not in info.value.message

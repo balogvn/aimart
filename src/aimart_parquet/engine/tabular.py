@@ -56,7 +56,8 @@ if TYPE_CHECKING:
 OutputFormat = Literal["json", "markdown", "csv"]
 TABLE_NAME_PATTERN = r"^[a-z_][a-z0-9_]{0,62}$"
 _MAX_SAFE_INT = 2**53
-_PATH_IN_MESSAGE = re.compile(r'"/[^"]*"')
+# A quoted absolute path, as DuckDB ("...") and Arrow ('...') put them in error messages.
+_PATH_IN_MESSAGE = re.compile(r"""(["'])/[^"']*\1""")
 # A preview or query result larger than this (after long cells are cut) is refused, unpaid.
 # 1000 rows of 30 full-length text columns still fit; nothing that big is readable by an agent.
 MAX_RESULT_BYTES = 64 * 1024 * 1024
@@ -382,8 +383,9 @@ def preview(
         pf = pq.ParquetFile(path)
         names = pf.schema_arrow.names
     except (pa.ArrowException, OSError) as exc:
+        message = _PATH_IN_MESSAGE.sub('"<file>"', str(exc).splitlines()[0])
         raise InvalidInput(
-            f"Not a readable Parquet file: {exc}", hint="Convert the file first."
+            f"Not a readable Parquet file: {message}", hint="Convert the file first."
         ) from exc
     if columns:
         columns = _pick_columns(names, columns)
@@ -394,8 +396,9 @@ def preview(
         schema = pf.read_row_groups([], columns=columns).schema  # the types the file declares
         batches = _collect(rows, stop - offset, max_chars, schema)
     except (pa.ArrowException, OSError) as exc:
+        message = _PATH_IN_MESSAGE.sub('"<file>"', str(exc).splitlines()[0])
         raise InvalidInput(
-            f"The Parquet file is corrupt: {str(exc).splitlines()[0]}",
+            f"The Parquet file is corrupt: {message}",
             hint="Re-create the file, or convert the original again.",
         ) from exc
     finally:
@@ -638,6 +641,16 @@ def query(
             raise QueryFailed(
                 f"Query failed: {message}",
                 hint=f"Available tables: {', '.join(ident(t) for t in tables)}. Use DESCRIBE <table> to list columns.",
+            ) from exc
+        except pa.ArrowException as exc:
+            # Arrow refusing what DuckDB hands back, e.g. text that is not valid UTF-8 in an
+            # input's string column ('Invalid UTF8 sequence in input'): it was a bare 500.
+            message = _PATH_IN_MESSAGE.sub('"<file>"', str(exc).splitlines()[0])
+            raise QueryFailed(
+                f"Query failed: {message}",
+                hint="An input holds values that cannot be read back (such as text that is not "
+                "valid UTF-8): leave those columns out, or convert the original file again "
+                "with /v1/convert.",
             ) from exc
     finally:
         timer.cancel()
