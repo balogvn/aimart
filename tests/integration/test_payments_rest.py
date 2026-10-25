@@ -308,10 +308,12 @@ async def test_paid_call_that_times_out_is_not_settled(
 async def test_failed_upload_conversion_is_not_settled(
     paid_app: kit.AppHarness, facilitator: kit.FakeFacilitator
 ) -> None:
+    # Valid options the conversion then refuses. (Options that are not ConvertOptions JSON are
+    # now refused before the quote: tests/integration/test_fix_money_upload_check.py.)
     r = await paid_app.paying.post(
         "/v1/convert/upload",
         files={"file": ("p.csv", PRICES_CSV, "text/csv")},
-        data={"options": "{not json"},
+        data={"options": '{"sort_by": ["no_such_column"]}'},
     )
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "invalid_request"

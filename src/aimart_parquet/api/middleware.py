@@ -1,4 +1,5 @@
-"""Pure-ASGI middleware: request IDs and access logs, body-size caps, per-client rate limits.
+"""Pure-ASGI middleware: request IDs and access logs, body-size caps, per-client rate limits,
+and a look at an upload form's small fields before the payment middleware quotes it.
 
 Pure ASGI (not BaseHTTPMiddleware) so request bodies stream through untouched — the multipart
 upload route must spool to disk, not buffer 50 MB in memory.
@@ -12,9 +13,18 @@ import math
 import secrets
 import time
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+from urllib.parse import unquote_plus
+
+from python_multipart.exceptions import FormParserError
+from python_multipart.multipart import MultipartParser, QuerystringParser, parse_options_header
+from starlette.datastructures import Headers
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from starlette.responses import Response
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 log = logging.getLogger("aimart.access")
@@ -222,3 +232,202 @@ class RateLimitMiddleware:
             )
             return
         await self.app(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------------- form peek
+FORM_TYPES = ("multipart/form-data", "application/x-www-form-urlencoded")
+
+
+@dataclass
+class FormPeek:
+    """What the start of a form body says, read before any route or payment middleware."""
+
+    fields: dict[str, str] = field(default_factory=dict)  # non-file parts; the last one wins
+    files: set[str] = field(default_factory=set)  # names of finished parts with a filename
+    complete: bool = False  # the whole body was read: no other part follows
+    error: str | None = None  # not a well-formed form: the route could only answer 400
+
+
+def _decode(raw: bytes, charset: str) -> str:
+    """As Starlette decodes multipart names and values."""
+    try:
+        return raw.decode(charset)
+    except (UnicodeDecodeError, LookupError):
+        return raw.decode("latin-1")
+
+
+class _FormReader:
+    """Feeds a form body to python-multipart (Starlette's own parser) and records what it sees.
+
+    File parts are noted by name and their data skipped; field values are kept, as Starlette
+    keeps them. Only ever sees the first ``FormPeekMiddleware.peek_bytes`` of a body.
+    """
+
+    def __init__(self, content_type: str) -> None:
+        self.peek = FormPeek()
+        kind, params = parse_options_header(content_type)
+        self._charset = params.get(b"charset", b"utf-8").decode("latin-1")
+        self._header_name = b""
+        self._header_text = b""
+        self._disposition = b""
+        self._name = b""
+        self._value = bytearray()
+        self._is_file = False
+        self._parser: MultipartParser | QuerystringParser | None = None
+        if kind == b"multipart/form-data":
+            boundary = params.get(b"boundary")
+            if not boundary:
+                return  # an error once there is a body; an empty one is still a price probe
+            self._parser = MultipartParser(
+                boundary,
+                {
+                    "on_part_begin": self._part_begin,
+                    "on_header_field": self._header_field,
+                    "on_header_value": self._header_value,
+                    "on_header_end": self._header_end,
+                    "on_headers_finished": self._headers_finished,
+                    "on_part_data": self._data,
+                    "on_part_end": self._part_end,
+                },
+            )
+        else:
+            self._parser = QuerystringParser(
+                {
+                    "on_field_start": self._part_begin,
+                    "on_field_name": self._field_name,
+                    "on_field_data": self._data,
+                    "on_field_end": self._field_end,
+                }
+            )
+
+    def feed(self, chunk: bytes) -> None:
+        if not chunk or self.peek.error is not None:
+            return
+        if self._parser is None:
+            self.peek.error = "Missing boundary in multipart."
+            return
+        try:
+            self._parser.write(chunk)
+        except FormParserError as exc:
+            self.peek.error = str(exc) or "The form body is malformed."
+
+    def finish(self) -> None:
+        if self._parser is not None and self.peek.error is None:
+            try:
+                self._parser.finalize()
+            except FormParserError as exc:
+                self.peek.error = str(exc) or "The form body is malformed."
+        self.peek.complete = self.peek.error is None
+
+    # ---------------------------------------------------------------- parser callbacks
+    def _part_begin(self) -> None:
+        self._header_name = b""
+        self._header_text = b""
+        self._disposition = b""
+        self._name = b""
+        self._value = bytearray()
+        self._is_file = False
+
+    def _header_field(self, data: bytes, start: int, end: int) -> None:
+        self._header_name += data[start:end]
+
+    def _header_value(self, data: bytes, start: int, end: int) -> None:
+        self._header_text += data[start:end]
+
+    def _header_end(self) -> None:
+        if self._header_name.lower() == b"content-disposition":
+            self._disposition = self._header_text
+        self._header_name = b""
+        self._header_text = b""
+
+    def _headers_finished(self) -> None:
+        _, options = parse_options_header(self._disposition)
+        if b"name" not in options:
+            # Starlette refuses such a part ("name" must be provided): a 400 either way.
+            self.peek.error = 'The Content-Disposition header field "name" must be provided.'
+            return
+        self._name = options[b"name"]
+        self._is_file = b"filename" in options
+
+    def _data(self, data: bytes, start: int, end: int) -> None:
+        if not self._is_file:
+            self._value += data[start:end]
+
+    def _part_end(self) -> None:
+        if self.peek.error is not None:
+            return
+        name = _decode(self._name, self._charset)
+        if self._is_file:
+            self.peek.files.add(name)
+        else:
+            self.peek.fields[name] = _decode(bytes(self._value), self._charset)
+
+    def _field_name(self, data: bytes, start: int, end: int) -> None:
+        self._name += data[start:end]
+
+    def _field_end(self) -> None:
+        name = unquote_plus(self._name.decode("latin-1"))
+        self.peek.fields[name] = unquote_plus(bytes(self._value).decode("latin-1"))
+
+
+class FormPeekMiddleware:
+    """Show ``check`` the small fields of a form POST before the app (and its payment
+    middleware) sees the request; ``check`` may answer it instead.
+
+    The payment middleware quotes and verifies the upload route before FastAPI parses its form,
+    so an upload that could only fail (invalid ``options``, no ``file`` part) got a 402, and its
+    paid retry a facilitator verify, before the route's 400. This reads the body until it ends
+    or ``peek_bytes`` have arrived (clients send fields before the file, so ``options`` comes
+    early), then replays every message it read, unchanged, to the app: the file still streams.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        paths: tuple[str, ...],
+        check: Callable[[Scope, FormPeek], Response | None],
+        peek_bytes: int = 1024 * 1024,
+    ) -> None:
+        self.app = app
+        self.paths = paths
+        self.check = check
+        self.peek_bytes = peek_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or scope["path"] not in self.paths
+        ):
+            await self.app(scope, receive, send)
+            return
+        content_type = Headers(scope=scope).get("content-type", "")
+        if not content_type.startswith(FORM_TYPES):
+            await self.app(scope, receive, send)
+            return
+        reader = _FormReader(content_type)
+        buffered: list[Message] = []
+        read = 0
+        disconnected = False
+        while reader.peek.error is None and read < self.peek_bytes:
+            message = await receive()
+            buffered.append(message)
+            if message["type"] != "http.request":
+                disconnected = True  # gone, or over the body limit: the app answers that
+                break
+            chunk = message.get("body", b"")
+            read += len(chunk)
+            reader.feed(chunk)
+            if not message.get("more_body", False):
+                reader.finish()
+                break
+        answer = None if disconnected else self.check(scope, reader.peek)
+        if answer is not None:
+            await answer(scope, receive, send)
+            return
+
+        async def replay() -> Message:
+            return buffered.pop(0) if buffered else await receive()
+
+        await self.app(scope, replay, send)

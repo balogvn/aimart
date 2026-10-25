@@ -10,7 +10,9 @@ stay free so directories and agents can discover the tools. MCP charges per tool
 
 A paid request's body is validated before the x402 middleware quotes a price (``_body_check``):
 FastAPI only validates inside the route, after the 402, so an agent signed a payment for a
-request that could only fail. MCP does the same through ``argument_checker``.
+request that could only fail. MCP does the same through ``argument_checker``. The upload
+form's small fields are read for the same check by ``FormPeekMiddleware`` (``_form_check``),
+which sits outside the payment middleware so the file itself still streams to the route.
 """
 
 from __future__ import annotations
@@ -37,8 +39,11 @@ from starlette.requests import ClientDisconnect
 from aimart_parquet import __version__
 from aimart_parquet.api import discovery
 from aimart_parquet.api.middleware import (
+    FORM_TYPES,
     AccessLogMiddleware,
     BodyLimitMiddleware,
+    FormPeek,
+    FormPeekMiddleware,
     RateLimitMiddleware,
 )
 from aimart_parquet.api.schemas import (
@@ -64,6 +69,8 @@ from aimart_parquet.service import Service
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+
+    from starlette.types import Scope
 
     from aimart_parquet.payments import Payments
 
@@ -112,6 +119,74 @@ def _price_probe(raw: bytes) -> bool:
     return raw.strip() in {b"", b"{}"}
 
 
+def _form_routes(app: FastAPI) -> dict[tuple[str, str], list[tuple[str, bool]]]:
+    """(method, path) of every form route -> its required parts as (name, is a file)."""
+    forms: dict[tuple[str, str], list[tuple[str, bool]]] = {}
+    for route in app.routes:
+        if not isinstance(route, APIRoute) or route.body_field is None:
+            continue
+        body_params = route.dependant.body_params
+        if not any(isinstance(p.field_info, fastapi_params.Form) for p in body_params):
+            continue
+        required = [
+            (p.alias, isinstance(p.field_info, fastapi_params.File))
+            for p in body_params
+            if p.field_info.is_required()
+        ]
+        for method in route.methods or ():
+            forms[(method, route.path)] = required
+    return forms
+
+
+def _convert_options(options: str | None) -> ConvertOptions:
+    """The upload form's ``options`` field, as the route parses it (and the check before it)."""
+    try:
+        return ConvertOptions.model_validate_json(options) if options else ConvertOptions()
+    except ValidationError as exc:
+        raise InvalidRequest(
+            "options is not valid ConvertOptions JSON.", hint=str(exc.errors()[:3])
+        ) from exc
+
+
+# Form fields a route parses itself (to FastAPI they are plain strings), by route path.
+_FORM_FIELDS: dict[str, dict[str, Callable[[str | None], object]]] = {
+    BY_KEY["convert_upload"].path: {"options": _convert_options},
+}
+
+
+def _form_check(
+    app: FastAPI, paying: Callable[[Scope], bool]
+) -> tuple[tuple[str, ...], Callable[[Scope, FormPeek], JSONResponse | None]]:
+    """The form paths, and what their routes would refuse, decided from ``FormPeekMiddleware``.
+
+    Without it every upload reached the payment middleware unread: invalid ``options`` or no
+    ``file`` part was quoted (402), and the paid retry verified, before the route's 400. An
+    invalid field or a malformed body is refused for anyone. A missing part only for a paid
+    request whose whole body was read: an unpaid form without its file is how catalogs replay
+    the advertised example to learn the price, so it still gets its 402.
+    """
+    forms = _form_routes(app)
+
+    def check(scope: Scope, peek: FormPeek) -> JSONResponse | None:
+        if peek.error is not None:
+            return _invalid_body([{"loc": (), "msg": peek.error}])
+        for name, parse in _FORM_FIELDS.get(scope["path"], {}).items():
+            try:
+                parse(peek.fields.get(name))
+            except AimartError as exc:
+                return JSONResponse(exc.to_dict(), status_code=exc.http_status)
+        missing = [
+            name
+            for name, is_file in forms.get((scope["method"], scope["path"]), [])
+            if name not in (peek.files if is_file else peek.fields)
+        ]
+        if missing and peek.complete and paying(scope):
+            return _invalid_body({"loc": (name,), "msg": "Field required"} for name in missing)
+        return None
+
+    return tuple(sorted({path for method, path in forms if method == "POST"})), check
+
+
 def _body_check(app: FastAPI) -> Callable[[Request, bool], Awaitable[JSONResponse | None]]:
     """Validate a request body against its route's own model, before the payment middleware.
 
@@ -119,22 +194,20 @@ def _body_check(app: FastAPI) -> Callable[[Request, bool], Awaitable[JSONRespons
     accept; the route still validates again, so this only ever rejects earlier what the route
     would reject anyway. Mirrors FastAPI's reading of the body (JSON only for a JSON or absent
     content type; an empty body is a missing one). An unpaid price probe is let through to its
-    402. Form routes are only checked for a form content type: their parts are not read here.
+    402. A form body is not read here: ``_form_check`` saw it already, before this middleware.
     """
     models: dict[tuple[str, str], type[BaseModel]] = {}
-    forms: dict[tuple[str, str], list[str]] = {}
+    forms = {key: [name for name, _ in parts] for key, parts in _form_routes(app).items()}
     for route in app.routes:
         if not isinstance(route, APIRoute) or route.body_field is None:
             continue
         body_params = route.dependant.body_params
         for method in route.methods or ():
             key = (method, route.path)
-            if any(isinstance(p.field_info, fastapi_params.Form) for p in body_params):
-                forms[key] = [p.alias for p in body_params if p.field_info.is_required()]
-                continue
             annotation = route.body_field.field_info.annotation
             if (
-                len(body_params) == 1
+                key not in forms
+                and len(body_params) == 1
                 and isinstance(annotation, type)
                 and issubclass(annotation, BaseModel)
             ):
@@ -143,10 +216,7 @@ def _body_check(app: FastAPI) -> Callable[[Request, bool], Awaitable[JSONRespons
     async def check(request: Request, paying: bool) -> JSONResponse | None:
         key = (request.method, request.url.path)
         if key in forms:
-            content_type = request.headers.get("content-type", "")
-            if content_type.startswith(
-                ("multipart/form-data", "application/x-www-form-urlencoded")
-            ):
+            if request.headers.get("content-type", "").startswith(FORM_TYPES):
                 return None
             length = request.headers.get("content-length")
             if length is None:
@@ -357,13 +427,7 @@ def create_app(
         file: Annotated[UploadFile, File(description="The data file.")],
         options: Annotated[str | None, Form(description="ConvertOptions as a JSON string.")] = None,
     ) -> ConvertResult:
-        try:
-            parsed = ConvertOptions.model_validate_json(options) if options else ConvertOptions()
-        except ValidationError as exc:
-            raise InvalidRequest(
-                "options is not valid ConvertOptions JSON.", hint=str(exc.errors()[:3])
-            ) from exc
-        return await service.convert_upload(file.read, file.filename, parsed)
+        return await service.convert_upload(file.read, file.filename, _convert_options(options))
 
     @app.post(
         "/v1/inspect",
@@ -439,7 +503,12 @@ def create_app(
             return await service.quantum_portfolio(body.source(), body.options)
 
     if pay is not None:
+        from aimart_parquet.payments import carries_payment  # noqa: PLC0415 - loaded with pay
+
         app.middleware("http")(pay.http_middleware(prevalidate=_body_check(app), store=store))
+        form_paths, form_check = _form_check(app, lambda scope: carries_payment(Request(scope)))
+        # Added after the payment middleware, so it runs before it (and inside BodyLimit).
+        app.add_middleware(FormPeekMiddleware, paths=form_paths, check=form_check)
 
     app.mount("/", mcp_app)  # after every route: a "/" mount swallows anything declared later
 
