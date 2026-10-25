@@ -7,11 +7,13 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import subprocess
 import sys
 import textwrap
-from typing import TYPE_CHECKING
+from pathlib import Path
 
+import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -19,10 +21,7 @@ import pytest
 import aimart_testkit as kit
 from aimart_parquet.engine import tabular
 from aimart_parquet.engine.tabular import preview, query
-from aimart_parquet.errors import InputTooLarge, InvalidInput, QueryRejected
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from aimart_parquet.errors import InputTooLarge, InvalidInput, QueryFailed, QueryRejected
 
 JOIN = "SELECT * FROM customers c JOIN orders o ON c.id = o.id ORDER BY c.id"
 
@@ -290,10 +289,233 @@ class TestQueryInputs:
         assert "artifact_id" in info.value.hint
 
 
+def _duckdb_parquet(path: Path, select: str) -> Path:
+    duckdb.connect().execute(f"COPY ({select}) TO '{path}' (FORMAT parquet)")
+    return path
+
+
+@pytest.fixture
+def scans(monkeypatch):
+    """Which inputs ``query`` gave DuckDB's own reader (True) or the Arrow scan (False)."""
+    seen: list[bool] = []
+    real = tabular._native_view
+
+    def spy(*args):
+        view = real(*args)
+        seen.append(view is not None)
+        return view
+
+    monkeypatch.setattr(tabular, "_native_view", spy)
+    return seen
+
+
+def _as_arrow_scan(monkeypatch) -> None:
+    """Register every input as an Arrow dataset, as query() did before round 3."""
+    monkeypatch.setattr(tabular, "_native_view", lambda *args: None)
+
+
+@pytest.fixture
+def typed(tmp_path):
+    """Types DuckDB's reader widens (cast back exactly), written by pyarrow and by DuckDB."""
+    stamp = dt.datetime(2024, 1, 2, 3, 4, 5, 123000)
+    arrow = pa.table(
+        {
+            "id": [1, 2, 3],
+            "ms": pa.array(
+                [stamp, None, dt.datetime(1969, 12, 31, 23, 59, 59)], pa.timestamp("ms")
+            ),
+            "s": pa.array([stamp.replace(microsecond=0), None, None], pa.timestamp("s")),
+            "fixed": pa.array([[1, 2], None, [3, None]], pa.list_(pa.int64(), 2)),
+            "nested": pa.array(
+                [{"t": [stamp]}, None, {"t": None}],
+                pa.struct([("t", pa.list_(pa.timestamp("ms")))]),
+            ),
+            "cat": pa.array(["a", None, "a"]).dictionary_encode(),
+            "": [7, 8, 9],
+        }
+    )
+    pq.write_table(arrow, tmp_path / "a.parquet", row_group_size=2)
+    duck = _duckdb_parquet(
+        tmp_path / "d.parquet",
+        """SELECT i AS id, ('{"k": ' || i || '}')::JSON AS j, ['[1]'::JSON] AS jl,
+                  MAP {'m': '{}'::JSON} AS jm, '2024-01-02 03:04:05.123'::TIMESTAMP_MS AS ms,
+                  ('01:02:0' || i || '+00')::TIMETZ AS tz
+           FROM range(1, 4) t(i)""",
+    )
+    return {"data": tmp_path / "a.parquet", "d": duck}
+
+
+class TestQueryInputsAreReadByDuckDB:
+    """Round 3: every input was an Arrow dataset, whose scan decodes whole row groups as plain
+    values outside memory_limit: SELECT count(*) took 3.3 GB on a 260-byte file. DuckDB's own
+    reader keeps dictionaries and reads 2048 rows at a time; it is used wherever it gives the
+    Arrow scan's names and types, so queries see exactly what they saw before.
+    """
+
+    @needs_resource
+    @pytest.mark.parametrize(("rows", "width"), [(20_000, 65_536), (128, 16 * 1024 * 1024)])
+    def test_a_dictionary_bomb_input_stays_small(self, tmp_path, rows: int, width: int) -> None:
+        bomb = _dictionary_bomb(tmp_path / "bomb.parquet", rows, width)
+        assert bomb.stat().st_size < 4096
+        growth, out = _peak_rss_growth_mb(
+            """
+            from pathlib import Path
+            for sql in ("SELECT count(*) FROM data", "SELECT * FROM data LIMIT 1",
+                        "SELECT * FROM data"):
+                r = query({"data": Path(sys.argv[1])}, sql, limit=1000, fmt="json",
+                          query_timeout=60, max_chars=2000, memory_limit="512MB", threads=1)
+                print("ROWS", r.row_count, r.rows[0][0] if r.types == ["int64"] else
+                      len(r.rows[0][0]))
+            """,
+            str(bomb),
+        )
+        assert f"ROWS 1 {rows}" in out
+        assert "ROWS 1 2000" in out
+        assert f"ROWS {min(rows, 1000)} 2000" in out
+        # Before: 3.3 GB (20,000 x 64 KB) and 4.1 GB (128 x 16 MB), even for SELECT count(*).
+        assert growth < 300, out
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT * FROM data ORDER BY id",
+            "SELECT * FROM d ORDER BY id",
+            "DESCRIBE data",
+            "DESCRIBE d",
+            "SELECT id, ms FROM data WHERE ms > '2000-01-01' ORDER BY id",
+            "SELECT d.j, d.jl[1], data.cat FROM data JOIN d USING (id) WHERE d.j->>'k' = '1'",
+            "SELECT count(*), count(cat), min(fixed), max(nested) FROM data",
+        ],
+    )
+    def test_results_are_those_of_the_arrow_scan(self, typed, scans, monkeypatch, sql) -> None:
+        native = run(typed, sql)
+        assert scans == [True, True]
+        _as_arrow_scan(monkeypatch)
+        assert native == run(typed, sql)
+
+    @pytest.mark.parametrize(
+        "column",
+        [
+            # INT96 nanoseconds: DuckDB's reader cuts them to microseconds.
+            pa.array([1704164645000000001, None], pa.timestamp("ns")),
+            pa.array([5, None], pa.duration("s")),  # DuckDB reads BIGINT, not INTERVAL
+            pa.array([[5], None], pa.list_(pa.duration("us"))),
+            pa.StructArray.from_arrays([pa.array([1, 2]), pa.array([3, 4])], names=["k", "k"]),
+        ],
+        ids=["int96", "duration", "nested-duration", "repeated-field"],
+    )
+    def test_types_duckdb_reads_differently_keep_the_arrow_scan(
+        self, tmp_path, scans, monkeypatch, column: pa.Array
+    ) -> None:
+        path = tmp_path / "t.parquet"
+        pq.write_table(
+            pa.table({"id": [1, 2], "c": column}), path, use_deprecated_int96_timestamps=True
+        )
+        result = run({"data": path}, "SELECT * FROM data ORDER BY id")
+        assert scans == [False]
+        _as_arrow_scan(monkeypatch)
+        assert result == run({"data": path}, "SELECT * FROM data ORDER BY id")
+        if pa.types.is_timestamp(column.type):
+            assert result.rows[0][1] == "2024-01-02T03:04:05.000000001"
+
+    def test_uuid_and_interval_keep_the_arrow_scan(self, tmp_path, scans, monkeypatch) -> None:
+        path = _duckdb_parquet(
+            tmp_path / "u.parquet",
+            "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID AS u, INTERVAL 3 DAY AS i",
+        )
+        result = run({"data": path}, "SELECT * FROM data")
+        assert scans == [False]
+        _as_arrow_scan(monkeypatch)
+        assert result == run({"data": path}, "SELECT * FROM data")
+
+    def test_repeated_column_names_in_the_file_are_queryable(self, tmp_path, scans) -> None:
+        # The Arrow scan refused the file: "Can't unify schema with duplicate field names".
+        path = tmp_path / "t.parquet"
+        names = ["a", "a", "A", ""]
+        pq.write_table(pa.Table.from_arrays([pa.array([i]) for i in range(4)], names=names), path)
+        result = run({"data": path}, "SELECT * FROM data")
+        assert scans == [True]
+        assert result.columns == ["a", "a_1", "A_2", "v3"]
+        assert result.rows == [[0, 1, 2, 3]]
+
+    def test_an_input_on_another_filesystem_is_copied(self, joined, scans, monkeypatch) -> None:
+        def cross_device(src, dst):
+            raise OSError(18, "Invalid cross-device link")
+
+        monkeypatch.setattr(tabular.os, "link", cross_device)
+        assert run(joined, JOIN).rows == [
+            [1, "alice", 1, "ACME", 100.0],
+            [2, "bob", 2, "Globex", 200.0],
+        ]
+        assert scans == [True, True]
+
+    def test_a_big_input_on_another_filesystem_keeps_the_arrow_scan(
+        self, joined, scans, monkeypatch
+    ) -> None:
+        def cross_device(src, dst):
+            raise OSError(18, "Invalid cross-device link")
+
+        monkeypatch.setattr(tabular.os, "link", cross_device)
+        monkeypatch.setattr(tabular, "_MAX_INPUT_COPY", 10)
+        assert run(joined, JOIN).rows == [
+            [1, "alice", 1, "ACME", 100.0],
+            [2, "bob", 2, "Globex", 200.0],
+        ]
+        assert scans == [False, False]
+
+    def test_sql_reads_only_the_query_s_own_links(self, tmp_path, joined, monkeypatch) -> None:
+        made: list[Path] = []
+        real = tabular.tempfile.mkdtemp
+
+        def mkdtemp(**kwargs):
+            made.append(Path(real(**kwargs)))
+            return str(made[-1])
+
+        monkeypatch.setattr(tabular.tempfile, "mkdtemp", mkdtemp)
+        with pytest.raises(QueryFailed, match="Permission Error") as info:
+            run(joined, f"SELECT * FROM read_parquet('{joined['customers']}')")
+        assert str(tmp_path) not in info.value.message
+        views = run(joined, "SELECT view_name FROM duckdb_views() WHERE NOT internal ORDER BY 1")
+        assert views.rows == [["customers"], ["orders"]]
+        assert made
+        assert not any(p.exists() for p in made)  # the links went with the query's directory
+        assert joined["customers"].exists()
+
+
+@pytest.mark.parametrize(
+    ("have", "want", "exact"),
+    [
+        ("TIMESTAMP", "TIMESTAMP_MS", True),
+        ("TIMESTAMP", "TIMESTAMP_S", True),
+        ("TIMESTAMP", "TIMESTAMP_NS", False),  # INT96: the nanoseconds are gone
+        ("JSON", "VARCHAR", True),
+        ("VARCHAR", "JSON", False),
+        ("TIME WITH TIME ZONE", "TIME", True),
+        ("BIGINT", "INTERVAL", False),
+        ("UUID", "BLOB", False),
+        ("INTEGER[]", "INTEGER[2]", True),
+        ("INTEGER[3]", "INTEGER[2]", False),
+        ("INTEGER[]", "BIGINT[]", False),
+        ("TIMESTAMP[]", "TIMESTAMP_MS[]", True),
+        ("STRUCT(a JSON, b INTEGER)", "STRUCT(a VARCHAR, b INTEGER)", True),
+        ("STRUCT(a JSON)", "STRUCT(b VARCHAR)", False),
+        ("STRUCT(a INTEGER, b INTEGER)", "STRUCT(a INTEGER)", False),
+        ("MAP(VARCHAR, JSON)", "MAP(VARCHAR, VARCHAR)", True),
+        ("MAP(VARCHAR, INTEGER)", "STRUCT(key VARCHAR, value INTEGER)", False),
+        ("UNION(a JSON)", "UNION(a VARCHAR)", False),
+    ],
+)
+def test_only_exact_casts_back_to_the_arrow_scan_types(have: str, want: str, exact: bool) -> None:
+    con = duckdb.connect()
+    kinds = con.sql(f"SELECT NULL::{have} AS have, NULL::{want} AS want").types
+    assert tabular._widens(kinds[0], kinds[1]) is exact
+
+
 _NESTED = {
     "list": "SELECT [repeat('x', 1000000)] AS s FROM range(1000)",
     "struct": "SELECT {'a': repeat('x', 1000000)} AS s FROM range(1000)",
     "map": "SELECT map([1], [repeat('x', 1000000)]) AS s FROM range(1000)",
+    "map_keys": "SELECT map([repeat('x', 1000000)], [1]) AS s FROM range(1000)",
     "union": "SELECT union_value(s := repeat('x', 1000000)) AS s FROM range(1000)",
     "deep": "SELECT {'a': {'b': [map(['k'], [repeat('x', 1000000)])]}, 'c': 1} AS s FROM range(1000)",
 }
@@ -304,6 +526,7 @@ class TestNestedTextIsCutInsideDuckDB:
 
     DuckDB built its full vectors and Arrow converted each 256-row batch before the byte cap was
     checked: 1.2 GB (1.4 GB for the union) for 1000 rows of one 1 MB string, then a 413.
+    Round 3: map keys were never cut (cut keys can collide, which DuckDB refuses): 1.5 GB.
     """
 
     @needs_resource
@@ -321,7 +544,8 @@ class TestNestedTextIsCutInsideDuckDB:
             _NESTED[shape],
         )
         assert "ROWS 1000 " in out, out
-        # Before: 1208 MB (list, struct, map), 1454 MB (union), then InputTooLarge.
+        # Before: 1208 MB (list, struct, map), 1454 MB (union), then InputTooLarge; 1520 MB
+        # for map keys.
         assert growth < 300, out
 
     @pytest.mark.parametrize(
@@ -334,6 +558,10 @@ class TestNestedTextIsCutInsideDuckDB:
             "SELECT map([1, 2], [repeat('m', 30), NULL]) AS m UNION ALL SELECT NULL "
             "UNION ALL SELECT map([], [])",
             "SELECT map([repeat('k', 30)], [1]) AS long_keys",
+            # Keys that are equal once cut, a key one past the cut, keys inside a list.
+            "SELECT map([repeat('k', 30), repeat('k', 31), repeat('k', 8), repeat('k', 9), "
+            "'kkkkkkk…1'], [1, 2, 3, 4, 5]) AS m UNION ALL SELECT NULL",
+            "SELECT [map([repeat('é', 20) || i::VARCHAR, 'é'], [i, 0])] AS l FROM range(12) t(i)",
             "SELECT union_value(s := repeat('z', 20))::UNION(s VARCHAR, n INT) AS u "
             "UNION ALL SELECT NULL UNION ALL SELECT union_value(n := 3)",
             "SELECT ['abcdefghijkl', NULL]::VARCHAR[2] AS a UNION ALL SELECT NULL",

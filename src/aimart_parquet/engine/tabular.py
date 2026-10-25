@@ -24,6 +24,7 @@ import datetime as dt
 import decimal
 import io
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -78,6 +79,23 @@ _PREVIEW_TEXT_BATCH_ROWS = 4096
 _PREVIEW_REREAD_BYTES = 1024 * 1024 * 1024
 # Rows per Arrow batch pulled from a query result; the byte cap is checked between batches.
 _QUERY_BATCH_ROWS = 256
+# Query inputs are read by DuckDB's own Parquet reader (see _native_view) through a hard link in
+# the query's private directory, the only one its SQL may read. The Arrow dataset scan it took
+# over from decodes row groups as plain values, outside memory_limit: SELECT count(*) took 3.3 GB
+# on a 260-byte file (20,000 rows pointing at one 64 KB string) and LIMIT 3 1 GB on an honest
+# 6 MB file of 5M distinct strings; DuckDB's reader keeps dictionaries and reads 2048 rows at a
+# time (25 MB and 31 MB). An input on another filesystem is copied, if it is not bigger than this.
+_MAX_INPUT_COPY = 256 * 1024 * 1024
+_TYPE_PROBE = "aimart-type-probe"  # never a table name (TABLE_NAME_PATTERN has no "-")
+_NESTED = frozenset({"list", "array", "map", "struct"})
+_EXACT_CASTS = frozenset(
+    {
+        ("TIMESTAMP", "TIMESTAMP_S"),
+        ("TIMESTAMP", "TIMESTAMP_MS"),
+        ("JSON", "VARCHAR"),
+        ("TIME WITH TIME ZONE", "TIME"),
+    }
+)
 # Types nested deeper than this, or whose cut would need more SQL than this, are cut at the top
 # level only inside DuckDB; the byte cap still holds.
 _MAX_CUT_DEPTH = 16
@@ -564,8 +582,25 @@ def validate_select(sql: str) -> str:
     return text
 
 
-def _register(con: duckdb.DuckDBPyConnection, name: str, path: Path) -> None:
-    """Expose one input as table ``name``, or say exactly why it cannot be (never a bare 500)."""
+def _register(con: duckdb.DuckDBPyConnection, name: str, path: Path, local: Path) -> None:
+    """Expose one input as table ``name``, or say exactly why it cannot be (never a bare 500).
+
+    Read by DuckDB's own Parquet reader where it gives the types the Arrow scan gave (a view over
+    ``local``, a link to the input in the query's private directory); else by the Arrow scan.
+    """
+    try:
+        # Extensions off: the types the Arrow scan below sees (UUID and JSON as bytes and text).
+        schema = pq.read_schema(path, arrow_extensions_enabled=False)
+    except (pa.ArrowException, OSError) as exc:  # its message names the server path
+        raise InvalidInput(
+            f"Table {name!r} is not a readable Parquet file.",
+            hint="Convert it first (/v1/convert or the convert tool) and pass the "
+            "returned artifact_id.",
+        ) from exc
+    view = _native_view(con, path, schema, local)
+    if view is not None:
+        con.execute(f"CREATE VIEW {ident(name)} AS {view}")
+        return
     try:
         dataset = pads.dataset(path, format="parquet")
     except (pa.ArrowException, OSError) as exc:  # its message names the server path
@@ -593,12 +628,99 @@ def _unreadable_columns(con: duckdb.DuckDBPyConnection, schema: pa.Schema) -> li
     bad = []
     for field in schema:
         try:
-            con.register("aimart_type_probe", pa.schema([field]).empty_table())
+            con.register(_TYPE_PROBE, pa.schema([field]).empty_table())
         except (duckdb.Error, pa.ArrowException):
             bad.append(f"{field.name} ({type_name(field.type)})")
         finally:
-            con.unregister("aimart_type_probe")
+            con.unregister(_TYPE_PROBE)
     return bad
+
+
+def _native_view(
+    con: duckdb.DuckDBPyConnection, path: Path, schema: pa.Schema, local: Path
+) -> str | None:
+    """A SELECT over DuckDB's own reader of ``path`` that looks exactly like its Arrow scan.
+
+    Same column names and types as the Arrow scan (which agents saw before, and which the query
+    and its cut were written against); a column DuckDB reads more precisely is cast back only
+    where that is exact (``_widens``). None, for the Arrow scan, when any column differs
+    otherwise: INT96 timestamps (nanoseconds DuckDB cuts to microseconds), decimals over 38
+    digits (which DuckDB reads as a wrong DOUBLE: 2e54 for 1e47), UUID and INTERVAL (which the
+    Arrow scan shows as bytes), and types the Arrow scan cannot read at all (its typed error).
+    """
+    try:
+        con.register(_TYPE_PROBE, schema.empty_table())
+        arrow = con.sql(f"SELECT * FROM {ident(_TYPE_PROBE)}")
+        want = list(zip(arrow.columns, arrow.types, strict=True))
+    except (duckdb.Error, pa.ArrowException):
+        return None
+    finally:
+        con.unregister(_TYPE_PROBE)
+    if not _link(path, local):
+        return None
+    source = f"read_parquet({literal(str(local))})"
+    try:
+        native = con.sql(f"SELECT * FROM {source}")
+    except duckdb.Error:
+        return None  # the Arrow scan then says why, typed
+    if len(native.types) != len(want):
+        return None
+    exprs = []
+    for i, (have, (name, kind)) in enumerate(zip(native.types, want, strict=True), start=1):
+        if not _widens(have, kind):
+            return None
+        expr = f"#{i}" if str(have) == str(kind) else f"CAST(#{i} AS {kind})"
+        exprs.append(f"{expr} AS {ident(name)}")
+    sql = f"SELECT {', '.join(exprs)} FROM {source}"
+    try:
+        bound = con.sql(sql)
+    except duckdb.Error:
+        return None
+    if [str(t) for t in bound.types] != [str(kind) for _, kind in want]:
+        return None
+    return sql
+
+
+def _widens(have: DuckDBPyType, want: DuckDBPyType) -> bool:
+    """Whether DuckDB's own reader gives ``have`` where the Arrow scan gave ``want``, and
+    ``CAST(have AS want)`` gives back exactly the Arrow scan's values.
+
+    Microsecond timestamps for ones stored in seconds or milliseconds, JSON for the text it is,
+    TIME WITH TIME ZONE for TIME stored adjusted to UTC (always +00), a list for a fixed-size
+    list; at any depth. Anything else differing is not known to be exact.
+    """
+    if str(have) == str(want) or (str(have), str(want)) in _EXACT_CASTS:
+        return True
+    if have.id not in _NESTED or want.id not in _NESTED:
+        return False
+    # Types only: an array's size is in str(), a list has its child, a map its key and value,
+    # a struct its fields (by exact name).
+    ours = [(n, t) for n, t in have.children if isinstance(t, DuckDBPyType)]
+    theirs = [(n, t) for n, t in want.children if isinstance(t, DuckDBPyType)]
+    if (have.id, want.id) == ("list", "array"):
+        return _widens(ours[0][1], theirs[0][1])
+    if have.id != want.id or len(ours) != len(theirs):
+        return False
+    if have.id == "array" and have.children[1] != want.children[1]:
+        return False  # (size, n)
+    return all(a == b and _widens(x, y) for (a, x), (b, y) in zip(ours, theirs, strict=True))
+
+
+def _link(path: Path, local: Path) -> bool:
+    """Put ``path`` at ``local``: a hard link, else a copy of a file that is not too big.
+
+    DuckDB's SQL may read only its own directory; it follows a symbolic link and refuses it.
+    """
+    try:
+        os.link(path, local)
+    except OSError:  # another filesystem
+        try:
+            if path.stat().st_size > _MAX_INPUT_COPY:
+                return False
+            shutil.copyfile(path, local)
+        except OSError:
+            return False
+    return True
 
 
 def query(
@@ -615,14 +737,17 @@ def query(
     text = validate_select(sql)
     # A private, throwaway spill directory: big sorts and joins can spill instead of failing,
     # and the only path current_setting() can reveal is this random temp dir, not the server's.
+    # DuckDB lets SQL read it (and nothing else), so the inputs are linked in there too.
     spill = Path(tempfile.mkdtemp(prefix="aimart-q-"))
+    inputs = spill / "inputs"
+    inputs.mkdir()
     con = connect(
         memory_limit=memory_limit, threads=threads, temp_dir=spill
     )  # no other file access
     timer = threading.Timer(query_timeout, con.interrupt)
     try:
-        for name, path in tables.items():
-            _register(con, name, path)
+        for i, (name, path) in enumerate(tables.items()):
+            _register(con, name, path, inputs / f"t{i}.parquet")
         timer.start()
         try:
             reader = con.execute(_clipped(con, text, max_chars)).to_arrow_reader(
@@ -636,21 +761,19 @@ def query(
                 hint="Add filters or aggregations, or reduce joins.",
             ) from exc
         except duckdb.Error as exc:
-            # Never echo server paths back to the caller.
-            message = _PATH_IN_MESSAGE.sub('"<file>"', str(exc).splitlines()[0])
+            message = _without_paths(exc, spill)
+            # DuckDB's reader refuses text that is not UTF-8 ('... is not valid UTF8!').
             raise QueryFailed(
                 f"Query failed: {message}",
-                hint=f"Available tables: {', '.join(ident(t) for t in tables)}. Use DESCRIBE <table> to list columns.",
+                hint=_BAD_VALUES_HINT
+                if "UTF8" in message
+                else f"Available tables: {', '.join(ident(t) for t in tables)}. Use DESCRIBE <table> to list columns.",
             ) from exc
         except pa.ArrowException as exc:
             # Arrow refusing what DuckDB hands back, e.g. text that is not valid UTF-8 in an
             # input's string column ('Invalid UTF8 sequence in input'): it was a bare 500.
-            message = _PATH_IN_MESSAGE.sub('"<file>"', str(exc).splitlines()[0])
             raise QueryFailed(
-                f"Query failed: {message}",
-                hint="An input holds values that cannot be read back (such as text that is not "
-                "valid UTF-8): leave those columns out, or convert the original file again "
-                "with /v1/convert.",
+                f"Query failed: {_without_paths(exc, spill)}", hint=_BAD_VALUES_HINT
             ) from exc
     finally:
         timer.cancel()
@@ -658,6 +781,20 @@ def query(
         shutil.rmtree(spill, ignore_errors=True)
     truncated = table.num_rows > limit
     return render(table.slice(0, limit), fmt=fmt, truncated=truncated, max_chars=max_chars)
+
+
+_BAD_VALUES_HINT = (
+    "An input holds values that cannot be read back (such as text that is not valid UTF-8): "
+    "leave those columns out, or convert the original file again with /v1/convert."
+)
+
+
+def _without_paths(exc: Exception, spill: Path) -> str:
+    """The first line of ``exc`` with no server path: quoted ones, and the query's directory."""
+    message = (str(exc).splitlines() or [type(exc).__name__])[0]
+    for directory in {str(spill.resolve()), str(spill)}:
+        message = message.replace(directory, "<tmp>")
+    return _PATH_IN_MESSAGE.sub('"<file>"', message)
 
 
 def _clipped(con: duckdb.DuckDBPyConnection, text: str, max_chars: int) -> str:
@@ -704,8 +841,8 @@ def _cut_sql(expr: str, kind: DuckDBPyType, max_chars: int, level: int, depth: i
     """A DuckDB expression for ``expr`` (of type ``kind``) with its text cut, or None if no cut.
 
     Nested values are rebuilt with their exact type: lists by ``list_transform``, structs by
-    ``struct_pack`` (NULL stays NULL), map values (never keys: cut keys can collide, which
-    DuckDB refuses), union members, fixed-size arrays cast back to their size. Each part is cut
+    ``struct_pack`` (NULL stays NULL), maps (text keys kept unique), union members, fixed-size
+    arrays cast back to their size. Each part is cut
     where it lies (``struct_extract(#1, 'a')``), never through a copy: binding a struct to a
     lambda once (``list_transform([#1], lambda p: ...)[1]``) copied every value, and a struct of
     one 1 MB string still took 1 GB for 1000 rows. JSON is cut only at the top level, where
@@ -727,10 +864,24 @@ def _cut_sql(expr: str, kind: DuckDBPyType, max_chars: int, level: int, depth: i
         listed = f"list_transform({expr}, lambda {item}: {inner})"
         return listed if kid == "list" else f"CAST({listed} AS {kind})"
     if kid == "map":  # map(NULL, NULL) is NULL
+        keys = values = None
+        if str(children[0][1]) == "VARCHAR":
+            # Cut keys must stay unique (DuckDB refuses a map with repeated keys): a long key
+            # becomes its first max_chars characters, "…" and its position, longer than any key
+            # left whole and unlike any other cut key; _cell shows either as the same text.
+            # map([repeat('x', 1000000)], [1]) over 1000 rows took 1.5 GB with its keys whole.
+            pos = f"aimart_i{level}"
+            keys = (
+                f"list_transform(map_keys({expr}), lambda {item}, {pos}: CASE WHEN "
+                f"length({item}) > {max_chars + 1} THEN left({item}, {max_chars}) || '…' || "
+                f"CAST({pos} AS VARCHAR) ELSE {item} END)"
+            )
         inner = _cut_sql(item, children[1][1], max_chars, level + 1, depth)
-        if inner is None:
+        if inner is not None:
+            values = f"list_transform(map_values({expr}), lambda {item}: {inner})"
+        if keys is None and values is None:
             return None
-        return f"map(map_keys({expr}), list_transform(map_values({expr}), lambda {item}: {inner}))"
+        return f"map({keys or f'map_keys({expr})'}, {values or f'map_values({expr})'})"
     if kid == "struct":
         if any(not name for name, _ in children):  # unnamed fields (row(...)) cannot be packed
             return None
