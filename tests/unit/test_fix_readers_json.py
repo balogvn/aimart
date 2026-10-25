@@ -10,6 +10,7 @@ An empty nested key (``{"a": {"": 1}}``) failed the whole read with a bare DuckD
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
@@ -219,3 +220,109 @@ def test_too_deep_to_rename_is_a_clean_error() -> None:
 )
 def test_structure_check(structure: str, collides: bool) -> None:
     assert jsonish._structure_collides(structure) is collides
+
+
+# Round 2: the renamer renamed case variants at every nested path, including objects DuckDB
+# reads as a MAP (over 200 distinct keys) or keeps as JSON text, which keep every key apart.
+# Map keys are data: they were altered (in every record, even ones with no collision) whenever
+# the file had one malformed line or a real STRUCT collision anywhere else.
+WORDS = {f"w{i}": i for i in range(250)}
+WIDE = {"doc": 1, "counts": {**WORDS, "The": 250, "the": 251}}
+NARROW = {"doc": 2, "counts": {"the": 1}}
+
+
+def _lines(*records: Any) -> str:
+    return "".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in records)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param(_lines(WIDE, NARROW), id="clean"),
+        pytest.param(_lines(WIDE, "{oops", NARROW), id="with-a-malformed-line"),
+    ],
+)
+def test_map_keys_are_never_renamed(tmp_path, text: str) -> None:
+    result = kit.convert_bytes(tmp_path, "m.ndjson", text)
+    assert result.column("counts").type.startswith("map<string, int64")
+    counts = [dict(m) for m in result.rows["counts"]]
+    assert counts[0]["The"] == 250
+    assert counts[0]["the"] == 251
+    assert counts[1] == {"the": 1}
+    assert not _renamed(result)
+
+
+def test_a_struct_collision_elsewhere_leaves_map_keys_alone(tmp_path) -> None:
+    header = {"hdr": {"Content-Type": "a", "content-type": "b"}}
+    result = kit.convert_bytes(tmp_path, "m.ndjson", _lines({**WIDE, **header}, NARROW))
+    counts = [dict(m) for m in result.rows["counts"]]
+    assert (counts[0]["The"], counts[0]["the"], counts[1]) == (250, 251, {"the": 1})
+    assert result.rows["hdr"] == [{"Content-Type": "a", "content-type_2": "b"}, None]
+    (warning,) = _renamed(result)
+    assert "renamed 1 nested key " in warning
+    assert "hdr.content-type is now hdr.content-type_2" in warning
+
+
+def test_structs_inside_a_map_are_still_renamed(tmp_path) -> None:
+    # The map's keys stay as they are; its values are STRUCTs, which do lose case variants.
+    record = {"m": {f"k{i}": {"v": i, "V": -i} for i in range(250)}}
+    result = kit.convert_bytes(tmp_path, "m.ndjson", _lines(record, "{oops"))
+    (first,) = result.rows["m"]
+    assert dict(first)["k7"] == {"v": 7, "V_2": -7}
+    assert "m[].V is now m[].V_2" in _renamed(result)[0]
+
+
+def test_json_text_keeps_its_keys(tmp_path) -> None:
+    # Mixed types make "a" JSON text, which keeps both keys; renaming would rewrite the text.
+    text = _lines({"a": {"k": 1, "K": 2}}, {"a": "str"}, "{oops", {"b": {"x": 1, "X": 2}})
+    result = kit.convert_bytes(tmp_path, "j.ndjson", text)
+    assert json.loads(result.rows["a"][0]) == {"k": 1, "K": 2}
+    assert result.rows["b"][-1] == {"x": 1, "X_2": 2}
+    (warning,) = _renamed(result)
+    assert "b.X is now b.X_2" in warning
+    assert "a." not in warning
+
+
+def test_top_level_case_variants_fall_back_to_renaming_everywhere(tmp_path) -> None:
+    # DuckDB names those columns itself (id, ID_1), so their types cannot be matched to keys;
+    # then every nested object is treated as a STRUCT, which keeps every value.
+    text = _lines({"id": {"k": 1, "K": 2}, "ID": 3}, "{oops")
+    result = kit.convert_bytes(tmp_path, "t.ndjson", text)
+    assert result.rows["id"] == [{"k": 1, "K_2": 2}]
+
+
+@pytest.mark.parametrize(
+    ("structure", "columns", "collides"),
+    [
+        ('{"m": {"k": "UBIGINT", "K": "UBIGINT"}}', {"m": "MAP(VARCHAR, BIGINT)"}, False),
+        ('{"m": {"k": "UBIGINT", "K": "UBIGINT"}}', {"m": "STRUCT(k BIGINT)"}, True),
+        ('{"m": {"k": "UBIGINT", "K": "UBIGINT"}}', {"m": "JSON"}, False),
+        (
+            '{"m": {"a": {"k": "UBIGINT", "K": "UBIGINT"}}}',
+            {"m": "MAP(VARCHAR, STRUCT(k BIGINT))"},
+            True,
+        ),
+        ('{"l": [{"k": "UBIGINT", "K": "UBIGINT"}]}', {"l": "JSON[]"}, False),
+        ('{"l": [{"k": "UBIGINT", "K": "UBIGINT"}]}', {"l": "STRUCT(k BIGINT)[]"}, True),
+        ('{"m": {"k": "UBIGINT", "K": "UBIGINT"}}', {}, True),  # unknown: assume a STRUCT
+    ],
+)
+def test_structure_check_follows_the_types_duckdb_chose(
+    structure: str, columns: dict[str, str], collides: bool
+) -> None:
+    import duckdb
+
+    kinds = {name: duckdb.sqltype(kind) for name, kind in columns.items()}
+    assert jsonish._structure_collides(structure, kinds) is collides
+
+
+def test_without_the_lenient_types_every_object_is_renamed(tmp_path, monkeypatch) -> None:
+    # If DuckDB cannot say which objects are STRUCTs, fall back to keeping every value.
+    real = jsonish._read_json_sql
+
+    def lenient_fails(path, fmt, *, strict=False):
+        return real(path, fmt, strict=strict) if strict else "read_json('/nonexistent.json')"
+
+    monkeypatch.setattr(jsonish, "_read_json_sql", lenient_fails)
+    result = kit.convert_bytes(tmp_path, "x.json", json.dumps(PAIRS))
+    assert result.rows["a"] == [{"k": 1, "K_2": 2}, {"k": 3, "K_2": 4}]
