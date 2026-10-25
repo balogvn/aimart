@@ -174,7 +174,7 @@ class _CountingAggregator(PDFPageAggregatorWithMarkedContent):
 
     def begin_figure(self, *args: Any, **kwargs: Any) -> None:
         # Each form XObject drawn ('Do') is a figure object. X1 drawing X2 twice, X2 drawing X3
-        # twice, ...: 24 levels in 3 KB were 16M figures and no glyph, 700 MB in 13 s.
+        # twice, ...: 24 levels in 5 KB were 16M figures and no glyph, 700 MB in 13 s.
         self.budget.spend()
         super().begin_figure(*args, **kwargs)
 
@@ -576,8 +576,8 @@ def read_pdf(
         # often a larger one, so a bordered table wins; say where borderless ones may be.
         span = _span(scan.unruled)
         warnings.append(
-            f"page(s) {span} have no ruled table and were not searched for borderless ones; "
-            f"pass pdf_pages='{span}' to search them"
+            f"page(s) {span} have no ruled table; borderless tables are read only when no page "
+            f"has one, so pass pdf_pages='{span}' to read those pages"
         )
     tables = _merge(scan.ruled or scan.aligned)
     if not tables:
