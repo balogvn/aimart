@@ -6,6 +6,7 @@ an outage. Every caller-triggerable failure must be an ``AimartError`` (>= 400, 
 
 from __future__ import annotations
 
+import decimal
 import io
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,6 +35,21 @@ def _parquet_bytes() -> bytes:
     buf = io.BytesIO()
     pq.write_table(pa.table({"id": [1, 2], "x": ["a", "b"]}), buf)
     return buf.getvalue()
+
+
+def _parquet_with(column: pa.Array) -> bytes:
+    buf = io.BytesIO()
+    pq.write_table(pa.table({"id": pa.array(range(len(column))), "h": column}), buf)
+    return buf.getvalue()
+
+
+# Valid Parquet that DuckDB cannot register: 'Unsupported Internal Arrow Type' from
+# con.register, which sat outside every handler (a bare 500), or, from the isolated worker,
+# 500 internal_error with "Retry", which cannot help.
+UNREGISTRABLE = {
+    "float16": pa.array([1.5, 2.0], pa.float16()),
+    "decimal256": pa.array([decimal.Decimal("1.25"), None], pa.decimal256(50, 2)),
+}
 
 
 def _corrupt_parquet_bytes() -> bytes:
@@ -140,3 +156,25 @@ async def test_preview_on_a_csv_input_is_a_typed_422(free_app: kit.AppHarness) -
         "/v1/preview", json={"content_base64": kit.b64(CSV), "filename": "t.csv"}
     )
     _assert_typed_error(r, 422, "invalid_input")
+
+
+@pytest.mark.parametrize("isolate", [False, True], ids=["in-process", "isolated"])
+@pytest.mark.parametrize("kind", sorted(UNREGISTRABLE))
+async def test_query_on_a_column_type_duckdb_cannot_read_is_a_typed_422(
+    make_settings: Callable[..., Settings], isolate: bool, kind: str
+) -> None:
+    async with kit.running_app(make_settings(isolate_jobs=isolate), paid=False) as app:
+        r = await app.http.post(
+            "/v1/query",
+            json={
+                "content_base64": kit.b64(_parquet_with(UNREGISTRABLE[kind])),
+                "filename": "t.parquet",
+                "sql": "SELECT id FROM data",
+            },
+        )
+    error = _assert_typed_error(r, 422, "invalid_input")
+    shown = {"float16": "halffloat", "decimal256": "decimal256(50, 2)"}[kind]
+    assert error["message"] == (
+        f"Table 'data' has columns of a type SQL queries cannot read: h ({shown})."
+    )
+    assert "Cast" in error["hint"]

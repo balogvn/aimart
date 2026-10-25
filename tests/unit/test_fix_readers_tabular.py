@@ -218,23 +218,23 @@ class TestMemoryBounds:
 
     def test_query_result_over_the_byte_cap_is_refused_unpaid(self, joined, monkeypatch) -> None:
         monkeypatch.setattr(tabular, "MAX_RESULT_BYTES", 100_000)
-        # Nested values are not cut, so a list of long strings is what reaches the cap.
+        # Long lists are not cut (round 2: nested text is), so 1000 integers a row reach the cap.
         with pytest.raises(InputTooLarge) as info:
-            run(
-                joined, "SELECT [repeat('x', 1000)] AS l FROM range(1000)", limit=1000, max_chars=50
-            )
+            run(joined, "SELECT range(1000) AS l FROM range(1000)", limit=1000, max_chars=50)
         assert info.value.http_status == 413
         assert info.value.details == {"limit_bytes": 100_000}
         assert info.value.hint is not None
         assert "limit" in info.value.hint
-        # Text is counted after the cut, so the same volume as top-level text is fine.
-        result = run(
-            joined, "SELECT repeat('x', 1000) AS s FROM range(1000)", limit=1000, max_chars=50
-        )
-        assert result.row_count == 1000
+        # Text is counted after the cut, top-level or nested, so the same volume is fine.
+        for sql in (
+            "SELECT repeat('x', 1000) AS s FROM range(1000)",
+            "SELECT [repeat('x', 1000)] AS l FROM range(1000)",
+        ):
+            assert run(joined, sql, limit=1000, max_chars=50).row_count == 1000
 
     def test_preview_over_the_byte_cap_is_refused_unpaid(self, tmp_path, monkeypatch) -> None:
-        path = kit.write_parquet(tmp_path / "l.parquet", {"l": [["x" * 1000] * 10] * 200})
+        # Integers: nested text is cut (round 2), so it no longer reaches the cap.
+        path = kit.write_parquet(tmp_path / "l.parquet", {"l": [list(range(1000))] * 200})
         monkeypatch.setattr(tabular, "MAX_RESULT_BYTES", 100_000)
         with pytest.raises(InputTooLarge):
             preview(path, columns=None, offset=0, limit=200, fmt="json", max_chars=50)
@@ -288,3 +288,117 @@ class TestQueryInputs:
         assert str(tmp_path) not in info.value.message
         assert info.value.hint is not None
         assert "artifact_id" in info.value.hint
+
+
+_NESTED = {
+    "list": "SELECT [repeat('x', 1000000)] AS s FROM range(1000)",
+    "struct": "SELECT {'a': repeat('x', 1000000)} AS s FROM range(1000)",
+    "map": "SELECT map([1], [repeat('x', 1000000)]) AS s FROM range(1000)",
+    "union": "SELECT union_value(s := repeat('x', 1000000)) AS s FROM range(1000)",
+    "deep": "SELECT {'a': {'b': [map(['k'], [repeat('x', 1000000)])]}, 'c': 1} AS s FROM range(1000)",
+}
+
+
+class TestNestedTextIsCutInsideDuckDB:
+    """Round 2: only top-level VARCHAR/BLOB was cut, so the same value one level down was not.
+
+    DuckDB built its full vectors and Arrow converted each 256-row batch before the byte cap was
+    checked: 1.2 GB (1.4 GB for the union) for 1000 rows of one 1 MB string, then a 413.
+    """
+
+    @needs_resource
+    @pytest.mark.parametrize("shape", sorted(_NESTED))
+    def test_a_long_string_inside_a_nested_value(self, tmp_path, shape: str) -> None:
+        data = kit.write_parquet(tmp_path / "t.parquet", {"id": [1]})
+        growth, out = _peak_rss_growth_mb(
+            """
+            from pathlib import Path
+            r = query({"data": Path(sys.argv[1])}, sys.argv[2], limit=1000, fmt="json",
+                      query_timeout=60, max_chars=2000, memory_limit="512MB", threads=1)
+            print("ROWS", r.row_count, len(str(r.rows[-1][0])))
+            """,
+            str(data),
+            _NESTED[shape],
+        )
+        assert "ROWS 1000 " in out, out
+        # Before: 1208 MB (list, struct, map), 1454 MB (union), then InputTooLarge.
+        assert growth < 300, out
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT [repeat('y', 20), NULL] AS l FROM range(2) UNION ALL SELECT NULL "
+            "UNION ALL SELECT []",
+            "SELECT {'a': repeat('x', 20), 'b': 1, 'it''s \"q\"': 'éééééééééééé'} AS s "
+            "UNION ALL SELECT NULL",
+            "SELECT map([1, 2], [repeat('m', 30), NULL]) AS m UNION ALL SELECT NULL "
+            "UNION ALL SELECT map([], [])",
+            "SELECT map([repeat('k', 30)], [1]) AS long_keys",
+            "SELECT union_value(s := repeat('z', 20))::UNION(s VARCHAR, n INT) AS u "
+            "UNION ALL SELECT NULL UNION ALL SELECT union_value(n := 3)",
+            "SELECT ['abcdefghijkl', NULL]::VARCHAR[2] AS a UNION ALL SELECT NULL",
+            'SELECT \'{"k": "vvvvvvvvvvvvvvvvv"}\'::JSON AS j, [\'{"a": "bbbbbbbbbbbbb"}\'::JSON] AS jl',
+            "SELECT {'k': map(['a'], [[repeat('q', 30)]])} AS deep, [[repeat('b', 9)::BLOB]] AS b",
+            "SELECT row('abcdefghijklmnop', 1) AS r",
+            "SELECT [{'t': repeat('t', 40), 'n': i}] AS l, i FROM range(3) t(i) ORDER BY i DESC",
+        ],
+    )
+    def test_values_render_exactly_as_without_the_cut(self, joined, monkeypatch, sql) -> None:
+        cut = run(joined, sql, max_chars=7)
+        monkeypatch.setattr(tabular, "_clipped", lambda con, text, max_chars: text)
+        assert cut == run(joined, sql, max_chars=7)
+
+    def test_the_cut_is_bounded_and_falls_back_to_the_top_level(self, joined, monkeypatch) -> None:
+        sql = "SELECT [repeat('l', 50)] AS l, repeat('t', 50) AS t"
+        wrapped = tabular._clipped(tabular.connect(memory_limit="64MB", threads=1), sql, 9)
+        assert "list_transform" in wrapped
+        assert "left(#2, 10)" in wrapped
+        monkeypatch.setattr(tabular, "_MAX_CUT_SQL", 10)
+        wrapped = tabular._clipped(tabular.connect(memory_limit="64MB", threads=1), sql, 9)
+        assert "list_transform" not in wrapped  # too long: the top level only
+        assert "left(#2, 10)" in wrapped
+        assert run(joined, sql, max_chars=9).rows == [[["l" * 8 + "…"], "t" * 8 + "…"]]
+
+
+class TestValuesWithoutAPythonObject:
+    """to_pylist() raised on these, outside every handler: a bare 500 for preview and query."""
+
+    def test_nanosecond_times_in_a_query(self, joined) -> None:
+        result = run(
+            joined,
+            "SELECT '2024-01-01 00:00:00.000000001'::TIMESTAMP_NS AS t, "
+            "'2024-01-01 00:00:00.5'::TIMESTAMP_NS AS whole, 1 AS n",
+        )
+        assert result.rows == [["2024-01-01T00:00:00.000000001", "2024-01-01T00:00:00.500000", 1]]
+        assert result.types == ["timestamp[ns]", "timestamp[ns]", "int32"]
+
+    def test_nanosecond_columns_in_a_preview(self, tmp_path) -> None:
+        path = tmp_path / "ns.parquet"
+        table = pa.table(
+            {
+                "ts": pa.array([1, None], pa.timestamp("ns", "UTC")),
+                "t": pa.array([1, 2_000], pa.time64("ns")),
+                "d": pa.array([1, 3], pa.duration("ns")),
+                "l": pa.array([[1], []], pa.list_(pa.timestamp("ns"))),
+            }
+        )
+        pq.write_table(table, path, version="2.6", coerce_timestamps=None)
+        result = preview(path, columns=None, offset=0, limit=5, fmt="json", max_chars=99)
+        assert result.rows == [
+            [
+                "1970-01-01T00:00:00.000000001Z",
+                "00:00:00.000000001",
+                "1 ns",
+                ["1970-01-01T00:00:00.000000001"],
+            ],
+            [None, "00:00:00.000002000", "3 ns", []],
+        ]
+
+    def test_struct_fields_with_repeated_or_empty_names(self, tmp_path, joined) -> None:
+        assert run(joined, "SELECT row('abc', 1) AS r").rows == [[{"field_1": "abc", "field_2": 1}]]
+        path = tmp_path / "s.parquet"
+        kids = [pa.array([1, None]), pa.array(["x", "y"]), pa.array([3, 4])]
+        st = pa.StructArray.from_arrays(kids, names=["k", "v", "k"], mask=pa.array([False, True]))
+        pq.write_table(pa.table({"s": st, "n": [1, 2]}), path)
+        result = preview(path, columns=None, offset=0, limit=5, fmt="csv", max_chars=99)
+        assert result.text == 's,n\n"{""k"": 1, ""v"": ""x"", ""k_3"": 3}",1\n,2\n'
