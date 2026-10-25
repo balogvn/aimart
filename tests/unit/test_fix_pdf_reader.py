@@ -6,6 +6,7 @@ assembler for structures fpdf2 cannot produce), so no binary is committed.
 
 from __future__ import annotations
 
+import gc
 import shutil
 import time
 import zlib
@@ -145,6 +146,31 @@ def test_p1_drawing_objects_count_against_the_page_budget(
         _convert(src, tmp_path)
 
 
+def _form(content: bytes) -> bytes:
+    """A form XObject (object 6 holds the resources it shares with the page)."""
+    data = zlib.compress(content, 9)
+    head = b"<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources 6 0 R /Length %d "
+    return head % len(data) + b"/Filter /FlateDecode >>\nstream\n" + data + b"\nendstream"
+
+
+def test_p1_nested_form_xobjects_count_against_the_page_budget(tmp_path: Path) -> None:
+    # X1 draws X2 twice, X2 draws X3 twice, ...: 24 levels in 5 KB are 16M figures and not one
+    # glyph, so only counting figures stops it (it reached the 700 MB job cap in 13 s).
+    depth = 24
+    names = b" ".join(b"/X%d %d 0 R" % (i, 6 + i) for i in range(1, depth + 1))
+    forms = [_form(b"/X%d Do /X%d Do" % (i + 1, i + 1)) for i in range(1, depth)] + [_form(b"")]
+    page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources 6 0 R "
+    page += b"/Contents 5 0 R >>"
+    resources = b"<< /Font << /F1 3 0 R >> /XObject << %s >> >>" % names
+    src = tmp_path / "forms.pdf"
+    src.write_bytes(_raw_pdf(page, resources, *forms, content=b"/X1 Do /X1 Do"))
+    assert src.stat().st_size < 8_000
+    started = time.monotonic()
+    with pytest.raises(InputTooLarge, match="page 1"):
+        _convert(src, tmp_path)
+    assert time.monotonic() - started < 30
+
+
 def test_p1_each_page_is_closed_before_the_next_is_parsed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -180,6 +206,52 @@ def test_p1_each_page_is_closed_before_the_next_is_parsed(
         ("read", 3),
         ("close", 3),
     ]
+
+
+def _many_pages(path: Path, count: int) -> Path:
+    pdf = FPDF()
+    pdf.add_page()
+    _bordered_rows(pdf, _ROWS[:4])
+    for _ in range(count - 1):
+        pdf.add_page()
+    pdf.output(str(path))
+    return path
+
+
+def test_p1_only_the_pages_read_are_built(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # pdfplumber's doc.pages builds a Page (~2 KB) for every page before one is read: 100k
+    # empty pages in a 12 MB file took 200 MB and 12 s, and a few MB of object streams hold
+    # millions. Pages are now built one at a time, and only those that are read.
+    built: list[int] = []
+    page_class = pdf_reader.pdfplumber.page.Page
+    init = page_class.__init__
+
+    def spy(self: Any, *args: Any, **kwargs: Any) -> None:
+        init(self, *args, **kwargs)
+        built.append(self.page_number)
+
+    monkeypatch.setattr(page_class, "__init__", spy)
+    src = _many_pages(tmp_path / "long.pdf", 400)
+    report, rows = _convert(src, tmp_path, pdf_pages="1")
+    assert built == [1]
+    assert report.rows == 3
+    assert rows[0] == {"region": "Area0", "units": 100, "revenue": 1000.5}
+    built.clear()
+    shutil.rmtree(tmp_path / "work")
+    report, _ = _convert(src, tmp_path)
+    assert built == list(range(1, 301))
+    assert any("first 300 of 400 pages" in w for w in report.warnings)
+
+
+def test_p1_page_count_is_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(pdf_reader, "MAX_DOCUMENT_PAGES", 50)
+    src = _many_pages(tmp_path / "long.pdf", 51)
+    with pytest.raises(InputTooLarge, match="more than 50 pages") as info:
+        _convert(src, tmp_path, pdf_pages="1")
+    assert "split" in (info.value.hint or "").lower()
+    shutil.rmtree(tmp_path / "work")
+    report, _ = _convert(_many_pages(tmp_path / "ok.pdf", 50), tmp_path)
+    assert report.rows == 3
 
 
 # ---------------------------------------------------------------- P2: title above a table
@@ -364,6 +436,28 @@ def test_p5_reference_cycle_is_invalid_input_not_a_hang(tmp_path: Path) -> None:
             timeout_s=20,
         )
     assert info.value.http_status == 422
+
+
+@pytest.mark.parametrize(
+    ("page", "extra"),
+    [
+        (_PAGE % b"6 0 R", [b"6 0 R"]),  # /Contents refers to itself
+        (_PAGE.replace(b"<< /Font << /F1 3 0 R >> >>", b"6 0 R") % b"5 0 R", [b"7 0 R", b"6 0 R"]),
+        (_PAGE.replace(b"/F1 3 0 R", b"/F1 6 0 R") % b"5 0 R", [b"7 0 R", b"6 0 R"]),
+    ],
+    ids=["self-reference", "resources", "font"],
+)
+def test_p5_other_reference_cycles_fail_in_process(
+    tmp_path: Path, page: bytes, extra: list[bytes]
+) -> None:
+    # In-process (isolate_jobs=False) nothing kills a hang, so this test would never return.
+    src = tmp_path / "cycle.pdf"
+    src.write_bytes(_raw_pdf(page, *extra, content=b"BT /F1 12 Tf 10 10 Td (Hi) Tj ET"))
+    with pytest.raises(InvalidInput, match="reference cycle"):
+        _convert(src, tmp_path)
+    # pdfplumber's close() rebuilds the page list, raises again, and never closes its file: one
+    # leaked handle per failed PDF in an API process that runs jobs in-process.
+    gc.collect()
 
 
 def test_p5_resolve_never_returns_a_reference_and_bounds_chains() -> None:

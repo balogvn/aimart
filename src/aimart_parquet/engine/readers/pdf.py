@@ -20,11 +20,12 @@ exact and cheap. Strategy:
 5. The largest table wins unless the caller picks one (``pdf_table``); every table found is
    listed in the report, so nothing is chosen silently.
 
-Hostile PDFs are bounded before they cost memory or time: every glyph and shape the
-interpreter draws counts against a page and a document budget (pdfplumber builds a ~2 KB
-Python object per glyph, so 1M glyphs in a 1.6 KB file took a worker to 2 GB); each page's
-objects are released once its tables are read; and indirect-reference chains are cut at
-``MAX_REF_HOPS``, because pdfminer follows them with no cycle check.
+Hostile PDFs are bounded before they cost memory or time: every glyph, shape and form XObject
+the interpreter draws counts against a page and a document budget (pdfplumber builds a ~2 KB
+Python object per glyph, so 1M glyphs in a 1.6 KB file took a worker to 2 GB); pages are built
+one at a time, only those read, and released once their tables are read; the page count is
+capped at ``MAX_DOCUMENT_PAGES``; and indirect-reference chains are cut at ``MAX_REF_HOPS``,
+because pdfminer follows them with no cycle check.
 
 Scanned PDFs (pages that are only images) have no text to read and are rejected with a clear
 error rather than an empty table. Cells keep text only; types come from the shared type ladder.
@@ -41,9 +42,10 @@ import pdfplumber
 import pyarrow as pa
 from pdfminer.pdfdocument import PDFEncryptionError, PDFPasswordIncorrect
 from pdfminer.pdfinterp import PDFPageInterpreter
+from pdfminer.pdfpage import PDFPage
 from pdfminer.pdfparser import PDFSyntaxError
 from pdfminer.pdftypes import PDFObjRef
-from pdfplumber.page import PDFPageAggregatorWithMarkedContent
+from pdfplumber.page import Page, PDFPageAggregatorWithMarkedContent
 from pdfplumber.utils.exceptions import PdfminerException
 
 from aimart_parquet.engine.duck import ident
@@ -57,17 +59,20 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import duckdb
-    from pdfplumber.page import Page
     from pdfplumber.pdf import PDF
 
     from aimart_parquet.engine.limits import Limits
     from aimart_parquet.engine.models import ConvertOptions
 
 MAX_PAGES = 300
-# Glyphs plus shapes (paths, images) one page, and all pages read, may draw. A dense text page
-# is ~5,000 glyphs and a small-font landscape spreadsheet ~40,000; each costs ~2.3 KB until the
-# page is closed, so 100k bounds one page near 250 MB. 2M bounds a document's parse time near
-# 30 s, inside the convert deadline. Module constants so tests can lower them.
+# Pages a document may have at all. Counting walks the page tree (~60 us a page), and a few MB
+# of compressed object streams can declare millions of empty pages. 100k pages is more than any
+# 50 MB document with a readable table on its pages holds.
+MAX_DOCUMENT_PAGES = 100_000
+# Glyphs plus shapes (paths, images, form XObjects) one page, and all pages read, may draw. A
+# dense text page is ~5,000 glyphs and a small-font landscape spreadsheet ~40,000; each costs
+# ~2.3 KB until the page is closed, so 100k bounds one page near 250 MB. 2M bounds a document's
+# parse time near 30 s, inside the convert deadline. Module constants so tests can lower them.
 MAX_PAGE_OBJECTS = 100_000
 MAX_DOC_OBJECTS = 2_000_000
 # A real PDF never chains references more than a hop or two; 32 is generous and still instant.
@@ -149,7 +154,7 @@ class _Budget:
 
 
 class _CountingAggregator(PDFPageAggregatorWithMarkedContent):
-    """pdfplumber's own layout device, charging each glyph and shape to a ``_Budget``."""
+    """pdfplumber's own layout device, charging each glyph, shape and figure to a ``_Budget``."""
 
     def __init__(self, *args: Any, budget: _Budget, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -166,6 +171,12 @@ class _CountingAggregator(PDFPageAggregatorWithMarkedContent):
     def paint_path(self, *args: Any, **kwargs: Any) -> None:
         self.budget.spend()
         super().paint_path(*args, **kwargs)
+
+    def begin_figure(self, *args: Any, **kwargs: Any) -> None:
+        # Each form XObject drawn ('Do') is a figure object. X1 drawing X2 twice, X2 drawing X3
+        # twice, ...: 24 levels in 3 KB were 16M figures and no glyph, 700 MB in 13 s.
+        self.budget.spend()
+        super().begin_figure(*args, **kwargs)
 
 
 def _parse_layout(page: Page, budget: _Budget) -> None:
@@ -216,7 +227,7 @@ def parse_pages(spec: str | None, total: int) -> list[int]:
     """'1-3,7' -> [1, 2, 3, 7] (1-based, in range). None -> every page up to MAX_PAGES."""
     if not spec:
         return list(range(1, min(total, MAX_PAGES) + 1))
-    pages: list[int] = []
+    pages: set[int] = set()
     for part in spec.split(","):
         match = _RANGE.match(part)
         if not match:
@@ -231,18 +242,17 @@ def parse_pages(spec: str | None, total: int) -> list[int]:
             )
         # Clamp before iterating: '1-99999999999' once walked 1e11 numbers to keep three,
         # holding a job slot until the deadline.
-        pages.extend(range(start, min(end, total) + 1))
-    pages = sorted(set(pages))
+        pages.update(range(start, min(end, total) + 1))
+        if len(pages) > MAX_PAGES:
+            raise InvalidRequest(
+                f"pdf_pages selects more than {MAX_PAGES} pages; the limit is {MAX_PAGES}.",
+                hint="Narrow the range; read the rest in another call.",
+            )
     if not pages:
         raise InvalidRequest(
             f"pdf_pages {spec!r} selects no page of this {total}-page PDF.", hint="Check the range."
         )
-    if len(pages) > MAX_PAGES:
-        raise InvalidRequest(
-            f"pdf_pages selects {len(pages)} pages; the limit is {MAX_PAGES}.",
-            hint="Narrow the range.",
-        )
-    return pages
+    return sorted(pages)
 
 
 def _clean(raw: list[list[Any]]) -> list[list[str]]:
@@ -389,12 +399,36 @@ class _Scan:
     unruled: list[int] = field(default_factory=list)  # pages with text, no usable bordered table
 
 
+def _count_pages(doc: PDF) -> int:
+    total = 0
+    for total, _ in enumerate(PDFPage.create_pages(doc.doc), 1):
+        if total > MAX_DOCUMENT_PAGES:
+            raise InputTooLarge(
+                f"The PDF has more than {MAX_DOCUMENT_PAGES:,} pages.",
+                hint="Split it (e.g. qpdf --split-pages) and send the part with the table.",
+                limit=MAX_DOCUMENT_PAGES,
+            )
+    return total
+
+
 def _scan(doc: PDF, pages: list[int]) -> _Scan:
-    """Read ``pages`` in order, one page's objects in memory at a time, under one budget."""
+    """Read ``pages`` in order, one page's objects in memory at a time, under one budget.
+
+    Pages come from pdfminer's page tree walk, not pdfplumber's ``doc.pages``: that builds a
+    Page (~2 KB) for every page of the document before one is read (100k empty pages in a
+    12 MB file took 200 MB and 12 s), and builds them all again when the document closes.
+    """
     scan = _Scan()
+    if not pages:  # a document without pages
+        return scan
     budget = _Budget()
-    for number in pages:
-        page = doc.pages[number - 1]
+    wanted = set(pages)
+    for number, page_obj in enumerate(PDFPage.create_pages(doc.doc), 1):
+        if number > pages[-1]:
+            break
+        if number not in wanted:
+            continue
+        page = Page(doc, page_obj, page_number=number)
         try:
             _parse_layout(page, budget)
             if not page.chars:
@@ -407,7 +441,7 @@ def _scan(doc: PDF, pages: list[int]) -> _Scan:
                 if not scan.ruled:  # pointless once a bordered table exists: it wins
                     scan.aligned.extend(_aligned_tables(page, number))
         finally:
-            page.close()  # pdfplumber keeps every page's objects until the document closes
+            page.close()  # release its glyph objects before the next page is parsed
     return scan
 
 
@@ -516,8 +550,12 @@ def read_pdf(
 ) -> RawTable:
     warnings: list[str] = []
     try:
-        with pdfplumber.open(path) as doc:
-            total = len(doc.pages)
+        # The file is ours to close and pdfplumber's PDF is deliberately not closed: its close()
+        # builds a Page for every page of the document (see ``_scan``) to close each, and when
+        # building them is what failed (a reference cycle) it raised again and leaked the file.
+        with path.open("rb") as fh:
+            doc = pdfplumber.open(fh)
+            total = _count_pages(doc)
             pages = parse_pages(options.pdf_pages, total)
             if not options.pdf_pages and total > MAX_PAGES:
                 warnings.append(
