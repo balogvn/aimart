@@ -333,7 +333,7 @@ async def test_withheld_cleanup_failure_is_logged_not_raised(
 async def test_a_gate_without_a_store_leaves_no_output_provisional(
     settings: Settings, tmp_path: Path
 ) -> None:
-    # Outputs of a tracked call stay provisional (never counted, never evicted) until committed;
+    # Outputs of a tracked call stay provisional (never evicted) until committed;
     # a gate with nothing to commit them to must not track them, or they would stay so for good.
     from types import SimpleNamespace
 

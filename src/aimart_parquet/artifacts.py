@@ -103,10 +103,11 @@ _PUTS: contextvars.ContextVar[tuple[list[str], ...]] = contextvars.ContextVar(
 def track_puts() -> Iterator[list[str]]:
     """Collect the ids of artifacts stored inside the block, including by tasks it starts.
 
-    The payment layers wrap a paid call in this. What is stored inside stays provisional until
-    they call ``store.commit(ids)`` (paid) or ``discard_withheld`` (not paid): an output whose
-    settlement then failed used to evict paying customers' artifacts the moment it was stored.
-    An inner block reports to the outer ones too.
+    The payment layers wrap a paid call in this. What is stored inside stays provisional (it
+    counts toward the budget but is never evicted) until they call ``store.commit(ids)`` (paid)
+    or ``discard_withheld`` (not paid): an output whose settlement then failed used to stay in
+    the budget until its TTL, evicting paying customers' artifacts. An inner block reports to
+    the outer ones too.
     """
     produced: list[str] = []
     token = _PUTS.set((*_PUTS.get(), produced))
@@ -119,7 +120,7 @@ def track_puts() -> Iterator[list[str]]:
 def outputs_of(store: ArtifactStore | None) -> contextlib.AbstractContextManager[list[str]]:
     """``track_puts()`` for a paid call whose outputs will be committed to or deleted from
     ``store``. Without a store nothing would ever commit them, and a provisional artifact is
-    never counted or evicted, so nothing is tracked at all."""
+    never evicted, so nothing is tracked at all."""
     return track_puts() if store is not None else contextlib.nullcontext([])
 
 
