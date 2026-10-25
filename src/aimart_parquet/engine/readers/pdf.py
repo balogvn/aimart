@@ -37,6 +37,7 @@ error rather than an empty table. Cells keep text only; types come from the shar
 from __future__ import annotations
 
 import re
+import sys
 from bisect import bisect_right
 from dataclasses import dataclass, field
 from itertools import pairwise
@@ -44,11 +45,13 @@ from typing import TYPE_CHECKING, Any, NoReturn
 
 import pdfplumber
 import pyarrow as pa
+from pdfminer import pdftypes
 from pdfminer.pdfdocument import PDFEncryptionError, PDFPasswordIncorrect
 from pdfminer.pdfinterp import PDFPageInterpreter
 from pdfminer.pdfpage import PDFPage
 from pdfminer.pdfparser import PDFSyntaxError
-from pdfminer.pdftypes import PDFObjRef
+from pdfminer.pdftypes import PDFObjRef, resolve1
+from pdfplumber import pdf as plumber_pdf
 from pdfplumber.page import Page, PDFPageAggregatorWithMarkedContent
 from pdfplumber.table import Table, TableSettings
 from pdfplumber.utils.exceptions import PdfminerException
@@ -83,6 +86,10 @@ MAX_PAGE_OBJECTS = 100_000
 MAX_DOC_OBJECTS = 2_000_000
 # A real PDF never chains references more than a hop or two; 32 is generous and still instant.
 MAX_REF_HOPS = 32
+# Parts one nested object may unfold to when pdfminer resolves it whole (a font's /W widths or
+# /FontBBox). A CJK font's /W lists ~65k widths, a few hundred thousand parts at most; objects
+# that name a shared object twice per level unfold to 2**depth, 2**40 in 3 KB.
+MAX_RESOLVED_PARTS = 1_000_000
 _RANGE = re.compile(r"^\s*(\d+)\s*(?:-\s*(\d+))?\s*$")
 _TEXT_STRATEGY = {"vertical_strategy": "text", "horizontal_strategy": "text"}
 _TYPED = frozenset({"number", "date"})
@@ -90,6 +97,7 @@ _TYPED = frozenset({"number", "date"})
 _DATA = _TYPED | {"missing", "empty"}
 _YEAR = re.compile(r"(?:19|20)\d\d")
 _BOUNDED_MARK = "_aimart_bounded"
+_MAX_REASON = 300
 
 
 def _bound_reference_chains() -> None:
@@ -126,6 +134,65 @@ def _bound_reference_chains() -> None:
 
 
 _bound_reference_chains()
+
+
+def _resolve_all(x: object, default: object = None) -> Any:
+    """``pdfminer.pdftypes.resolve_all``, stopped after ``MAX_RESOLVED_PARTS`` parts.
+
+    pdfminer's copy walks a nested object path by path, so a shared object is walked once per
+    path to it. Not memoised instead: pdfminer logs what it could not parse with ``%r``, and
+    ``repr`` walks a memoised result path by path just the same.
+    """
+    left = MAX_RESOLVED_PARTS
+
+    def walk(obj: object) -> Any:
+        nonlocal left
+        left -= 1
+        if left < 0:
+            msg = f"a nested object unfolds to more than {MAX_RESOLVED_PARTS:,} parts"
+            raise PDFSyntaxError(msg)
+        while isinstance(obj, PDFObjRef):
+            obj = obj.resolve(default=default)
+        if isinstance(obj, list):
+            return [walk(v) for v in obj]
+        if isinstance(obj, dict):  # in place, as pdfminer's own: font code relies on it
+            for k, v in obj.items():
+                obj[k] = walk(v)
+        return obj
+
+    return walk(x)
+
+
+setattr(_resolve_all, _BOUNDED_MARK, True)
+
+
+def _unread_metadata(value: Any) -> Any:
+    return value
+
+
+def _walk_shared_objects_once() -> None:
+    """Stop the recursive walks pdfminer and pdfplumber make over nested objects from walking
+    a shared object once per path to it: 2**40 times for 40 levels in a 3 KB file.
+
+    A /Info dictionary naming the next dictionary twice per level, 40 levels deep, ran to the
+    deadline inside ``pdfplumber.open`` (memory stays flat, so no budget saw it): pdfplumber
+    resolves every metadata value with no visited set. Metadata is never read here, so it is
+    left unresolved. pdfminer's ``resolve_all`` (font widths and boxes) gets a part budget
+    (``_resolve_all``), in every module that imported it by name. The other walks are kept off
+    hostile input where they happen: page labels in ``read_pdf``, page boxes in
+    ``_flat_page_attrs``. Applied at import, so the forkserver and every child inherit it.
+    """
+    setattr(plumber_pdf, "resolve_and_decode", _unread_metadata)  # noqa: B010
+    original = pdftypes.resolve_all
+    if getattr(original, _BOUNDED_MARK, False):
+        return
+    ours = [m for n, m in sys.modules.items() if n.partition(".")[0] in {"pdfminer", "pdfplumber"}]
+    for module in ours:
+        if vars(module).get("resolve_all") is original:
+            setattr(module, "resolve_all", _resolve_all)  # noqa: B010
+
+
+_walk_shared_objects_once()
 
 
 class _Budget:
@@ -506,6 +573,29 @@ def _count_pages(doc: PDF) -> int:
     return total
 
 
+def _flat_page_attrs(page_obj: PDFPage) -> PDFPage:
+    """Give pdfplumber's Page the page's boxes and rotation as plain numbers.
+
+    pdfplumber resolves /MediaBox, /CropBox, /TrimBox, /BleedBox, /ArtBox and /Rotate with its
+    own recursive walk, which has no visited set: a /CropBox naming an array that names the
+    next one twice, 40 levels deep, ran out of memory (and its error message held the walk).
+    pdfminer has already read MediaBox, CropBox and Rotate one level deep, with defaults for
+    bad values; the other boxes are kept only when they are four numbers.
+    """
+    attrs = page_obj.attrs
+    attrs["MediaBox"] = list(page_obj.mediabox)
+    attrs["Rotate"] = page_obj.rotate
+    if "CropBox" in attrs:
+        attrs["CropBox"] = list(page_obj.cropbox)
+    for name in ("TrimBox", "BleedBox", "ArtBox"):
+        if name in attrs:
+            box = resolve1(attrs.pop(name))
+            values = [resolve1(v) for v in box] if isinstance(box, list) and len(box) == 4 else []
+            if len(values) == 4 and all(isinstance(v, int | float) for v in values):
+                attrs[name] = values
+    return page_obj
+
+
 def _scan(doc: PDF, pages: list[int]) -> _Scan:
     """Read ``pages`` in order, one page's objects in memory at a time, under one budget.
 
@@ -524,7 +614,7 @@ def _scan(doc: PDF, pages: list[int]) -> _Scan:
             break
         if number not in wanted:
             continue
-        page = Page(doc, page_obj, page_number=number)
+        page = Page(doc, _flat_page_attrs(page_obj), page_number=number)
         try:
             _parse_layout(page, budget)
             if not page.chars:
@@ -614,8 +704,10 @@ def _unwrap(exc: BaseException) -> BaseException:
 
 def _reason(exc: BaseException) -> str:
     inner = _unwrap(exc)
-    # PDFPasswordIncorrect and friends have an empty str(): name the class instead.
-    return str(inner) or type(inner).__name__
+    # PDFPasswordIncorrect and friends have an empty str(): name the class instead. Some quote
+    # the object they could not read, which a hostile file can make as large as it likes.
+    reason = str(inner) or type(inner).__name__
+    return reason if len(reason) <= _MAX_REASON else reason[: _MAX_REASON - 3] + "..."
 
 
 def _raise_unreadable(exc: Exception) -> NoReturn:
@@ -657,6 +749,9 @@ def read_pdf(
         # building them is what failed (a reference cycle) it raised again and leaked the file.
         with path.open("rb") as fh:
             doc = pdfplumber.open(fh)
+            # pdfminer walks the page-label number tree, with no visited set, before it yields
+            # the first page: a tree naming each child twice took 2**40 steps. Never read here.
+            doc.doc.catalog.pop("PageLabels", None)
             total = _count_pages(doc)
             pages = parse_pages(options.pdf_pages, total)
             if not options.pdf_pages and total > MAX_PAGES:

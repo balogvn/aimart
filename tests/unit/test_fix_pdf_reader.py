@@ -610,6 +610,186 @@ def test_p5_patch_is_idempotent() -> None:
     assert PDFObjRef.resolve is before
 
 
+# ---------------------------------------------------------------- RV4: shared-object DAGs
+
+
+def _assemble(objs: list[bytes], trailer: bytes = b"") -> bytes:
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, obj in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + obj + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1)
+    out += b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R %s>>\n" % (len(objs) + 1, trailer)
+    out += b"startxref\n%d\n%%%%EOF\n" % xref
+    return bytes(out)
+
+
+def _dag(first: int, depth: int, node: bytes, leaf: bytes) -> list[bytes]:
+    """Objects ``first``.. each naming the next one twice: 2**depth paths through ``depth``."""
+    return [node % (n + 1, n + 1) for n in range(first, first + depth - 1)] + [leaf]
+
+
+_DICT = b"<< /A %d 0 R /B %d 0 R >>"
+_LIST = b"[%d 0 R %d 0 R]"
+_GRID = [["Region", "Units"], ["North", "7"], ["South", "9"]]
+
+
+def _shared_dag_pdf(path: Path, case: str, depth: int = 40) -> Path:
+    """A bordered 2x3 table (rectangles and text, as fpdf2 draws them) plus one hostile DAG."""
+    ops = [b"BT /F2 10 Tf 50 760 Td (x) Tj ET"]
+    for j, row in enumerate(_GRID):
+        for k, cell in enumerate(row):
+            x, y = 50 + 100 * k, 700 - 20 * j
+            ops.append(b"%d %d 100 20 re S" % (x, y))
+            ops.append(b"BT /F1 10 Tf %d %d Td (%s) Tj ET" % (x + 5, y + 6, cell.encode()))
+    data = zlib.compress(b"\n".join(ops), 9)
+    catalog = b"<< /Type /Catalog /Pages 2 0 R >>"
+    page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] %s "
+    page += b"/Resources << /Font << /F1 3 0 R /F2 %s >> >> /Contents 5 0 R >>"
+    font2, extra, trailer, objs = b"3 0 R", b"", b"", list[bytes]()
+    if case.startswith("info"):  # pdfplumber.open resolves every /Info value, recursively
+        trailer = b"/Info 6 0 R "
+        objs = [b"<< /Title (t) /Keywords 7 0 R >>"]
+        objs += _dag(7, depth, _DICT if case == "info-dict" else _LIST, b"(leaf)")
+    elif case in {"CropBox", "TrimBox", "Rotate"}:  # pdfplumber's Page resolves these
+        extra = b"/%s 6 0 R" % case.encode()
+        objs = _dag(6, depth, _LIST, b"0")
+    elif case == "page-labels":  # pdfminer walks the labels' number tree to count pages
+        catalog = b"<< /Type /Catalog /Pages 2 0 R /PageLabels 6 0 R >>"
+        objs = _dag(6, depth, b"<< /Kids [%d 0 R %d 0 R] >>", b"<< /Nums [0 << /S /D >>] >>")
+    elif case == "font-widths":  # pdfminer resolves a CID font's /W whole
+        font2 = b"6 0 R"
+        objs = [
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H "
+            b"/DescendantFonts [7 0 R] >>",
+            b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X /CIDSystemInfo "
+            b"<< /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /W [1 [8 0 R]] >>",
+            *_dag(8, depth, _DICT, b"0"),
+        ]
+    elif case == "font-bbox":  # ... and a font descriptor's /FontBBox
+        font2 = b"6 0 R"
+        objs = [
+            b"<< /Type /Font /Subtype /TrueType /BaseFont /Xyz /FontDescriptor 7 0 R "
+            b"/FirstChar 32 /LastChar 32 /Widths [500] >>",
+            b"<< /Type /FontDescriptor /FontName /Xyz /Flags 32 /FontBBox 8 0 R >>",
+            *_dag(8, depth, _DICT, b"0"),
+        ]
+    head = [
+        catalog,
+        b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        page % (extra, font2),
+        b"<< /Length %d /Filter /FlateDecode >>\nstream\n" % len(data) + data + b"\nendstream",
+    ]
+    path.write_bytes(_assemble(head + objs, trailer))
+    return path
+
+
+# Unread (metadata, page labels) or read one level deep (page boxes): the table converts.
+_DAG_SKIPPED = ["info-dict", "info-list", "CropBox", "TrimBox", "Rotate", "page-labels"]
+# Read whole by pdfminer's font code: refused once the walk passes MAX_RESOLVED_PARTS.
+_DAG_REFUSED = ["font-widths", "font-bbox"]
+
+
+def _isolated(src: Path, work: Path) -> ConversionReport:
+    work.mkdir()
+    return run_isolated(
+        convert_file,
+        src,
+        work / "out.parquet",
+        filename=src.name,
+        options=ConvertOptions(),
+        workdir=work,
+        limits=Limits(),
+        timeout_s=20,
+    )
+
+
+@pytest.mark.parametrize("case", _DAG_SKIPPED + _DAG_REFUSED)
+def test_rv4_shared_object_dags_do_not_run_to_the_deadline(tmp_path: Path, case: str) -> None:
+    # Round-2 review: a 3 KB /Info whose dictionaries name the next one twice per level, 40
+    # levels deep, ran until the deadline: pdfplumber resolves metadata recursively with no
+    # visited set, so it walks 2**40 paths (memory stays low; no budget or hop limit helps).
+    # Page boxes, the page-label tree and font widths and boxes are walked the same way (or
+    # filled the 700 MB job cap). In a child with a deadline, so the unfixed walk fails this
+    # test (Timeout, or InputTooLarge from the cap) instead of hanging the suite.
+    src = _shared_dag_pdf(tmp_path / f"{case}.pdf", case)
+    assert src.stat().st_size < 5_000
+    if case in _DAG_REFUSED:
+        with pytest.raises(InvalidInput, match="nested object unfolds") as info:
+            _isolated(src, tmp_path / "work")
+        assert info.value.http_status == 422
+        return
+    report = _isolated(src, tmp_path / "work")
+    assert [c.name for c in report.columns] == ["region", "units"]
+    assert pq.read_table(tmp_path / "work" / "out.parquet").to_pylist() == [
+        {"region": "North", "units": 7},
+        {"region": "South", "units": 9},
+    ]
+
+
+@pytest.mark.parametrize("case", _DAG_SKIPPED + _DAG_REFUSED)
+def test_rv4_shared_object_dags_in_process(tmp_path: Path, case: str) -> None:
+    # In-process (isolate_jobs=False) nothing would stop the walk; fixed, it is quick.
+    src = _shared_dag_pdf(tmp_path / f"{case}.pdf", case)
+    started = time.monotonic()
+    if case in _DAG_REFUSED:
+        with pytest.raises(InvalidInput, match="nested object unfolds"):
+            _convert(src, tmp_path)
+    else:
+        report, rows = _convert(src, tmp_path)
+        assert report.rows == 2
+        assert rows[0] == {"region": "North", "units": 7}
+    assert time.monotonic() - started < 10
+
+
+def test_rv4_resolve_all_is_pdfminers_with_a_part_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pdfminer import pdffont, pdftypes
+    from pdfminer.pdfparser import PDFSyntaxError
+    from pdfminer.pdftypes import PDFObjRef
+
+    class Doc:
+        def __init__(self) -> None:
+            self.objs: dict[int, object] = {}
+
+        def getobj(self, objid: int) -> object:
+            return self.objs[objid]
+
+    assert pdffont.resolve_all is pdftypes.resolve_all  # pdffont imported it by name
+    doc = Doc()
+    doc.objs = {1: [PDFObjRef(doc, 2), 3], 2: {"w": PDFObjRef(doc, 3)}, 3: 500}
+    # Lists copied, dictionaries resolved in place, as pdfminer's own: font code relies on it.
+    assert pdftypes.resolve_all(PDFObjRef(doc, 1)) == [{"w": 500}, 3]
+    assert doc.objs[2] == {"w": 500}
+    monkeypatch.setattr(pdf_reader, "MAX_RESOLVED_PARTS", 100)
+    flat = list(range(99))  # the list and its 99 numbers: 100 parts
+    assert pdftypes.resolve_all(flat) == flat
+    with pytest.raises(PDFSyntaxError, match="more than 100 parts"):
+        pdftypes.resolve_all([*flat, 99])
+    shared = Doc()  # 20 levels naming the next twice: 2**20 paths, refused after 100 parts
+    shared.objs = {n: [PDFObjRef(shared, n + 1)] * 2 for n in range(1, 20)} | {20: 0}
+    with pytest.raises(PDFSyntaxError):
+        pdftypes.resolve_all(PDFObjRef(shared, 1))
+
+
+def test_rv4_patches_are_idempotent() -> None:
+    from pdfminer import pdftypes
+    from pdfplumber import pdf as plumber_pdf
+
+    before = (pdftypes.resolve_all, plumber_pdf.resolve_and_decode)
+    pdf_reader._walk_shared_objects_once()
+    assert (pdftypes.resolve_all, plumber_pdf.resolve_and_decode) == before
+
+
+def test_rv4_long_parser_messages_are_cut() -> None:
+    message = pdf_reader._reason(ValueError("Bounding box: " + "[" * 100_000))
+    assert len(message) < 400
+    assert message.startswith("Bounding box: [[")
+
+
 # ---------------------------------------------------------------- P6: degenerate bordered boxes
 
 
