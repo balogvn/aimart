@@ -70,7 +70,8 @@ This order is what guarantees that no caller pays for an error and no work is gi
    retries the same request with the header **`PAYMENT-SIGNATURE`** (base64 `PaymentPayload`).
 3. **Success** → the normal response plus the header **`PAYMENT-RESPONSE`** (base64
    settlement):
-   `{"success": true, "transaction": "0x…", "network": "eip155:84532", "payer": "0x…", "amount": "10000"}`.
+   `{"success": true, "transaction": "0x…", "network": "eip155:84532", "payer": "0x…", "amount": "2000"}`
+   (it settles exactly the quoted `amount`).
 4. **Rejected payment** → `402` again with body `{}`. The reason is in the new
    `PAYMENT-REQUIRED` header's `error` field. Clients and logs must read the header, because
    the body says nothing.

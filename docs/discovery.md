@@ -107,15 +107,20 @@ Two free, zero-cost signals tell you what agents tried to buy that you do not se
 - **`request_capability`** (MCP tool) / **`POST /v1/feedback`** (REST). Its description invites
   any agent to say what it needed, the formats involved and the most it would pay per call.
 
-Read them from the logs (Cloud Logging keeps them under its free tier):
+Both are logged as `demand_signal` lines. Without an admin token, those log lines are the
+interface (Cloud Logging keeps them under its free tier):
 
 ```bash
 gcloud logging read 'jsonPayload.msg="demand_signal"' --limit 100 --format json
 ```
 
-or, with `AIMART_ADMIN_TOKEN` set, `GET /v1/demand` with `Authorization: Bearer <token>` for
-the counters since the last restart. After a few weeks live, build the most requested
-format or tool next.
+With `AIMART_ADMIN_TOKEN` set, `GET /v1/demand` with `Authorization: Bearer <token>` also
+returns the counters since the last restart (without it, the endpoint answers 404). On Cloud
+Run, `deploy.yml` overwrites the service's secrets on every deploy, so a token set by hand does
+not survive: name a Secret Manager secret in the GitHub variable `GCP_SECRET_ADMIN_TOKEN`
+(`deploy/setup-gcp.sh` creates one with `SECRET_ADMIN_TOKEN=aimart-admin-token`) and deploy
+([deploy/README.md](../deploy/README.md#demand-report-get-v1demand)). After a few weeks live,
+build the most requested format or tool next.
 
 ### 10. Future work
 

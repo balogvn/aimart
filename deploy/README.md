@@ -3,7 +3,7 @@
 The hosted service runs on **Google Cloud Run** (us-central1, request-based billing, scale to
 zero), pulled straight from the public image `ghcr.io/balogvn/aimart-parquet`. GitHub Actions
 deploys it with no stored credential: Workload Identity Federation (WIF) exchanges the job's OIDC
-token for a short-lived Google token. The two secrets live in Secret Manager and never pass
+token for a short-lived Google token. The secrets live in Secret Manager and never pass
 through GitHub.
 
 ```
@@ -15,7 +15,7 @@ synthetic.yml (every 6 h) ─► scripts/smoke.py against production ─► issu
 
 | File | What it is |
 |---|---|
-| `setup-gcp.sh` | One-time, idempotent Google Cloud setup (APIs, service accounts, WIF, secrets, optional bucket). Prints the GitHub variables to set. |
+| `setup-gcp.sh` | One-time, idempotent Google Cloud setup (APIs, service accounts, WIF, secrets, optional bucket and admin token). Prints the GitHub variables to set. |
 | `smoke-flags.sh` | Turns the deploy configuration into `scripts/smoke.py` expectations; shared by deploy and synthetic checks. |
 | `modal_app.py` | Untested sketch for the Modal fallback. |
 | `../.github/workflows/deploy.yml` | The deploy: digest in, verified revision out, rollback on failure. |
@@ -82,6 +82,8 @@ PROJECT_ID=my-project deploy/setup-gcp.sh
 PROJECT_ID=my-project BUCKET=my-project-aimart-artifacts deploy/setup-gcp.sh
 # to keep an ML-DSA key you already publish, paste existing values instead of generating:
 PROJECT_ID=my-project SECRET_SOURCE=prompt deploy/setup-gcp.sh
+# to switch on GET /v1/demand, also create an admin token secret (section 2, "Demand report"):
+PROJECT_ID=my-project SECRET_ADMIN_TOKEN=aimart-admin-token deploy/setup-gcp.sh
 ```
 
 It is safe to re-run: it creates only what is missing and never adds a new secret version. It
@@ -107,7 +109,8 @@ so both the deploy and the synthetic check can read them; every value here is pu
 | `GCP_RUNTIME_SERVICE_ACCOUNT` | yes | the runtime SA, from the script |
 | `GCP_REGION` | no | `us-central1` (default) |
 | `GCP_SERVICE` | no | `aimart-parquet` (default) |
-| `GCP_SECRET_SIGNING_KEY`, `GCP_SECRET_SIGNING_SECRET` | no | secret names, if you changed them |
+| `GCP_SECRET_SIGNING_KEY`, `GCP_SECRET_SIGNING_SECRET` | no | secret names, if you changed them; a secret kept in another project is `projects/<project number>/secrets/<name>` (the runtime SA needs `secretAccessor` on it there) |
+| `GCP_SECRET_ADMIN_TOKEN` | no | name of the Secret Manager secret holding `AIMART_ADMIN_TOKEN`, e.g. `aimart-admin-token` (or its `projects/...` path, as above); unset: `GET /v1/demand` is off |
 | `AIMART_PUBLIC_BASE_URL` | yes | the run.app URL, or your custom domain |
 | `PRODUCTION_URL` | yes, for the synthetic check | same as above |
 | `AIMART_NETWORK_MODE` | no | `testnet` (default) or `mainnet` |
@@ -116,10 +119,19 @@ so both the deploy and the synthetic check can read them; every value here is pu
 | `AIMART_ARTIFACT_MAX_TOTAL_BYTES` | no | `268435456` (the default applied when no bucket is set) |
 | `AIMART_GCS_BUCKET` | no | bucket name; artifacts then leave the instance's RAM |
 | `AIMART_FACILITATOR_URLS` | no | comma-separated override of the default facilitators |
+| `AIMART_ENABLE_QUANTUM` | no | `true` serves the premium quantum tools (off by default); both smoke checks then require them |
 | `SMOKE_SIGNING_KEY_SHA256` | no, recommended | pins the public signing key (section 1.7) |
 
 `deploy.yml` always sets `AIMART_TRUST_FORWARDED_FOR=true` (Google's front end sets
 `X-Forwarded-For`) and omits any optional variable that is empty rather than sending `""`.
+
+**Every runtime setting goes through these variables.** `deploy.yml` deploys with
+`env_vars_update_strategy: overwrite` and `secrets_update_strategy: overwrite`: the variables and
+secret references it passes are the service's whole configuration. A setting changed by hand
+(`gcloud run services update --update-env-vars ...`, or the console) is removed by the next
+deploy, and a setting `deploy.yml` does not pass cannot be set at all; add it to the workflow
+and to this table first. The synthetic check reads the same variables, so a changed variable
+also changes what it expects.
 
 **Secrets** (all optional): `RELEASE_PLEASE_TOKEN` (fine-grained PAT or GitHub App token with
 contents + pull requests read/write on this repository, so the release PR triggers CI),
@@ -246,6 +258,27 @@ Mainnet is reversible: set `AIMART_NETWORK_MODE=testnet` and deploy.
 Logs Explorer with `resource.type="cloud_run_revision"`. Logs are JSON (`AIMART_LOG_JSON` is on
 by default), so Cloud Logging indexes the fields.
 
+### Demand report (`GET /v1/demand`)
+
+Demand signals (rejected file extensions, `request_capability` requests) are always logged as
+`demand_signal` lines; without a token, those log lines are the interface
+([docs/discovery.md](../docs/discovery.md)). To also serve the counters at `GET /v1/demand`:
+
+1. Create the secret: `PROJECT_ID=... SECRET_ADMIN_TOKEN=aimart-admin-token deploy/setup-gcp.sh`
+   generates a random token, stores it in Secret Manager and grants the runtime SA access.
+2. `gh variable set GCP_SECRET_ADMIN_TOKEN --repo balogvn/aimart --body aimart-admin-token`.
+3. Deploy. `deploy.yml` then adds `AIMART_ADMIN_TOKEN=aimart-admin-token:latest` to the service's
+   secrets; setting the variable by hand on the service would not survive the next deploy.
+4. Read it without echoing the token:
+
+   ```sh
+   TOKEN="$(gcloud secrets versions access latest --secret aimart-admin-token --project "$PROJECT_ID")"
+   curl -s -H "Authorization: Bearer $TOKEN" "$URL/v1/demand"; unset TOKEN
+   ```
+
+The counters cover the time since the instance started (one instance at most); the log lines
+cover everything Cloud Logging keeps. Without the token the endpoint answers 404.
+
 ---
 
 ## 3. Cost model
@@ -258,8 +291,8 @@ Run pricing page before relying on them.
 | CPU | 180,000 vCPU-seconds | $0.000024 per vCPU-second |
 | Memory | 360,000 GiB-seconds | $0.0000025 per GiB-second |
 | Requests | 2 million | $0.40 per million |
-| Secret Manager | 6 active versions, 10,000 accesses | we use 2 versions, 2 accesses per instance start |
-| Cloud Storage (optional) | 5 GB-months, 100 GB egress from North America | delete-after-1-day rule keeps storage near zero |
+| Secret Manager | 6 active versions, 10,000 accesses | we use 2 versions (3 with the admin token), one access per secret per instance start |
+| Cloud Storage (optional) | 5 GB-months, 100 GB egress from North America | expired artifacts are deleted within minutes; a delete-after-1-day rule is the backstop |
 | GHCR (public), GitHub Actions (public repo) | free | |
 
 - **Idle: $0.** Scale to zero; CPU is billed only while a request is in flight.
@@ -275,8 +308,16 @@ Run pricing page before relying on them.
   spend cap (1.2 A) is the control that bounds them; the alert budget (1.2 B) is how you hear
   about it.
 - **Artifacts:** without a bucket they sit in `/tmp`, which on Cloud Run is the instance's RAM
-  (counted inside the 2 GiB), hence the 256 MiB budget. With `AIMART_GCS_BUCKET`, downloads are
-  V4 signed GCS URLs and leave Cloud Run's 1 GiB egress allowance alone.
+  (counted inside the 2 GiB, wiped when the instance stops), hence the 256 MiB budget. With
+  `AIMART_GCS_BUCKET`, downloads are V4 signed GCS URLs and leave Cloud Run's 1 GiB egress
+  allowance alone.
+- **Retention** (what `/pricing` publishes as `data_retention`): an artifact becomes unreachable
+  at `AIMART_ARTIFACT_TTL_S` (60 minutes) and is normally deleted within minutes after that, by a
+  sweep that runs at most once a minute while the service has traffic (local files and their
+  GCS copies). A GCS copy whose local record was lost in an instance restart is caught by a
+  bucket-listing sweep (at most every 6 hours) or, worst case, by the bucket's 1-day lifecycle
+  rule from `setup-gcp.sh`: about a day. Without that rule there is no worst-case bound, so keep
+  it on any bucket you use.
 
 ---
 
@@ -302,7 +343,8 @@ Run pricing page before relying on them.
 | `unauthorized_client ... rejected by the attribute condition` | The token's repository or owner id differs from `setup-gcp.sh`'s `GITHUB_REPO`/`GITHUB_OWNER_ID`; re-run the script with the right values. |
 | `Permission 'iam.serviceAccounts.getAccessToken' denied` | The `workloadIdentityUser` binding is missing or names another repository; re-run the script. |
 | Revision fails to start: image pull error | The GHCR package is still private (1.6, step 3). |
-| Revision fails to start: secret access denied | Runtime SA lacks `secretAccessor` on that secret; re-run the script. |
+| Revision fails to start: secret access denied | Runtime SA lacks `secretAccessor` on that secret; re-run the script (with `SECRET_ADMIN_TOKEN=...` if `GCP_SECRET_ADMIN_TOKEN` is set). |
+| A setting you changed on the service is gone | The deploy overwrites env vars and secrets (1.4). Set it as a GitHub variable instead. |
 | Smoke fails on `payTo` / network | The service advertises a different payee or chain than the variables say. Treat as an incident: an unexpected `payTo` is revenue going elsewhere. |
 | Smoke fails on provenance / key fingerprint | `AIMART_SIGNING_KEY_MLDSA` is missing (ephemeral key) or was rotated without updating `SMOKE_SIGNING_KEY_SHA256`. |
 | MCP requests rejected with a host error | `AIMART_PUBLIC_BASE_URL` does not match the host being called; the MCP transport allows only that host (and localhost). |

@@ -25,6 +25,12 @@ Two stores sit behind one interface (`artifacts.py`):
 - `GcsArtifactStore`: for Cloud Run, where local disk vanishes on scale-to-zero (ADR 0004).
   Downloads are V4 signed URLs served by GCS, with a lifecycle rule as the cleanup backstop.
 
+**Amendment (review of 6f99145).** The TTL only made artifacts unreachable, while the
+published retention promised deletion. Expired artifacts and their GCS blobs are now deleted
+by a request-path sweep (at most once a minute); a bucket-listing sweep (at most every 6 h)
+catches blobs whose local record a restart lost, and the 1-day lifecycle rule is the last
+resort, which bounds the worst case at about a day ([privacy.md](../privacy.md)).
+
 Local stdio mode writes the file next to the input, or to `output_path`, and returns its
 `path`.
 

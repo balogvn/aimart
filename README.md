@@ -10,8 +10,10 @@ Parquet. You can then inspect the result (footer only), preview rows, and query 
 sandboxed, read-only DuckDB SQL, including joins across several files. Agents pay per call in
 USDC with [x402 v2](https://www.x402.org/). There is no signup and no API key.
 
-**Your data:** inputs are deleted when the call ends, converted files after 60 minutes, and file
-contents are never logged or used for training. Details: [docs/privacy.md](docs/privacy.md).
+**Your data:** inputs are deleted when the call ends. Converted files become unreachable after
+60 minutes and are normally deleted within minutes after that; with Cloud Storage the worst case
+is about a day (the bucket's 1-day lifecycle rule). File contents are never logged or used for
+training. Details: [docs/privacy.md](docs/privacy.md).
 
 Why it exists: an agent that reads a 100,000-row CSV as text spends a large share of its
 context on raw rows. With this service it reads a compact schema report and then asks targeted
@@ -78,7 +80,7 @@ curl -s -D - -o /dev/null -X POST "$URL/v1/convert" \
     "scheme": "exact",
     "network": "eip155:84532",
     "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
-    "amount": "10000",
+    "amount": "20000",
     "payTo": "0x…",
     "maxTimeoutSeconds": 300,
     "extra": {"name": "USDC", "version": "2"}
@@ -174,6 +176,19 @@ hosted service, which adds signed provenance.
 > To pay over MCP you need an x402-capable MCP client, such as the Python client in
 > [docs/agents-guide.md](docs/agents-guide.md). The local server never asks for payment.
 
+### Joins
+
+One query reads up to 8 tables in total: the top-level input is table `data`, and `tables` adds
+up to 7 more by name, for one query price. REST takes an object per table (`artifact_id`, or
+`url` of a Parquet file); the MCP tool takes the `artifact_id` string itself (a local path in
+local mode). With
+`sql` = `SELECT d.*, o.status FROM data d JOIN orders o USING (order_id)`:
+
+```text
+REST  POST /v1/query  {"artifact_id": "<invoices_id>", "sql": "...", "tables": {"orders": {"artifact_id": "<orders_id>"}}}
+MCP   query_parquet   {"artifact_id": "<invoices_id>", "sql": "...", "tables": {"orders": "<orders_id>"}}
+```
+
 ## Pricing
 
 Prices are the `Settings` defaults, in USDC per **successful** call. A call that fails (HTTP
@@ -185,7 +200,7 @@ deployment can override each price with `AIMART_PRICE_*`. Its live list is at `G
 | convert | `POST /v1/convert`, `POST /v1/convert/upload` (multipart) | `convert_to_parquet` | $0.02 |
 | inspect (footer only) | `POST /v1/inspect` | `inspect_parquet` | $0.002 |
 | preview | `POST /v1/preview` | `preview_parquet` | $0.002 |
-| query (one read-only SELECT; joins up to 8 files via `tables`) | `POST /v1/query` | `query_parquet` | $0.005 |
+| query (one read-only SELECT; up to 8 tables: `data` plus up to 7 more in `tables`) | `POST /v1/query` | `query_parquet` | $0.005 |
 | premium (off by default): quantum-kernel PCA | `POST /v1/quantum/compress` | `quantum_compress_features` | $0.50 |
 | premium (off by default): QAOA portfolio | `POST /v1/quantum/portfolio` | `quantum_optimize_portfolio` | $1.00 |
 
@@ -215,7 +230,7 @@ must be switched on explicitly by the operator. See [docs/payments.md](docs/paym
 | Stata | `.dta` | labels kept |
 | SAS | `.sas7bdat` `.xpt` | labels kept |
 | Parquet | `.parquet` `.pq` | re-typed and re-compressed |
-| PDF (digital) | `.pdf` | tables with or without borders; tables continuing across pages are merged; pick pages with `pdf_pages` (`"1-3,7"`) and a table with `pdf_table`; the report lists every table found. Scanned PDFs (images, no text layer) are rejected: no OCR |
+| PDF (digital) | `.pdf` | tables with or without borders; tables continuing across pages are merged; pick pages with `pdf_pages` (`"1-3,7"`) and a table with `pdf_table`; the report lists every table found. Scanned PDFs (images, no text layer) are rejected: no OCR. Password-protected PDFs are rejected with an error that says so |
 
 Any of these can also arrive gzip-, bz2- or zip-compressed. Detection uses magic bytes before
 extensions. Every column in the report carries its type, null count, rejected values with

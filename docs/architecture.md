@@ -72,6 +72,8 @@ flowchart LR
 6. **Artifact store.** The output goes to `LocalArtifactStore` (TTL disk, HMAC-signed links)
    or `GcsArtifactStore` (V4 signed URLs). The caller gets a reference (`artifact_id` and
    `download_url`), not the bytes ([ADR 0007](adr/0007-artifact-references-not-bytes.md)).
+   At the TTL an artifact becomes unreachable; a sweep on the request path deletes it soon
+   after ([privacy.md](privacy.md) has the retention promise and its worst case).
 7. **Provenance.** `Service._publish`, the single place every output passes through, signs a
    manifest with ML-DSA-65 ([ADR 0009](adr/0009-post-quantum-provenance.md)).
 8. **Settlement.** REST settles only after a response below 400. MCP settles only for a
@@ -82,7 +84,7 @@ flowchart LR
 | question | the one answer |
 |---|---|
 | what costs what, at which route or tool | `payments/pricing.py` `OPERATIONS`, `active_operations()` |
-| what this installation can serve (quantum extra present?) | `pricing.active_operations()` |
+| what this deployment serves (quantum extra installed and `AIMART_ENABLE_QUANTUM=true`?) | `pricing.active_operations(settings)` |
 | the configuration | `config.Settings` (`AIMART_*` environment variables) |
 | how an operation behaves | the `Service` method used by both REST and MCP |
 | the public contract (fields agents read) | `engine/models.py`, `quantum/models.py` |

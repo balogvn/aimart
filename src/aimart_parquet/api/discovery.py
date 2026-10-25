@@ -12,14 +12,16 @@ from typing import TYPE_CHECKING, Any
 from aimart_parquet import __version__
 from aimart_parquet.engine.detect import SUPPORTED_EXTENSIONS
 from aimart_parquet.payments.pricing import active_operations
+from aimart_parquet.service import MAX_QUERY_TABLES
 
 if TYPE_CHECKING:
     from aimart_parquet.config import Settings
 
 DESCRIPTION = (
-    "Converts messy CSV, JSON, Excel, SPSS, Stata and SAS files into clean, typed, "
-    "schema-validated, zstd-compressed Parquet — then inspects, previews and queries it with "
-    "DuckDB SQL. Built for AI agents: no signup, pay per call in USDC via x402."
+    "Converts messy CSV, JSON, Excel, SPSS, Stata and SAS files, and tables in digital (not "
+    "scanned) PDFs, into clean, typed, schema-validated, zstd-compressed Parquet — then "
+    "inspects, previews and queries it with DuckDB SQL, including joins across converted files. "
+    "Built for AI agents: no signup, pay per call in USDC via x402."
 )
 
 
@@ -67,13 +69,24 @@ def retention_policy(settings: Settings) -> dict[str, Any]:
     """What happens to caller data — stated once, derived from the settings that enforce it.
 
     Every buyer persona we asked raised data handling before price. These are facts about the
-    code paths (per-request work directories, artifact TTL, log fields), not aspirations.
+    code paths (per-request work directories, artifact TTL, log fields), not aspirations. The
+    TTL makes an artifact unreachable; deletion is a later sweep, run from the request path at
+    most once a minute (and over the bucket listing at most every 6 h), with the bucket's 1-day
+    lifecycle rule as the last resort. "Deleted at 60 minutes" was promised once and was false.
     """
     minutes = settings.artifact_ttl_s // 60
+    outputs = (
+        f"converted files become unreachable {minutes} minutes after creation and are normally "
+        "deleted within minutes after that (cleanup runs while the service has traffic)"
+    )
+    if settings.gcs_bucket:
+        outputs += (
+            "; worst case, the storage bucket's 1-day lifecycle rule deletes them about a day "
+            "after creation"
+        )
     return {
         "inputs": "deleted when the call finishes (each call works in its own temporary directory)",
-        "outputs": f"converted files are deleted {minutes} minutes after creation"
-        + (" (a 1-day storage lifecycle rule is the backstop)" if settings.gcs_bucket else ""),
+        "outputs": outputs,
         "logs": "request method, path, status and duration; never file contents",
         "training": "your data is never used to train models",
         "sharing": "none; the payment facilitator sees the payment, never the data",
@@ -128,14 +141,18 @@ def llms_txt(settings: Settings) -> str:
         "## Notes",
         "",
         "- Inputs: `url` (preferred), `content_base64` + `filename`, or `artifact_id` from an earlier convert.",
-        "- Data handling: inputs are deleted when the call ends, outputs after "
-        f"{settings.artifact_ttl_s // 60} minutes; file contents are never logged or used for training.",
+        "- Data handling: inputs are deleted when the call ends; "
+        f"{retention_policy(settings)['outputs']}. File contents are never logged or used for "
+        "training.",
         "- Missing something? Call the free `request_capability` tool (or POST /v1/feedback) with "
         "the task and what you would pay.",
         "- convert returns an `artifact_id` and a signed `download_url`; artifacts expire after "
         f"{settings.artifact_ttl_s // 60} minutes.",
         f"- Supported extensions: {', '.join(SUPPORTED_EXTENSIONS)} (optionally .gz/.bz2/.zip).",
-        "- query accepts one read-only SELECT over table `data`.",
+        "- query accepts one read-only SELECT. Its input is table `data`; `tables` joins up to "
+        f"{MAX_QUERY_TABLES - 1} more artifacts by name ({MAX_QUERY_TABLES} tables in total). "
+        'REST: `"tables": {"orders": {"artifact_id": "..."}}`; '
+        'MCP: `"tables": {"orders": "<artifact_id>"}`.',
         "",
         "## Optional",
         "",

@@ -5,10 +5,11 @@
 # hand is the same thing: dispatch this workflow with the previous release's digest.
 #
 # Configuration lives in GitHub variables, not here (deploy/README.md, "GitHub configuration"):
-# non-secret values only. The two secrets live in Google Secret Manager and are referenced by
-# name; neither GitHub nor this log ever holds them. Authentication is Workload Identity
-# Federation: this job's OIDC token is exchanged for a short-lived Google token, scoped by the
-# provider's attribute condition to this repository. There is no service-account key.
+# non-secret values only. The secrets (two, plus an optional admin token) live in Google Secret
+# Manager and are referenced by name; neither GitHub nor this log ever holds them.
+# Authentication is Workload Identity Federation: this job's OIDC token is exchanged for a
+# short-lived Google token, scoped by the provider's attribute condition to this repository.
+# There is no service-account key.
 name: Deploy
 
 on:
@@ -78,6 +79,7 @@ jobs:
           GCP_RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
           GCP_SECRET_SIGNING_KEY: ${{ vars.GCP_SECRET_SIGNING_KEY }}
           GCP_SECRET_SIGNING_SECRET: ${{ vars.GCP_SECRET_SIGNING_SECRET }}
+          GCP_SECRET_ADMIN_TOKEN: ${{ vars.GCP_SECRET_ADMIN_TOKEN }}
           AIMART_NETWORK_MODE: ${{ vars.AIMART_NETWORK_MODE }}
           AIMART_PAY_TO_EVM: ${{ vars.AIMART_PAY_TO_EVM }}
           AIMART_PAY_TO_SVM: ${{ vars.AIMART_PAY_TO_SVM }}
@@ -148,6 +150,23 @@ jobs:
             [[ "$line" != *$'\n'* && "$line" != *'"'* ]] || fail "variable values must not contain newlines or quotes"
           done
 
+          # Secret Manager references, resolved by Cloud Run at instance start. `latest` makes a
+          # rotation (new secret version) take effect on the next instance start. The deploy
+          # overwrites the service's secrets, so a secret not listed here does not exist in
+          # production: GET /v1/demand needs AIMART_ADMIN_TOKEN, hence the optional third.
+          secrets=(
+            "AIMART_SIGNING_KEY_MLDSA=${GCP_SECRET_SIGNING_KEY:-aimart-signing-key-mldsa}:latest"
+            "AIMART_SIGNING_SECRET=${GCP_SECRET_SIGNING_SECRET:-aimart-signing-secret}:latest"
+          )
+          [ -z "$GCP_SECRET_ADMIN_TOKEN" ] || secrets+=("AIMART_ADMIN_TOKEN=${GCP_SECRET_ADMIN_TOKEN}:latest")
+          # A secret is a name ([A-Za-z0-9_-]) or, for one kept in another project, the resource
+          # path Cloud Run takes: projects/<project number>/secrets/<name>. Anything else (a
+          # comma, `=`, a newline) would smuggle in another reference.
+          secret_re='^([A-Za-z0-9_-]{1,255}|projects/[a-z0-9-]{1,63}/secrets/[A-Za-z0-9_-]{1,255}):latest$'
+          for line in "${secrets[@]}"; do
+            [[ "${line#*=}" =~ $secret_re ]] || fail "invalid Secret Manager secret name in '${line%%=*}' (a name, or projects/<number>/secrets/<name>)"
+          done
+
           delim="EOF_$(openssl rand -hex 12)"
           {
             echo "env_vars<<${delim}"
@@ -156,11 +175,14 @@ jobs:
             echo "public_url=${base}"
             echo "region=${GCP_REGION:-us-central1}"
             echo "service=${GCP_SERVICE:-aimart-parquet}"
-            echo "secret_signing_key=${GCP_SECRET_SIGNING_KEY:-aimart-signing-key-mldsa}"
-            echo "secret_signing_secret=${GCP_SECRET_SIGNING_SECRET:-aimart-signing-secret}"
+            echo "secrets<<${delim}"
+            printf '%s\n' "${secrets[@]}"
+            echo "${delim}"
           } >> "$GITHUB_OUTPUT"
           echo "Environment for the new revision (all public values):"
           printf '  %s\n' "${lines[@]}"
+          echo "Secret Manager references (names only, never values):"
+          printf '  %s\n' "${secrets[@]}"
 
       - name: Authenticate to Google Cloud (Workload Identity Federation)
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
@@ -204,12 +226,11 @@ jobs:
           # By digest: the bytes that passed the release build, not whatever a tag points to now.
           image: ${{ env.IMAGE }}@${{ inputs.image_digest }}
           env_vars: ${{ steps.config.outputs.env_vars }}
-          env_vars_update_strategy: overwrite # the variables above are the whole truth
-          # Secret Manager references, resolved by Cloud Run at instance start. `latest` makes a
-          # rotation (new secret version) take effect on the next instance start.
-          secrets: |-
-            AIMART_SIGNING_KEY_MLDSA=${{ steps.config.outputs.secret_signing_key }}:latest
-            AIMART_SIGNING_SECRET=${{ steps.config.outputs.secret_signing_secret }}:latest
+          # The variables above are the whole truth: anything set by hand on the service
+          # (gcloud run services update) is removed by the next deploy.
+          env_vars_update_strategy: overwrite
+          # Secret Manager references, built and validated by the config step.
+          secrets: ${{ steps.config.outputs.secrets }}
           secrets_update_strategy: overwrite
           # Request-based billing (--cpu-throttling): CPU is billed only while a request is in
           # flight, which is what keeps an idle service inside the free tier. max-instances=1 is
