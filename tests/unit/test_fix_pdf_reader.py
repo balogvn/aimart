@@ -270,6 +270,55 @@ def test_p2_numeric_header_row_is_kept_as_before(tmp_path: Path) -> None:
     assert not any("above the header" in w for w in report.warnings)
 
 
+_YEARS = [["Region", "2023", "2024"], *_ROWS[1:]]
+
+
+@pytest.mark.parametrize("bordered", [True, False])
+def test_p2_blank_corner_header_survives_section_rows(tmp_path: Path, bordered: bool) -> None:
+    # Review of the first fix: a section row ('North' alone) right under a header with a blank
+    # corner became the header, and the real header was dropped as if it were a title.
+    rows = [["", "Units", "Revenue"], ["North", "", ""], *_ROWS[1:7], ["South", "", ""], *_ROWS[7:]]
+    pdf = FPDF()
+    pdf.add_page()
+    (_bordered_rows if bordered else _borderless_rows)(pdf, rows)
+    src = tmp_path / "sections.pdf"
+    pdf.output(str(src))
+    report, out = _convert(src, tmp_path)
+    assert [c.name for c in report.columns] == ["column_1", "units", "revenue"]
+    assert [c.type for c in report.columns] == ["string", "int64", "double"]
+    assert report.rows == 14
+    assert out[0] == {"column_1": "North", "units": None, "revenue": None}
+    assert out[1] == {"column_1": "Area0", "units": 100, "revenue": 1000.5}
+    assert not any("above the header" in w for w in report.warnings)
+
+
+def test_p2_title_above_a_header_of_years_is_dropped(tmp_path: Path) -> None:
+    # Years as column names look like a data row to the type check, so the title stayed the
+    # header ('revenue_by_region_us', 'd_thousands') and the header became data.
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", size=13)
+    pdf.set_xy(20, 30)
+    pdf.cell(150, 7, "Revenue by region (USD thousands)")
+    _borderless_rows(pdf, _YEARS)
+    src = tmp_path / "years_titled.pdf"
+    pdf.output(str(src))
+    report, rows = _convert(src, tmp_path)
+    assert [c.name for c in report.columns] == ["region", "c_2023", "c_2024"]
+    assert [c.type for c in report.columns] == ["string", "int64", "double"]
+    assert report.rows == 12
+    assert rows[0] == {"region": "Area0", "c_2023": 100, "c_2024": 1000.5}
+    assert any("above the header" in w and "Revenue by region" in w for w in report.warnings)
+
+
+def test_p2_years_are_names_only_where_the_body_is_not_years() -> None:
+    title = ["Projects by year", ""]
+    rows = [title, ["Start", "End"], ["2019", "2020"], ["2020", "2021"], ["2021", "2023"]]
+    assert pdf_reader._split_captions(rows) == (rows[1:], ["Projects by year"])
+    repeated = [["Totals", "", ""], ["Region", "2024", "2024"], *_ROWS[1:5]]  # not distinct
+    assert pdf_reader._split_captions(repeated) == (repeated, [])
+
+
 # ---------------------------------------------------------------- P4: page ranges
 
 
@@ -384,7 +433,7 @@ def test_p6_empty_bordered_grid_on_the_same_page(tmp_path: Path) -> None:
     assert [c.name for c in report.columns] == ["region", "units", "revenue"]
 
 
-def test_p6_borderless_page_after_a_bordered_page_is_listed_and_selectable(
+def test_p6_borderless_page_after_a_bordered_page_is_named_and_reachable(
     tmp_path: Path,
 ) -> None:
     pdf = FPDF()
@@ -395,16 +444,55 @@ def test_p6_borderless_page_after_a_bordered_page_is_listed_and_selectable(
     src = tmp_path / "mixed.pdf"
     pdf.output(str(src))
     report, _ = _convert(src, tmp_path)
-    # The bordered table stays the default, as before the per-page text pass existed (text
-    # alignment also turns contents pages into "tables"); the borderless one is now listed.
+    # The bordered table wins, as before (text alignment also turns contents pages into
+    # "tables"); the page that has none is named, with the pdf_pages value that searches it.
     assert report.rows == 2
-    assert len(report.available_sheets or []) == 2
-    assert any("ruling lines" in w for w in report.warnings)
+    assert report.available_sheets == ["table 0: page 1, 2 rows x 2 columns"]
+    assert any(
+        "page(s) 2 have no ruled table" in w and "pdf_pages='2'" in w for w in report.warnings
+    )
     shutil.rmtree(tmp_path / "work")
-    report, rows = _convert(src, tmp_path, pdf_table=1)
+    report, rows = _convert(src, tmp_path, pdf_pages="2")
     assert report.rows == 12
     assert rows[0] == {"region": "Area0", "units": 100, "revenue": 1000.5}
     assert any("text alignment" in w for w in report.warnings)
+
+
+def test_p6_text_pass_stops_once_a_bordered_table_is_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Running text alignment on every page without a ruled table took a 300-page report with
+    # one bordered table from 30 s to 76 s (review of the first fix): it costs ~3x the ruled pass.
+    searched: list[int] = []
+    aligned = pdf_reader._aligned_tables
+
+    def spy(page: Any, number: int) -> Any:
+        searched.append(number)
+        return aligned(page, number)
+
+    monkeypatch.setattr(pdf_reader, "_aligned_tables", spy)
+    pdf = FPDF()
+    pdf.add_page()
+    _borderless_rows(pdf, _ROWS)  # page 1: searched, before any bordered table is known
+    pdf.add_page()
+    _bordered_rows(pdf, _ROWS[:4])
+    for _ in range(3):
+        pdf.add_page()
+        _borderless_rows(pdf, _ROWS)
+    src = tmp_path / "report.pdf"
+    pdf.output(str(src))
+    report, rows = _convert(src, tmp_path)
+    assert searched == [1]
+    assert report.rows == 3
+    assert rows[0] == {"region": "Area0", "units": 100, "revenue": 1000.5}
+    assert report.available_sheets == ["table 0: page 2, 3 rows x 3 columns"]
+    assert any("page(s) 1,3-5 have no ruled table" in w for w in report.warnings)
+
+
+def test_p6_span_is_a_valid_pdf_pages_value() -> None:
+    assert pdf_reader._span([2]) == "2"
+    assert pdf_reader._span([1, 3, 4, 5, 9, 10]) == "1,3-5,9-10"
+    assert parse_pages(pdf_reader._span([1, 3, 4, 5, 9, 10]), 10) == [1, 3, 4, 5, 9, 10]
 
 
 def test_p6_bordered_table_beats_a_larger_contents_page(tmp_path: Path) -> None:
@@ -461,6 +549,47 @@ def test_p7_text_rows_under_a_numeric_column_are_not_a_continuation(tmp_path: Pa
     pdf.output(str(src))
     report, _ = _convert(src, tmp_path)
     assert len(report.available_sheets or []) == 2
+
+
+def test_p7_year_tables_on_consecutive_pages_stay_apart(tmp_path: Path) -> None:
+    # Review of the first fix: 'Department, 2023, 2024' on page 2 reads as a data row under the
+    # page-1 table's numeric columns, so a second table was merged into the first as body.
+    pdf = FPDF()
+    pdf.add_page()
+    _bordered_rows(pdf, _YEARS[:6])
+    pdf.add_page()
+    _bordered_rows(
+        pdf, [["Department", "2023", "2024"], ["Sales", "7", "1.50"], ["Ops", "9", "2.50"]]
+    )
+    src = tmp_path / "two_year_tables.pdf"
+    pdf.output(str(src))
+    report, rows = _convert(src, tmp_path)
+    assert report.available_sheets == [
+        "table 0: page 1, 5 rows x 3 columns",
+        "table 1: page 2, 2 rows x 3 columns",
+    ]
+    assert all(r["region"].startswith("Area") for r in rows)
+    shutil.rmtree(tmp_path / "work")
+    report, rows = _convert(src, tmp_path, pdf_table=1)
+    assert [c.name for c in report.columns] == ["department", "c_2023", "c_2024"]
+    assert rows == [
+        {"department": "Sales", "c_2023": 7, "c_2024": 1.5},
+        {"department": "Ops", "c_2023": 9, "c_2024": 2.5},
+    ]
+
+
+def test_p7_year_table_continuing_without_its_header_is_merged(tmp_path: Path) -> None:
+    pdf = FPDF()
+    pdf.add_page()
+    _bordered_rows(pdf, _YEARS[:8])
+    pdf.add_page()
+    _bordered_rows(pdf, _YEARS[8:])
+    src = tmp_path / "years_cont.pdf"
+    pdf.output(str(src))
+    report, rows = _convert(src, tmp_path)
+    assert report.rows == 12
+    assert {"region": "Area7", "c_2023": 107, "c_2024": 1049.5} in rows
+    assert len(report.available_sheets or []) == 1
 
 
 # ---------------------------------------------------------------- P8: encrypted PDFs

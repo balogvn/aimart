@@ -4,17 +4,21 @@ pdfplumber reads the PDF's own text positions — no OCR, no model — so digita
 exact and cheap. Strategy:
 
 1. Ruling-line detection first (bordered tables, the common case in generated reports).
-2. Text-alignment detection on every page that has no usable bordered table (borderless
+2. Text-alignment detection when the pages read hold no usable bordered table (borderless
    layouts). A 1-row or 1-column box (a note, a signature block) is not a usable table: it once
-   disabled the fallback for the whole document.
-3. The header is the row directly above the first data row: a title line above a table (or a
-   merged title cell) is dropped and reported, not used as column names.
+   disabled the fallback for the whole document. Text alignment is not kept for the other pages
+   of a document that has a bordered table, as before, and stops running once one is found: it
+   costs ~3x a page's ruling-line pass, and running it on every such page took a 300-page
+   report from 30 s to 76 s, toward the deadline. The report names those pages instead, so the
+   caller can point ``pdf_pages`` at them.
+3. The header is the widest row above the first data row: a title line above a table (or a
+   merged title cell) is dropped and reported, not used as column names; a section row ('North'
+   alone) between the header and the data stays a data row.
 4. A table that continues across pages is merged in page order: by its repeated header (the
    repeats dropped), or, with no repeated header, when the next page's table has the same width
    and starts with a row typed like the body (numbers where the body has numbers).
-5. The largest bordered table wins (the largest text-alignment one if none is bordered) unless
-   the caller picks one (``pdf_table``); every table found is listed in the report, so nothing
-   is chosen silently.
+5. The largest table wins unless the caller picks one (``pdf_table``); every table found is
+   listed in the report, so nothing is chosen silently.
 
 Hostile PDFs are bounded before they cost memory or time: every glyph and shape the
 interpreter draws counts against a page and a document budget (pdfplumber builds a ~2 KB
@@ -54,6 +58,7 @@ if TYPE_CHECKING:
 
     import duckdb
     from pdfplumber.page import Page
+    from pdfplumber.pdf import PDF
 
     from aimart_parquet.engine.limits import Limits
     from aimart_parquet.engine.models import ConvertOptions
@@ -72,6 +77,7 @@ _TEXT_STRATEGY = {"vertical_strategy": "text", "horizontal_strategy": "text"}
 _TYPED = frozenset({"number", "date"})
 # What a data row may hold under a typed column: a value, a missing-value token, or nothing.
 _DATA = _TYPED | {"missing", "empty"}
+_YEAR = re.compile(r"(?:19|20)\d\d")
 _BOUNDED_MARK = "_aimart_bounded"
 
 
@@ -291,10 +297,33 @@ def _filled(row: list[str]) -> int:
     return sum(1 for c in row if c)
 
 
-def _data_row(row: list[str], typed: list[int]) -> bool:
-    """A value or a missing-value token under some typed column, and no text under any."""
+def _year_names(row: list[str], typed: list[int], body: list[list[str]]) -> bool:
+    """Years as column names ('Region', '2023', '2024'): a header the type check reads as data.
+
+    Found reviewing the fixes below: a title above such a header became the column names again,
+    and a second year-comparison table on the next page ('Department', '2023', '2024') was
+    merged into the first as a body row. Distinct years under every filled typed column, where
+    the body of each of those columns is not mostly years (a 'Year' column holds data).
+    """
+    cells = {c: v for c in typed if (v := _cell(row, c))}
+    if not cells or len(set(cells.values())) != len(cells):
+        return False
+    if not all(_YEAR.fullmatch(v) for v in cells.values()):
+        return False
+    for c in cells:
+        values = _values(body, c)
+        if values and sum(bool(_YEAR.fullmatch(v)) for v in values) * 2 >= len(values):
+            return False
+    return True
+
+
+def _data_row(row: list[str], typed: list[int], body: list[list[str]]) -> bool:
+    """A value or a missing-value token under some typed column, no text under any, and not a
+    header of years (``_year_names``)."""
     kinds = [_kind(_cell(row, c)) for c in typed]
-    return all(k in _DATA for k in kinds) and any(k != "empty" for k in kinds)
+    if not all(k in _DATA for k in kinds) or all(k == "empty" for k in kinds):
+        return False
+    return not _year_names(row, typed, body)
 
 
 def _split_captions(rows: list[list[str]]) -> tuple[list[list[str]], list[str]]:
@@ -303,10 +332,12 @@ def _split_captions(rows: list[list[str]]) -> tuple[list[list[str]], list[str]]:
     Text alignment returns the whole page as one table, so a title line above a borderless
     table was rows[0] and became the column names ('quarterly_sales_by_regi', 'on', ...), with
     the real header as a data row that turned every numeric column into strings: a 200 for bad
-    data. The header is the row directly above the first data row (``_data_row``: a number,
-    date or missing-value token under a typed column and no text under any). Typed columns are
-    judged on the bottom half of the rows, which is body as long as there are no more leading
-    rows than data rows.
+    data. The header is the widest row above the first data row (``_data_row``: a number, date
+    or missing-value token under a typed column and no text under any), the lowest of equals.
+    Widest, not merely the row directly above: a section row ('North', '', '') under a header
+    with a blank corner ('', 'Units', 'Revenue') became the header and the real one was dropped.
+    Typed columns are judged on the bottom half of the rows, which is body as long as there are
+    no more leading rows than data rows.
 
     Rows are only dropped when every one is narrower than the body (fewer filled cells than
     most data rows), as titles and merged cells are: a body row with text where numbers belong
@@ -319,10 +350,11 @@ def _split_captions(rows: list[list[str]]) -> tuple[list[list[str]], list[str]]:
     typed = [c for c in range(len(rows[0])) if _typed_share(_values(tail, c)) >= 0.8]
     if not typed:
         return rows, []
-    first = next((i for i, row in enumerate(rows) if _data_row(row, typed)), None)
-    if first is None:
+    first = next((i for i, row in enumerate(rows) if _data_row(row, typed, tail)), None)
+    if not first:  # no data row, or data from the first row on: nothing to choose
         return rows, []
-    header = max(0, first - 1)
+    widest = max(_filled(r) for r in rows[:first])
+    header = max(i for i in range(first) if _filled(rows[i]) == widest)
     if header == 0:
         return rows, []
     body_width = Counter(_filled(r) for r in rows[header + 1 :]).most_common(1)[0][0]
@@ -331,19 +363,52 @@ def _split_captions(rows: list[list[str]]) -> tuple[list[list[str]], list[str]]:
     return rows[header:], [" ".join(c for c in r if c) for r in rows[:header]]
 
 
-def _page_tables(page: Page, number: int) -> list[_Found]:
+def _ruled_tables(page: Page, number: int) -> list[_Found]:
     found = []
     for raw in page.extract_tables():
         rows, captions = _split_captions(_clean(raw))
         if _usable(rows):
             found.append(_Found(number, rows, "ruling lines", captions))
-    if found or not page.chars:
-        return found
+    return found
+
+
+def _aligned_tables(page: Page, number: int) -> list[_Found]:
+    found = []
     for raw in page.extract_tables(_TEXT_STRATEGY):
         rows, captions = _split_captions(_clean(raw))
         if _looks_tabular(rows):
             found.append(_Found(number, rows, "text alignment", captions))
     return found
+
+
+@dataclass
+class _Scan:
+    has_text: bool = False
+    ruled: list[_Found] = field(default_factory=list)
+    aligned: list[_Found] = field(default_factory=list)
+    unruled: list[int] = field(default_factory=list)  # pages with text, no usable bordered table
+
+
+def _scan(doc: PDF, pages: list[int]) -> _Scan:
+    """Read ``pages`` in order, one page's objects in memory at a time, under one budget."""
+    scan = _Scan()
+    budget = _Budget()
+    for number in pages:
+        page = doc.pages[number - 1]
+        try:
+            _parse_layout(page, budget)
+            if not page.chars:
+                continue
+            scan.has_text = True
+            bordered = _ruled_tables(page, number)
+            scan.ruled.extend(bordered)
+            if not bordered:
+                scan.unruled.append(number)
+                if not scan.ruled:  # pointless once a bordered table exists: it wins
+                    scan.aligned.extend(_aligned_tables(page, number))
+        finally:
+            page.close()  # pdfplumber keeps every page's objects until the document closes
+    return scan
 
 
 def _continues(table: _Table, rows: list[list[str]]) -> bool:
@@ -352,12 +417,24 @@ def _continues(table: _Table, rows: list[list[str]]) -> bool:
     Without this, a table whose header is not repeated on page 2 split in two: page 2's first
     data row became the second table's header ('area7', 'c_107', ...) and appeared in neither.
     Continuation needs the same width and a first row that is a data row under the columns
-    typed in ``table``'s body (text there is what a new table's header looks like).
+    typed in ``table``'s body (text there, or years, is what a new table's header looks like).
     """
     if len(rows[0]) != len(table.header):
         return False
     typed = [c for c in range(len(table.header)) if _typed_share(_values(table.rows, c)) >= 0.8]
-    return bool(typed) and _data_row(rows[0], typed)
+    return bool(typed) and _data_row(rows[0], typed, table.rows)
+
+
+def _span(pages: list[int]) -> str:
+    """[2, 3, 4, 7] -> '2-4,7': a pdf_pages value the caller can send back as is."""
+    parts: list[str] = []
+    start = prev = pages[0]
+    for page in [*pages[1:], 0]:
+        if page != prev + 1:
+            parts.append(str(start) if start == prev else f"{start}-{prev}")
+            start = page
+        prev = page
+    return ",".join(parts)
 
 
 def _merge(found: list[_Found]) -> list[_Table]:
@@ -446,27 +523,25 @@ def read_pdf(
                 warnings.append(
                     f"read the first {MAX_PAGES} of {total} pages; pass pdf_pages for the rest"
                 )
-            budget = _Budget()
-            has_text = False
-            found: list[_Found] = []
-            for number in pages:
-                page = doc.pages[number - 1]
-                try:
-                    _parse_layout(page, budget)
-                    has_text = has_text or bool(page.chars)
-                    found.extend(_page_tables(page, number))
-                finally:
-                    page.close()  # one page's objects in memory at a time, not the document's
+            scan = _scan(doc, pages)
     except AimartError:
         raise
     except Exception as exc:  # noqa: BLE001 - every parser failure becomes a typed error
         _raise_unreadable(exc)
-    if not has_text:
+    if not scan.has_text:
         raise InvalidInput(
             "The PDF has no text layer (scanned pages are images).",
             hint="Only digital PDFs are supported; scanned documents need OCR, which this service does not do.",
         )
-    tables = _merge(found)
+    if scan.ruled and scan.unruled:
+        # Text alignment also reads a table of contents or figure-heavy prose as a "table",
+        # often a larger one, so a bordered table wins; say where borderless ones may be.
+        span = _span(scan.unruled)
+        warnings.append(
+            f"page(s) {span} have no ruled table and were not searched for borderless ones; "
+            f"pass pdf_pages='{span}' to search them"
+        )
+    tables = _merge(scan.ruled or scan.aligned)
     if not tables:
         raise InvalidInput(
             "No tables were found in the PDF.",
@@ -481,13 +556,7 @@ def read_pdf(
             )
         index = options.pdf_table
     else:
-        # A bordered table, when there is one, beats any text-alignment table, as it did when
-        # the text pass ran only for documents without one: text alignment also reads a table
-        # of contents or a page of figures-heavy prose as a "table", often a larger one.
-        index = max(
-            range(len(tables)),
-            key=lambda i: (tables[i].strategy == "ruling lines", tables[i].cells),
-        )
+        index = max(range(len(tables)), key=lambda i: tables[i].cells)
     chosen = tables[index]
     if len(tables) > 1:
         warnings.append(
