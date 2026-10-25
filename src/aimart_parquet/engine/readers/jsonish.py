@@ -138,15 +138,18 @@ def _collides(node: Any, kind: _Kind) -> bool:
     return any(_collides(v, fields.get(_fold(k))) for k, v in node.items())
 
 
-def _record_kinds(names: list[str], types: list[DuckDBPyType], structure: Any) -> dict[str, _Kind]:
+def _record_kinds(names: list[str], types: list[DuckDBPyType]) -> dict[str, _Kind]:
     """Each record key's DuckDB type, from the lenient read's columns.
 
     Columns are named after record keys, except when two keys differ only by case: DuckDB then
-    names them itself (``id``, ``ID_1``), and no key can be matched to its column with certainty,
-    so all are unknown.
+    names them itself (``id``, ``ID_1``), and a real key could be called ``ID_1`` too. When a
+    name looks like that, no key can be matched to its column with certainty: all are unknown.
     """
-    if not isinstance(structure, dict) or len({_fold(k) for k in structure}) < len(structure):
-        return {}
+    folds = {_fold(name) for name in names}
+    for name in names:
+        base, _, number = name.rpartition("_")
+        if base and number.isdigit() and _fold(base) in folds:
+            return {}
     return dict(zip(names, types, strict=True))
 
 
@@ -271,16 +274,12 @@ def _load(con: duckdb.DuckDBPyConnection, path: Path, fmt: str, workdir: Path) -
         con.execute(f"CREATE TABLE {table} AS SELECT * FROM {_read_json_sql(path, fmt)}")
         lenient = con.sql(f"SELECT * FROM {table}")
         names, types = lenient.columns, lenient.types
-    row = con.execute(
-        f"SELECT json_group_structure(json) FROM {_objects_sql(path, fmt)}"
-    ).fetchone()
-    structure = row[0] if row else None
-    try:
-        columns = _record_kinds(names, types, json.loads(structure or "null"))
-    except RecursionError as exc:
-        raise InvalidInput(_TOO_DEEP, hint="Flatten the document before sending.") from exc
+    columns = _record_kinds(names, types)
     if not collides:
-        if structure is None or not _structure_collides(structure, columns):
+        row = con.execute(
+            f"SELECT json_group_structure(json) FROM {_objects_sql(path, fmt)}"
+        ).fetchone()
+        if not row or row[0] is None or not _structure_collides(row[0], columns):
             return []
         con.execute(f"DROP TABLE {table}")
     renamed_path = workdir / "records_renamed.ndjson"

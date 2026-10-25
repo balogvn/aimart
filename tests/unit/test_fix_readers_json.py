@@ -326,3 +326,19 @@ def test_without_the_lenient_types_every_object_is_renamed(tmp_path, monkeypatch
     monkeypatch.setattr(jsonish, "_read_json_sql", lenient_fails)
     result = kit.convert_bytes(tmp_path, "x.json", json.dumps(PAIRS))
     assert result.rows["a"] == [{"k": 1, "K_2": 2}, {"k": 3, "K_2": 4}]
+
+
+@pytest.mark.parametrize(
+    ("names", "known"),
+    [
+        (["id", "counts"], True),
+        (["id", "ID_1"], False),  # DuckDB's name for a second "ID"
+        (["price", "price_1"], False),  # or two real keys: cannot tell, so unknown
+        (["a_1", "b_2"], True),
+    ],
+)
+def test_record_keys_are_matched_to_columns_only_when_certain(names, known) -> None:
+    import duckdb
+
+    types = [duckdb.sqltype("BIGINT")] * len(names)
+    assert bool(jsonish._record_kinds(names, types)) is known
