@@ -81,6 +81,19 @@ class Settings(BaseSettings):
         default=True,
         description="Run DuckDB-heavy jobs in a child process (crash isolation, hard deadline).",
     )
+    job_memory_limit_mb: int = Field(
+        default=700,
+        ge=0,
+        description=(
+            "Resident memory (MB) one isolated job may use; over it the job is killed and the "
+            "call fails with 413 input_too_large, unpaid. Sized for a 2 GiB instance: the API "
+            "(~250 MB) and the forkserver (~250 MB) plus max_concurrent_jobs=2 jobs at 700 MB, "
+            "since a 1.6 KB PDF or a query of huge strings once took one job to 2 GB. On Linux "
+            "it includes the ~160 MB of preloaded engine each child shares with the forkserver. "
+            "Ordinary inputs peak at 250-500 MB; about 200 MB of decompressed CSV reaches the "
+            "limit. 0 disables it. Needs isolate_jobs (the parent polls the child's RSS)."
+        ),
+    )
     queue_wait_s: float = 10.0
     duckdb_memory_limit: str = "1GB"
     duckdb_threads: int = 2
