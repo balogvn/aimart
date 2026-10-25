@@ -158,8 +158,9 @@ def test_capacity_evicts_oldest_first(tmp_path: Path) -> None:
     first = store.put(src_file(tmp_path, b"a" * 1000, "1"), "1.parquet")
     one_size = sum(p.stat().st_size for p in (store.root / first.id).iterdir())
     second = store.put(src_file(tmp_path, b"b" * 1000, "2"), "2.parquet")
-    age(store.root / first.id, 300)
-    age(store.root / second.id, 200)
+    # Older than the minimum residency: a just-delivered output is never evicted.
+    age(store.root / first.id, artifacts.MIN_RESIDENCY_S + 300)
+    age(store.root / second.id, artifacts.MIN_RESIDENCY_S + 200)
 
     store.max_total_bytes = 2 * one_size + 10  # room for two, not three
     third = store.put(src_file(tmp_path, b"c" * 1000, "3"), "3.parquet")

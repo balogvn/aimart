@@ -149,7 +149,9 @@ class Service:
 
         Taken before any input is materialized. The slot used to be taken only around the
         engine call, so a query naming 8 URLs downloaded up to 400 MB onto the RAM disk and
-        only then learned the server was busy.
+        only then learned the server was busy. The stored artifacts the operation reads stay on
+        disk until it ends (``store.hold``): on GCS, fetching a query's second table evicted
+        the cached copy of its first, and the join failed on a missing file.
         """
         stats = self._limiter.statistics()
         if (
@@ -160,7 +162,8 @@ class Service:
                 "The server is at capacity.", hint="Retry in a few seconds; you were not charged."
             )
         async with self._limiter:
-            yield
+            with self.store.hold():
+                yield
 
     async def _execute(
         self, fn: Callable[..., T], *args: Any, timeout_s: float, isolate: bool, **kwargs: Any

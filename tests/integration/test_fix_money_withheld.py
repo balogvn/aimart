@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +22,7 @@ from x402 import SettleResponse, parse_payment_required
 from x402.http.clients.httpx import PaymentError
 
 import aimart_testkit as kit
+from aimart_parquet import artifacts
 from aimart_parquet.engine.models import ConvertOptions
 from aimart_parquet.service import SourceRef
 
@@ -100,13 +103,27 @@ async def test_output_over_the_artifact_budget_is_413_and_never_settled(
 async def test_output_that_fits_is_stored_and_downloadable(
     make_settings: Callable[..., Settings],
 ) -> None:
+    # The budget holds one. Round 1 let the second output evict the first right away, so the
+    # first caller's paid link was dead: now a just-delivered output stays, and the second
+    # caller is refused (503, not charged) until the first is old enough to make room.
     settings = make_settings(artifact_max_total_bytes=12_000)
-    async with kit.running_app(settings) as h:
+    fake = kit.FakeFacilitator()
+    async with kit.running_app(settings, facilitator=fake) as h:
         first = (await h.paying.post("/v1/convert", **convert_body(name="1.csv"))).json()
-        second = (await h.paying.post("/v1/convert", **convert_body(name="2.csv"))).json()
-        assert await download_status(h, second["artifact"]) == 200
-        # The budget holds one: the older paid artifact made room, the new one never does.
-        assert stored(settings) == {second["artifact"]["id"]}
+        refused = await h.paying.post("/v1/convert", **convert_body(name="2.csv"))
+        assert refused.status_code == 503, refused.text
+        assert refused.json()["error"]["code"] == "busy"
+        assert "not charged" in refused.json()["error"]["hint"]
+        assert "payment-response" not in refused.headers
+        assert len(fake.settled) == 1
+        assert await download_status(h, first["artifact"]) == 200
+
+        then = time.time() - artifacts.MIN_RESIDENCY_S - 60
+        os.utime(settings.artifact_dir / first["artifact"]["id"], (then, then))
+        third = (await h.paying.post("/v1/convert", **convert_body(name="3.csv"))).json()
+        assert await download_status(h, third["artifact"]) == 200
+        # The older paid artifact made room; the new one never does.
+        assert stored(settings) == {third["artifact"]["id"]}
         assert await download_status(h, first["artifact"]) == 404
 
 
@@ -114,7 +131,7 @@ async def test_output_that_fits_is_stored_and_downloadable(
 async def test_rest_settlement_failure_deletes_the_withheld_output(
     make_settings: Callable[..., Settings],
 ) -> None:
-    settings = make_settings(artifact_max_total_bytes=12_000)
+    settings = make_settings(artifact_max_total_bytes=20_000)  # room for two outputs
     fake = kit.FakeFacilitator()
     async with kit.running_app(settings, facilitator=fake) as h:
         paid = await h.paying.post("/v1/convert", **convert_body(name="paid.csv"))

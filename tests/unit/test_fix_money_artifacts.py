@@ -4,6 +4,7 @@ deleting expired GCS blobs at the TTL (G1), against a fake bucket that records e
 from __future__ import annotations
 
 import datetime as dt
+import os
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -11,7 +12,7 @@ import pytest
 
 from aimart_parquet import artifacts
 from aimart_parquet.artifacts import GcsArtifactStore, LocalArtifactStore, track_puts
-from aimart_parquet.errors import AimartError, ArtifactNotFound, InputTooLarge
+from aimart_parquet.errors import AimartError, ArtifactNotFound, Busy, InputTooLarge
 from fixtures.money.fake_gcs import FakeBlob, FakeClient, key
 
 if TYPE_CHECKING:
@@ -36,6 +37,13 @@ def folders(store: LocalArtifactStore) -> set[str]:
     return {p.name for p in store.root.iterdir() if p.is_dir() and not p.name.startswith(".")}
 
 
+def delivered_long_ago(store: LocalArtifactStore, *ids: str) -> None:
+    """Age artifacts past the minimum residency, so capacity may evict them."""
+    then = time.time() - artifacts.MIN_RESIDENCY_S - 60
+    for artifact_id in ids:
+        os.utime(store.root / artifact_id, (then, then))
+
+
 # ------------------------------------------------------------------------------ M1: the budget
 def test_an_output_bigger_than_the_whole_budget_is_refused_before_storing(tmp_path: Path) -> None:
     # Before: put() stored it, enforce_capacity() evicted it (and every older artifact), and the
@@ -58,6 +66,7 @@ def test_an_output_bigger_than_the_whole_budget_is_refused_before_storing(tmp_pa
 def test_capacity_never_evicts_the_artifact_just_written(tmp_path: Path) -> None:
     store = store_at(tmp_path / "store")
     first = store.put(src_file(tmp_path, DATA, "1"), "1.parquet")
+    delivered_long_ago(store, first.id)
     # The data fits the budget but data + meta.json does not: before, the new artifact was
     # evicted right after the older one, and put() still returned it.
     store.max_total_bytes = len(DATA) + 10
@@ -73,6 +82,7 @@ def test_enforce_capacity_keeps_the_named_artifact(tmp_path: Path) -> None:
     store = store_at(tmp_path / "store")
     a = store.put(src_file(tmp_path, DATA, "a"), "a.parquet")
     b = store.put(src_file(tmp_path, DATA, "b"), "b.parquet")
+    delivered_long_ago(store, a.id, b.id)
     store.max_total_bytes = 1
     store.enforce_capacity(keep=a.id)
     assert folders(store) == {a.id}
@@ -106,23 +116,23 @@ def test_track_puts_records_only_inside_the_block(tmp_path: Path) -> None:
     assert after.id not in produced
 
 
-def test_provisional_outputs_neither_evict_nor_are_evicted_until_committed(
+def test_provisional_outputs_count_and_are_never_evicted_until_committed(
     tmp_path: Path,
 ) -> None:
-    # A paid call's output is stored before settlement. It used to evict older (paid) artifacts
-    # at once, and stayed when settlement then failed.
+    # A paid call's output is stored before settlement. Round 1 left it out of the count (the
+    # RAM disk then held the budget plus every unsettled output); it counts, and is never
+    # evicted until the payment layer commits it.
     store = store_at(tmp_path / "store")
-    paid = store.put(src_file(tmp_path, DATA, "p"), "p.parquet")
-    store.max_total_bytes = len(DATA) + 200  # room for one artifact and its meta.json
+    store.max_total_bytes = len(DATA) + 200  # room for one artifact
     with track_puts() as produced:
         pending = store.put(src_file(tmp_path, DATA, "q"), "q.parquet")
-    assert folders(store) == {paid.id, pending.id}  # nothing evicted for an unsettled call
-    later = store.put(src_file(tmp_path, DATA, "l"), "l.parquet")
-    assert pending.id in folders(store)  # and an unsettled output is never evicted itself
-    assert folders(store) == {later.id, pending.id}
-    store.commit(produced)  # settled: it now counts, and the older one makes room
+    delivered_long_ago(store, pending.id)
+    with pytest.raises(Busy):  # not evicted for a later output, however old
+        store.put(src_file(tmp_path, DATA, "l"), "l.parquet")
     assert folders(store) == {pending.id}
-    store.get(pending.id)
+    store.commit(produced)  # settled: an old output like any other
+    later = store.put(src_file(tmp_path, DATA, "l2"), "l2.parquet")
+    assert folders(store) == {later.id}
 
 
 def test_a_deleted_provisional_output_is_forgotten(tmp_path: Path) -> None:
@@ -135,20 +145,20 @@ def test_a_deleted_provisional_output_is_forgotten(tmp_path: Path) -> None:
     assert store._provisional == set()
 
 
-def test_commit_never_fails_a_settled_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    # commit() runs after settlement: raising there turned a paid 200 into a 500.
+def test_commit_never_fails_a_settled_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # commit() runs after settlement: raising there turned a paid 200 into a 500. It is
+    # bookkeeping only (room was made when the output was stored), so no disk error reaches it.
     store = store_at(tmp_path / "store")
     with track_puts() as produced:
         art = store.put(src_file(tmp_path), "x.parquet")
 
-    def broken(**_: Any) -> None:
+    def broken(*_: Any) -> None:
         raise OSError("disk hiccup")
 
-    monkeypatch.setattr(store, "enforce_capacity", broken)
+    monkeypatch.setattr(store, "_folders", broken)
+    monkeypatch.setattr(store, "_evict", broken)
     store.commit(produced)
-    assert any("capacity enforcement failed" in r.message for r in caplog.records)
+    assert store._provisional == set()
     store.get(art.id)
 
 
@@ -158,6 +168,7 @@ def test_enforce_capacity_tolerates_a_folder_removed_meanwhile(
     store = store_at(tmp_path / "store")
     a = store.put(src_file(tmp_path, DATA, "a"), "a.parquet")
     b = store.put(src_file(tmp_path, DATA, "b"), "b.parquet")
+    delivered_long_ago(store, a.id, b.id)
     ghost = store.root / ("G" * 24)  # listed, then swept by another thread before its stat
     real = store._folders()
     monkeypatch.setattr(store, "_folders", lambda: [ghost, *real])

@@ -18,10 +18,12 @@ their GCS blobs; blobs whose local record was lost with an instance are found by
 listing at most every six hours; the bucket's 1-day lifecycle rule is the final backstop.
 
 Money: ``put`` raising an ``AimartError`` is what keeps a caller from paying for an output
-that could not be kept. Outputs stored during a paid call (inside ``track_puts``) are
-provisional: they neither evict nor can be evicted until the payment layer either commits them
-(settled) or deletes them (result withheld, e.g. settlement failed), so an unpaid output never
-pushes out a paying customer's artifact.
+that could not be kept. The budget (``max_total_bytes``) counts every stored output, and three
+kinds are never evicted to make room: an output whose paid call has not settled yet
+(provisional, inside ``track_puts``; the payment layer then commits or deletes it), an output
+delivered less than ``MIN_RESIDENCY_S`` ago, and an artifact a running call is reading
+(``hold``). An output that cannot fit without evicting one of those is refused before it is
+stored (503 busy), so nobody pays for a link that dies a moment later.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ import time
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-from aimart_parquet.errors import AimartError, ArtifactNotFound, InputTooLarge
+from aimart_parquet.errors import AimartError, ArtifactNotFound, Busy, InputTooLarge
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -50,6 +52,10 @@ if TYPE_CHECKING:
 log = logging.getLogger("aimart.artifacts")
 
 _ID = re.compile(r"^[A-Za-z0-9_-]{22,64}$")
+# How long a delivered output is safe from capacity eviction. Two concurrent paid converts
+# that each fit the budget, but not together: the second one's commit evicted the first, whose
+# caller had been charged a moment earlier for a download_url that now 404'd.
+MIN_RESIDENCY_S = 600
 # Listing is a class-A GCS operation (free tier: 5,000 a month, shared with every upload), so
 # the sweep for orphaned blobs is rationed across all instances by a marker in the bucket.
 LISTING_INTERVAL_S = 6 * 3600
@@ -78,6 +84,7 @@ class Artifact:
 class ArtifactStore(Protocol):
     def put(self, src: Path, filename: str) -> Artifact: ...
     def get(self, artifact_id: str) -> tuple[Artifact, Path]: ...
+    def hold(self) -> contextlib.AbstractContextManager[None]: ...
     def commit(self, artifact_ids: Iterable[str]) -> None: ...
     def delete(self, artifact_id: str) -> None: ...
     def download_url(self, base_url: str, art: Artifact) -> str: ...
@@ -116,6 +123,12 @@ def outputs_of(store: ArtifactStore | None) -> contextlib.AbstractContextManager
     return track_puts() if store is not None else contextlib.nullcontext([])
 
 
+# The store and the ids a running call has read (see LocalArtifactStore.hold).
+_HELD: contextvars.ContextVar[tuple[LocalArtifactStore, list[str]] | None] = contextvars.ContextVar(
+    "aimart_held", default=None
+)
+
+
 def _record(artifact_id: str) -> bool:
     """Report a stored artifact to the enclosing blocks; True if it is provisional."""
     blocks = _PUTS.get()
@@ -146,6 +159,9 @@ def _human(n: int) -> str:
 
 
 class LocalArtifactStore:
+    # Evicting a local artifact deletes it for good (see MIN_RESIDENCY_S).
+    min_residency_s: float = MIN_RESIDENCY_S
+
     def __init__(self, root: Path, *, ttl_s: int, max_total_bytes: int, secret: bytes) -> None:
         self.root = root
         self.ttl_s = ttl_s
@@ -154,6 +170,8 @@ class LocalArtifactStore:
         self._last_sweep = 0.0
         # Stored during a paid call whose settlement is not known yet (see track_puts).
         self._provisional: set[str] = set()
+        # id -> how many running calls are reading it (see hold).
+        self._pins: dict[str, int] = {}
         root.mkdir(parents=True, exist_ok=True)
 
     def maybe_sweep(self, interval_s: float = 60.0) -> None:
@@ -188,25 +206,61 @@ class LocalArtifactStore:
                 output_bytes=size,
                 limit_bytes=self.max_total_bytes,
             )
+        # Room is made before the file lands, and counting every output (unsettled ones too):
+        # leaving those out let concurrent paid calls hold a multiple of the RAM disk's budget.
+        if not self._make_room(size, strict=True):
+            raise Busy(
+                "The server's output storage is full right now: recent outputs, and outputs "
+                "of calls still settling, are kept for their callers.",
+                hint="Retry in a few minutes, or send a smaller extract; you were not charged.",
+                output_bytes=size,
+                limit_bytes=self.max_total_bytes,
+            )
         art = self._store_local(src, filename)
         self._persist(art)
         if _record(art.id):
-            self._provisional.add(art.id)  # capacity is enforced when the payment commits it
-        else:
-            self.enforce_capacity(keep=art.id)
+            self._provisional.add(art.id)  # never evicted until the payment layer commits it
         return art
 
     def commit(self, artifact_ids: Iterable[str]) -> None:
-        """The call that stored these was paid for: they now count, and may evict, as usual."""
-        ids = [i for i in artifact_ids if i in self._provisional]
-        self._provisional.difference_update(ids)
-        if not ids:
-            return
+        """The call that stored these was paid for: from now on they age like any output.
+        Bookkeeping only (their bytes were counted when stored), so it cannot fail a paid call."""
+        self._provisional.difference_update(artifact_ids)
+
+    @contextlib.contextmanager
+    def hold(self) -> Iterator[None]:
+        """Keep every artifact ``get`` returns inside the block on disk until the block exits.
+
+        A call reads its inputs by path, after it has fetched all of them (a query names up to
+        8). On GCS, rehydrating a query's second table evicted the cached copy of its first, so
+        a join of artifacts that together exceed the local budget always failed. A held artifact
+        is neither evicted nor swept; the cache may exceed the budget while a call needs more,
+        and is trimmed back when the call ends.
+        """
+        held: list[str] = []
+        token = _HELD.set((self, held))
         try:
-            self.enforce_capacity(keep=ids)
-        except Exception:
-            # Runs after settlement: the caller has paid, so their result must still go out.
-            log.exception("capacity enforcement failed", extra={"artifact_ids": ids})
+            yield
+        finally:
+            _HELD.reset(token)
+            for artifact_id in held:
+                left = self._pins.get(artifact_id, 0) - 1
+                if left > 0:
+                    self._pins[artifact_id] = left
+                else:
+                    self._pins.pop(artifact_id, None)
+            if held:
+                try:
+                    self.enforce_capacity()
+                except Exception:  # the call's own result must still go out
+                    log.exception("capacity enforcement failed")
+
+    def _held(self, artifact_id: str) -> None:
+        """Pin an artifact just read, if a running call (``hold``) is reading it."""
+        block = _HELD.get()
+        if block is not None and block[0] is self:
+            self._pins[artifact_id] = self._pins.get(artifact_id, 0) + 1
+            block[1].append(artifact_id)
 
     def _store_local(self, src: Path, filename: str) -> Artifact:
         artifact_id = self.new_id()
@@ -257,7 +311,9 @@ class LocalArtifactStore:
                 "Unknown or expired artifact_id.",
                 hint="Artifacts expire after a TTL; convert the file again.",
             )
-        return self._unexpired(art), self.root / artifact_id / "data.parquet"
+        self._unexpired(art)
+        self._held(artifact_id)
+        return art, self.root / artifact_id / "data.parquet"
 
     @staticmethod
     def _check_id(artifact_id: str) -> None:
@@ -272,7 +328,8 @@ class LocalArtifactStore:
 
     def _unexpired(self, art: Artifact) -> Artifact:
         if art.expires_at < time.time():
-            self.delete(art.id)
+            if not self._pins.get(art.id):  # else a running call reads it: the sweep follows
+                self.delete(art.id)
             raise ArtifactNotFound(
                 "The artifact has expired.", hint="Convert the file again to get a new artifact_id."
             )
@@ -296,7 +353,7 @@ class LocalArtifactStore:
                     expires = folder.stat().st_mtime + self.ttl_s  # half-written: by mtime
                 except OSError:  # removed meanwhile: the other sweeper (threads) or a delete
                     continue
-            if expires < now:
+            if expires < now and not self._pins.get(folder.name):  # held: the next sweep
                 self.delete(folder.name)
                 removed += 1
         return removed
@@ -304,30 +361,46 @@ class LocalArtifactStore:
     def enforce_capacity(self, *, keep: str | Iterable[str] = ()) -> None:
         """Evict oldest artifacts until total size fits the budget (free disks are small).
 
-        ``keep`` is never evicted: the artifact just written, whose id is about to be handed
-        to a paying caller (evicting it charged them for a dead link). Provisional artifacts
-        are neither counted nor evicted: their call has not settled yet.
+        Never evicts ``keep``, an unsettled output, a running call's input, or an output
+        delivered less than ``min_residency_s`` ago, so it may leave the total over budget.
         """
-        spared = {keep} if isinstance(keep, str) else set(keep)
-        pending = set(self._provisional) - spared
-        entries: list[tuple[float, int, Path]] = []
+        self._make_room(0, keep={keep} if isinstance(keep, str) else set(keep), strict=False)
+
+    def _make_room(self, need: int, *, keep: set[str] | None = None, strict: bool) -> bool:
+        """Evict the oldest evictable artifacts until ``need`` more bytes fit the budget.
+
+        Returns whether they fit. ``strict``: when evicting everything evictable would not be
+        enough, evict nothing (an output refused anyway must not cost anyone their artifact).
+        Counts data files only; a meta.json is a few hundred bytes.
+        """
+        entries: list[tuple[float, int, str]] = []
         for folder in self._folders():
-            if folder.name in pending:
-                continue
             try:
-                size = sum(p.stat().st_size for p in folder.iterdir() if p.is_file())
-                entries.append((folder.stat().st_mtime, size, folder))
-            except OSError:  # removed meanwhile, e.g. by a sweep in a worker thread
+                stamp = folder.stat().st_mtime
+                entries.append((stamp, (folder / "data.parquet").stat().st_size, folder.name))
+            except OSError:  # removed meanwhile (a sweep in a worker thread), or half-written
                 continue
-        entries.sort(key=lambda e: e[0])
-        total = sum(size for _, size, _ in entries)
-        for _, size, folder in entries:
+        total = need + sum(size for _, size, _ in entries)
+        if total <= self.max_total_bytes:
+            return True
+        now = time.time()
+        spared = keep or set()
+        victims = sorted(
+            (stamp, size, artifact_id)
+            for stamp, size, artifact_id in entries
+            if artifact_id not in spared
+            and artifact_id not in self._provisional
+            and not self._pins.get(artifact_id)
+            and now - stamp >= min(self.min_residency_s, self.ttl_s)
+        )
+        if strict and total - sum(size for _, size, _ in victims) > self.max_total_bytes:
+            return False
+        for _, size, artifact_id in victims:
             if total <= self.max_total_bytes:
                 break
-            if folder.name in spared:
-                continue
             total -= size
-            self._evict(folder)
+            self._evict(self.root / artifact_id)
+        return total <= self.max_total_bytes
 
     def _evict(self, folder: Path) -> None:
         """Free disk for the budget. Here the folder is the artifact, so it is gone for good."""
@@ -364,6 +437,9 @@ class GcsArtifactStore(LocalArtifactStore):
     operations, so expired blobs are deleted as soon as a sweep sees them, including blobs whose
     cached copy was evicted (remembered in ``_uncached``, as no folder is left to find them by).
     """
+
+    # Evicting drops only the cached copy: the blob, and so the download link, stays valid.
+    min_residency_s: float = 0
 
     def __init__(
         self,
@@ -413,9 +489,13 @@ class GcsArtifactStore(LocalArtifactStore):
         self._check_id(artifact_id)
         local = self._local_record(artifact_id)
         if local is not None:
-            return self._unexpired(local), self.root / artifact_id / "data.parquet"
+            self._unexpired(local)
+            self._held(artifact_id)
+            return local, self.root / artifact_id / "data.parquet"
         try:
-            return self._rehydrate(artifact_id)
+            got = self._rehydrate(artifact_id)
+            self._held(artifact_id)
+            return got
         except AimartError:
             raise
         except Exception as exc:  # a GCS blip on a paid read: a typed error, never a bare 500
@@ -445,12 +525,15 @@ class GcsArtifactStore(LocalArtifactStore):
         if art.expires_at < time.time():
             self._delete_blob(self._key(artifact_id))
             raise ArtifactNotFound("The artifact has expired.", hint="Convert the file again.")
+        # The cache shares the RAM disk's budget: make room first. Never at the cost of what a
+        # running call reads (hold), so a join of artifacts that together exceed the budget
+        # still runs, over budget until it ends.
+        self._make_room(art.size_bytes, strict=False)
         folder = self.root / artifact_id
         folder.mkdir(parents=True, exist_ok=True)
         blob.download_to_filename(str(folder / "data.parquet"))
         self._write_meta(folder, art)
         self._uncached.pop(artifact_id, None)  # cached again: the local sweep finds it
-        self.enforce_capacity(keep=artifact_id)  # the cache shares the RAM disk's budget
         return art, folder / "data.parquet"
 
     def delete(self, artifact_id: str) -> None:
@@ -504,6 +587,9 @@ class GcsArtifactStore(LocalArtifactStore):
                 if self._blob_expired(blob, now):
                     parts = str(blob.name).split("/")
                     if len(parts) > 1 and _ID.match(parts[1]):
+                        if self._pins.get(parts[1]):
+                            continue  # a running call reads it; the request-path sweep follows
+                        self._uncached.pop(parts[1], None)  # or a later sweep counts it again
                         super().delete(parts[1])
                     self._delete_blob(str(blob.name))
                     removed += 1
