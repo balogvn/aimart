@@ -19,9 +19,10 @@ from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import Extension, MCPServer
 from mcp_types import CallToolResult, ResourceLink, TextContent, ToolAnnotations
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from aimart_parquet import __version__
+from aimart_parquet.api.schemas import MAX_EXTRA_TABLES, NamedKeys, TableName
 from aimart_parquet.config import Settings
 from aimart_parquet.demand import CapabilityAck, CapabilityRequest
 from aimart_parquet.engine.models import ConvertOptions, ConvertResult, InspectResult, TabularResult
@@ -114,6 +115,27 @@ async def _guard(fn: Callable[[], Awaitable[CallToolResult]]) -> CallToolResult:
         return await fn()
     except AimartError as exc:
         return _err(exc)
+
+
+def argument_checker(server: MCPServer) -> Callable[[str, dict[str, Any]], str | None]:
+    """The SDK's own argument validation for a tool, callable before the tool runs.
+
+    The x402 gate wraps tools/call outside the SDK's validation, so without this a call with
+    invalid arguments was quoted, and when paid also verified, before it was rejected. Returns
+    the SDK's error text, or None when the arguments are valid or the tool is unknown.
+    """
+
+    def check(name: str, arguments: dict[str, Any]) -> str | None:
+        tool = server._tool_manager.get_tool(name)  # private: mcp 2.x has no public lookup
+        if tool is None:
+            return None
+        try:
+            tool.fn_metadata.validate_arguments(arguments)
+        except ValidationError as exc:
+            return f"Error executing tool {name}: {exc}"  # the SDK's wording for the same error
+        return None
+
+    return check
 
 
 def _price_note(price: str, *, local: bool) -> str:
@@ -239,11 +261,12 @@ a .parquet file. {note(settings.price_inspect)}"""
 CSV. Use to eyeball data; use query_parquet to filter or aggregate. Long cells are truncated. \
 {note(settings.price_preview)}"""
     query_description = f"""Run one read-only DuckDB SELECT over a Parquet file, available as \
-table `data`; join more files by passing `tables` ({{name: artifact_id}}), e.g. a GL against a \
-bank statement. Supports aggregates, window functions, CTEs, DESCRIBE data and SUMMARIZE data. \
-Up to {settings.max_query_rows} rows are returned; `truncated` says if more matched. Writes, \
-file access and multiple statements are rejected. Example: SELECT region, sum(units) FROM data \
-GROUP BY 1 ORDER BY 2 DESC. {note(settings.price_query)}"""
+table `data`; join more files by passing `tables` ({{name: artifact_id}}, up to \
+{MAX_EXTRA_TABLES} besides data), e.g. a GL against a bank statement. Supports aggregates, \
+window functions, CTEs, DESCRIBE data and SUMMARIZE data. Up to {settings.max_query_rows} rows \
+are returned; `truncated` says if more matched. Writes, file access and multiple statements are \
+rejected. Example: SELECT region, sum(units) FROM data GROUP BY 1 ORDER BY 2 DESC. \
+{note(settings.price_query)}"""
 
     Columns = Annotated[list[str] | None, Field(description="Only these columns.", max_length=200)]
     Offset = Annotated[int, Field(ge=0, description="Rows to skip.")]
@@ -335,10 +358,13 @@ GROUP BY 1 ORDER BY 2 DESC. {note(settings.price_query)}"""
             path: PathArg = None,
             url: UrlArg = None,
             tables: Annotated[
-                dict[str, str] | None,
+                Annotated[dict[TableName, str], NamedKeys] | None,
                 Field(
-                    description="Extra tables for joins: {name: local path}. The main input is `data`.",
-                    max_length=8,
+                    description=(
+                        f"Extra tables for joins: {{name: local path}}, up to {MAX_EXTRA_TABLES} "
+                        "besides data. The main input is `data`."
+                    ),
+                    max_length=MAX_EXTRA_TABLES,
                 ),
             ] = None,
             limit: QueryLimit = 100,
@@ -388,10 +414,13 @@ GROUP BY 1 ORDER BY 2 DESC. {note(settings.price_query)}"""
             artifact_id: ArtifactArg = None,
             url: UrlArg = None,
             tables: Annotated[
-                dict[str, str] | None,
+                Annotated[dict[TableName, str], NamedKeys] | None,
                 Field(
-                    description="Extra tables for joins: {name: artifact_id}. The main input is `data`.",
-                    max_length=8,
+                    description=(
+                        f"Extra tables for joins: {{name: artifact_id}}, up to {MAX_EXTRA_TABLES} "
+                        "besides data. The main input is `data`."
+                    ),
+                    max_length=MAX_EXTRA_TABLES,
                 ),
             ] = None,
             limit: QueryLimit = 100,

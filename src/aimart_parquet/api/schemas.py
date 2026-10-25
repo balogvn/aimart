@@ -2,14 +2,46 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from aimart_parquet.engine.models import ConvertOptions
 from aimart_parquet.errors import InvalidRequest
 from aimart_parquet.quantum.models import PortfolioOptions, QuantumCompressOptions
-from aimart_parquet.service import SourceRef
+from aimart_parquet.service import MAX_QUERY_TABLES, TABLE_NAME, SourceRef
+
+if TYPE_CHECKING:
+    from pydantic import GetJsonSchemaHandler
+    from pydantic.json_schema import JsonSchemaValue
+    from pydantic_core import CoreSchema
+
+# `tables` holds the joins; `data` is the top-level input and counts toward the service's cap.
+MAX_EXTRA_TABLES = MAX_QUERY_TABLES - 1
+
+
+class _NamedKeys:
+    """JSON Schema for a dict whose keys must match a pattern: ``propertyNames``.
+
+    Pydantic emits ``patternProperties``, under which a key that does not match is simply
+    unconstrained, so a client validating against the schema would send "Bad-Name".
+    """
+
+    def __get_pydantic_json_schema__(
+        self, core_schema: CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        schema = handler(core_schema)
+        patterns = schema.get("patternProperties")
+        if isinstance(patterns, dict) and len(patterns) == 1:
+            [(pattern, value)] = patterns.items()
+            del schema["patternProperties"]
+            schema["propertyNames"] = {"pattern": pattern}
+            schema["additionalProperties"] = value
+        return schema
+
+
+TableName = Annotated[str, StringConstraints(pattern=TABLE_NAME.pattern)]
+NamedKeys = _NamedKeys()
 
 
 class SourceBody(BaseModel):
@@ -64,12 +96,15 @@ class QueryBody(SourceBody):
         max_length=20_000,
         description="One DuckDB SELECT. The top-level input is table `data`; `tables` adds more.",
     )
-    tables: dict[str, TableRef] | None = Field(
+    # max_length used to be 8 extra tables while the service caps the total at 8: data + 8
+    # joins passed the schema, was quoted and paid for, and then failed with a 400.
+    tables: Annotated[dict[TableName, TableRef], NamedKeys] | None = Field(
         default=None,
-        max_length=8,
+        max_length=MAX_EXTRA_TABLES,
         description=(
-            "Extra named tables for joins, e.g. {'gl': {'artifact_id': ...}, 'bank': {...}}. "
-            "Names: lowercase letters, digits, underscores."
+            f"Extra named tables for joins, up to {MAX_EXTRA_TABLES} besides `data`, e.g. "
+            "{'gl': {'artifact_id': ...}, 'bank': {...}}. Names: lowercase letters, digits, "
+            "underscores."
         ),
     )
 

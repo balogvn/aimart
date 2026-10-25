@@ -3,21 +3,27 @@
 Keeping a single code path matters for money: the HTTP route and the MCP tool must agree on
 what counts as success, because success is what triggers settlement. Both call these methods,
 and both map ``AimartError`` to a >= 400 response that cancels payment.
+
+Capacity: every operation holds one job slot (``_job``) from before its inputs are fetched
+until its result is built. URL inputs land on the artifact disk, which on Cloud Run is RAM, so
+downloads must count toward capacity and share one byte budget per call.
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import re
 import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import anyio
 import anyio.to_thread
 
+from aimart_parquet.artifacts import discard_withheld
 from aimart_parquet.demand import DemandSignals
 from aimart_parquet.engine.convert import convert_file
 from aimart_parquet.engine.inspect import inspect_parquet
@@ -32,13 +38,20 @@ from aimart_parquet.engine.models import (
     TabularResult,
 )
 from aimart_parquet.engine.tabular import OutputFormat, preview, query
-from aimart_parquet.errors import AimartError, Busy, InvalidRequest, Timeout, UnsupportedFormat
+from aimart_parquet.errors import (
+    AimartError,
+    Busy,
+    InputTooLarge,
+    InvalidRequest,
+    Timeout,
+    UnsupportedFormat,
+)
 from aimart_parquet.provenance import ALGORITHM, build_manifest
 from aimart_parquet.provenance import verify as verify_signature
 from aimart_parquet.sources import decode_base64, fetch_url, safe_filename
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
     from aimart_parquet.artifacts import ArtifactStore
     from aimart_parquet.config import Settings
@@ -80,6 +93,32 @@ class SourceRef:
         ]
 
 
+@dataclass
+class _InputBudget:
+    """Bytes one call may still download or decode, across all of its inputs.
+
+    A query names up to 8 inputs. Each URL alone was capped at max_input_bytes, so one paid
+    call could put 8 x 50 MB on Cloud Run's RAM-backed disk, and four concurrent calls 1.6 GB.
+    Stored artifacts do not count: they are already inside the artifact budget.
+    """
+
+    total: int
+    used: int = field(default=0)
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.total - self.used)
+
+    def exceeded(self) -> InputTooLarge:
+        return InputTooLarge(
+            f"The inputs of this call together exceed the {self.total // (1024 * 1024)} MB "
+            "limit per call.",
+            hint="Convert each file first and pass the artifact_ids instead (stored artifacts "
+            "do not count), or send smaller extracts; you were not charged.",
+            limit_bytes=self.total,
+        )
+
+
 class Service:
     def __init__(
         self,
@@ -104,9 +143,16 @@ class Service:
     def _workdir(self) -> Path:
         return Path(tempfile.mkdtemp(dir=self._workroot))
 
-    async def _execute(
-        self, fn: Callable[..., T], *args: Any, timeout_s: float, isolate: bool, **kwargs: Any
-    ) -> T:
+    @contextlib.asynccontextmanager
+    async def _job(self) -> AsyncIterator[None]:
+        """Hold one job slot for a whole operation: fetching inputs, the engine, the output.
+
+        Taken before any input is materialized. The slot used to be taken only around the
+        engine call, so a query naming 8 URLs downloaded up to 400 MB onto the RAM disk and
+        only then learned the server was busy. The stored artifacts the operation reads stay on
+        disk until it ends (``store.hold``): on GCS, fetching a query's second table evicted
+        the cached copy of its first, and the join failed on a missing file.
+        """
         stats = self._limiter.statistics()
         if (
             stats.borrowed_tokens >= stats.total_tokens
@@ -115,16 +161,22 @@ class Service:
             raise Busy(
                 "The server is at capacity.", hint="Retry in a few seconds; you were not charged."
             )
+        async with self._limiter:
+            with self.store.hold():
+                yield
+
+    async def _execute(
+        self, fn: Callable[..., T], *args: Any, timeout_s: float, isolate: bool, **kwargs: Any
+    ) -> T:
+        """Run one engine call. Callers hold the job slot (``async with self._job()``)."""
         if isolate:
             # The child enforces the deadline (and is killed at it), so no outer timeout here.
             call = functools.partial(run_isolated, fn, *args, timeout_s=timeout_s, **kwargs)
-            return await anyio.to_thread.run_sync(call, limiter=self._limiter)
+            return await anyio.to_thread.run_sync(call)
         try:
             with anyio.fail_after(timeout_s):
                 return await anyio.to_thread.run_sync(
-                    functools.partial(fn, *args, **kwargs),
-                    abandon_on_cancel=True,
-                    limiter=self._limiter,
+                    functools.partial(fn, *args, **kwargs), abandon_on_cancel=True
                 )
         except TimeoutError as exc:
             raise Timeout(
@@ -132,7 +184,12 @@ class Service:
                 hint="Send a smaller file, or fewer rows; you were not charged.",
             ) from exc
 
-    async def _materialize(self, src: SourceRef, workdir: Path) -> tuple[Path, str | None]:
+    def _budget(self) -> _InputBudget:
+        return _InputBudget(self.settings.max_input_bytes)
+
+    async def _materialize(
+        self, src: SourceRef, workdir: Path, budget: _InputBudget
+    ) -> tuple[Path, str | None]:
         await anyio.to_thread.run_sync(self.store.maybe_sweep)
         kinds = src.kinds()
         if len(kinds) != 1:
@@ -148,18 +205,29 @@ class Service:
             return src.upload, name
         if kind == "url":
             assert src.url is not None
-            fetched = await fetch_url(
-                src.url,
-                workdir / "download",
-                max_bytes=self.settings.max_input_bytes,
-                deadline_s=self.settings.fetch_timeout_s,
-                allow_private=self.settings.allow_private_urls,
-            )
+            try:
+                fetched = await fetch_url(
+                    src.url,
+                    workdir / "download",
+                    max_bytes=budget.remaining,
+                    deadline_s=self.settings.fetch_timeout_s,
+                    allow_private=self.settings.allow_private_urls,
+                )
+            except InputTooLarge as exc:
+                if not budget.used:
+                    raise
+                raise budget.exceeded() from exc
+            budget.used += fetched.size
             return fetched.path, name or fetched.filename
         if kind == "content_base64":
             assert src.content_base64 is not None
             dest = workdir / "inline"
-            decode_base64(src.content_base64, dest, max_bytes=self.settings.max_input_bytes)
+            try:
+                budget.used += decode_base64(src.content_base64, dest, max_bytes=budget.remaining)
+            except InputTooLarge as exc:
+                if not budget.used:
+                    raise
+                raise budget.exceeded() from exc
             return dest, name
         if kind == "artifact_id":
             assert src.artifact_id is not None
@@ -181,9 +249,45 @@ class Service:
     async def convert(
         self, src: SourceRef, options: ConvertOptions, *, output_path: str | None = None
     ) -> ConvertResult:
+        async with self._job():
+            return await self._convert(src, options, output_path)
+
+    async def convert_upload(
+        self,
+        read: Callable[[int], Awaitable[bytes]],
+        filename: str | None,
+        options: ConvertOptions,
+    ) -> ConvertResult:
+        """Convert a multipart upload, copied to disk inside the job slot like a URL download.
+
+        The route used to copy all 50 MB onto the RAM-backed artifact disk first and only then
+        ask for a slot, so a busy server still took the copy before answering "busy".
+        """
+        async with self._job():
+            workdir = self._workdir()
+            try:
+                dest = workdir / "upload"
+                size = 0
+                with dest.open("wb") as out:
+                    while chunk := await read(1024 * 1024):
+                        size += len(chunk)
+                        if size > self.settings.max_input_bytes:
+                            raise InputTooLarge(
+                                f"Upload exceeds {self.settings.max_input_bytes // (1024 * 1024)} "
+                                "MB.",
+                                hint="Split the file or pass a url.",
+                            )
+                        out.write(chunk)
+                return await self._convert(SourceRef(upload=dest, filename=filename), options, None)
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
+
+    async def _convert(
+        self, src: SourceRef, options: ConvertOptions, output_path: str | None
+    ) -> ConvertResult:
         workdir = self._workdir()
         try:
-            in_path, name = await self._materialize(src, workdir)
+            in_path, name = await self._materialize(src, workdir, self._budget())
             out = workdir / "out.parquet"
             try:
                 report = await self._execute(
@@ -229,30 +333,36 @@ class Service:
                 path=str(target),
             )
         art = self.store.put(out, filename)
-        provenance = None
-        if self.signer is not None:
-            manifest = build_manifest(
-                artifact_id=art.id,
-                sha256=art.sha256,
-                size_bytes=art.size_bytes,
+        try:
+            provenance = None
+            if self.signer is not None:
+                manifest = build_manifest(
+                    artifact_id=art.id,
+                    sha256=art.sha256,
+                    size_bytes=art.size_bytes,
+                    filename=art.filename,
+                    operation=operation,
+                )
+                provenance = Provenance(
+                    algorithm=ALGORITHM,
+                    manifest=manifest,
+                    signature=self.signer.sign(manifest),
+                    public_key_url=f"{self.settings.public_base_url}/.well-known/aimart-signing-key",
+                )
+            return ArtifactRef(
+                id=art.id,
                 filename=art.filename,
-                operation=operation,
+                size_bytes=art.size_bytes,
+                sha256=art.sha256,
+                expires_at=art.expires_iso,
+                download_url=self.store.download_url(self.settings.public_base_url, art),
+                provenance=provenance,
             )
-            provenance = Provenance(
-                algorithm=ALGORITHM,
-                manifest=manifest,
-                signature=self.signer.sign(manifest),
-                public_key_url=f"{self.settings.public_base_url}/.well-known/aimart-signing-key",
-            )
-        return ArtifactRef(
-            id=art.id,
-            filename=art.filename,
-            size_bytes=art.size_bytes,
-            sha256=art.sha256,
-            expires_at=art.expires_iso,
-            download_url=self.store.download_url(self.settings.public_base_url, art),
-            provenance=provenance,
-        )
+        except BaseException:
+            # Stored, but the caller gets an error and pays nothing: the file must not sit in
+            # the budget until its TTL, evicting paying customers' artifacts.
+            discard_withheld(self.store, [art.id], reason="publish_failed")
+            raise
 
     def _local_target(self, src: SourceRef, output_path: str | None, filename: str) -> Path:
         if output_path:
@@ -267,19 +377,26 @@ class Service:
             n += 1
         return target
 
-    async def _parquet_path(self, src: SourceRef, workdir: Path) -> Path:
-        path, _ = await self._materialize(src, workdir)
+    async def _parquet_path(self, src: SourceRef, workdir: Path, budget: _InputBudget) -> Path:
+        path, _ = await self._materialize(src, workdir, budget)
         return path
 
+    # inspect and preview decode a caller's Parquet (inspect: its footer, which is native
+    # Thrift plus a loop over every row group). They ran in-process, so a 258-byte dictionary
+    # bomb took /v1/preview's server past 2 GB with limit=1: they run in the child like query.
     async def inspect(self, src: SourceRef) -> InspectResult:
-        workdir = self._workdir()
-        try:
-            path = await self._parquet_path(src, workdir)
-            return await self._execute(
-                inspect_parquet, path, timeout_s=self.settings.query_timeout_s, isolate=False
-            )
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+        async with self._job():
+            workdir = self._workdir()
+            try:
+                path = await self._parquet_path(src, workdir, self._budget())
+                return await self._execute(
+                    inspect_parquet,
+                    path,
+                    timeout_s=self.settings.query_timeout_s,
+                    isolate=self.settings.isolate_jobs,
+                )
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
 
     async def preview(
         self,
@@ -291,22 +408,23 @@ class Service:
         fmt: OutputFormat,
     ) -> TabularResult:
         limit = max(0, min(limit, self.settings.max_preview_rows))
-        workdir = self._workdir()
-        try:
-            path = await self._parquet_path(src, workdir)
-            return await self._execute(
-                preview,
-                path,
-                columns=columns,
-                offset=max(0, offset),
-                limit=limit,
-                fmt=fmt,
-                max_chars=self.settings.max_cell_chars,
-                timeout_s=self.settings.query_timeout_s,
-                isolate=False,
-            )
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+        async with self._job():
+            workdir = self._workdir()
+            try:
+                path = await self._parquet_path(src, workdir, self._budget())
+                return await self._execute(
+                    preview,
+                    path,
+                    columns=columns,
+                    offset=max(0, offset),
+                    limit=limit,
+                    fmt=fmt,
+                    max_chars=self.settings.max_cell_chars,
+                    timeout_s=self.settings.query_timeout_s,
+                    isolate=self.settings.isolate_jobs,
+                )
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
 
     async def query(
         self, tables: dict[str, SourceRef], sql: str, *, limit: int, fmt: OutputFormat
@@ -327,29 +445,32 @@ class Service:
                 hint="Use lowercase names of letters, digits and underscores, e.g. 'gl' or 'bank_2025'.",
             )
         limit = max(1, min(limit, self.settings.max_query_rows))
-        workdir = self._workdir()
-        try:
-            paths: dict[str, Path] = {}
-            for i, (name, ref) in enumerate(tables.items()):
-                sub = workdir / f"t{i}"
-                sub.mkdir()
-                paths[name] = await self._parquet_path(ref, sub)
-            # query() interrupts DuckDB itself at query_timeout_s; the outer deadline is a backstop.
-            return await self._execute(
-                query,
-                paths,
-                sql,
-                limit=limit,
-                fmt=fmt,
-                query_timeout=self.settings.query_timeout_s,
-                max_chars=self.settings.max_cell_chars,
-                memory_limit=self.settings.duckdb_memory_limit,
-                threads=self.settings.duckdb_threads,
-                timeout_s=self.settings.query_timeout_s + 5,
-                isolate=self.settings.isolate_jobs,
-            )
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+        async with self._job():
+            workdir = self._workdir()
+            try:
+                budget = self._budget()
+                paths: dict[str, Path] = {}
+                for i, (name, ref) in enumerate(tables.items()):
+                    sub = workdir / f"t{i}"
+                    sub.mkdir()
+                    paths[name] = await self._parquet_path(ref, sub, budget)
+                # query() interrupts DuckDB itself at query_timeout_s; the outer deadline is a
+                # backstop.
+                return await self._execute(
+                    query,
+                    paths,
+                    sql,
+                    limit=limit,
+                    fmt=fmt,
+                    query_timeout=self.settings.query_timeout_s,
+                    max_chars=self.settings.max_cell_chars,
+                    memory_limit=self.settings.duckdb_memory_limit,
+                    threads=self.settings.duckdb_threads,
+                    timeout_s=self.settings.query_timeout_s + 5,
+                    isolate=self.settings.isolate_jobs,
+                )
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
 
     # ------------------------------------------------------------------ premium quantum tier
     def _require_quantum(self) -> None:
@@ -370,12 +491,18 @@ class Service:
         self, src: SourceRef, options: QuantumCompressOptions, *, output_path: str | None = None
     ) -> QuantumCompressResult:
         self._require_quantum()
+        async with self._job():
+            return await self._quantum_compress(src, options, output_path)
+
+    async def _quantum_compress(
+        self, src: SourceRef, options: QuantumCompressOptions, output_path: str | None
+    ) -> QuantumCompressResult:
         from aimart_parquet.quantum.kernel_pca import compress
         from aimart_parquet.quantum.models import SIMULATOR_NOTE, QuantumCompressResult
 
         workdir = self._workdir()
         try:
-            path, name = await self._materialize(src, workdir)
+            path, name = await self._materialize(src, workdir, self._budget())
             out = workdir / "quantum.parquet"
             fields = await self._execute(
                 compress,
@@ -402,20 +529,21 @@ class Service:
         from aimart_parquet.quantum.models import SIMULATOR_NOTE, PortfolioResult
         from aimart_parquet.quantum.portfolio import optimize
 
-        workdir = self._workdir()
-        try:
-            path, _ = await self._materialize(src, workdir)
-            fields = await self._execute(
-                optimize,
-                path,
-                options,
-                timeout_s=self.settings.quantum_timeout_s,
-                isolate=self.settings.isolate_jobs,
-            )
-            extra_notes = fields.pop("notes", [])
-            return PortfolioResult(**fields, notes=[SIMULATOR_NOTE, *extra_notes])
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+        async with self._job():
+            workdir = self._workdir()
+            try:
+                path, _ = await self._materialize(src, workdir, self._budget())
+                fields = await self._execute(
+                    optimize,
+                    path,
+                    options,
+                    timeout_s=self.settings.quantum_timeout_s,
+                    isolate=self.settings.isolate_jobs,
+                )
+                extra_notes = fields.pop("notes", [])
+                return PortfolioResult(**fields, notes=[SIMULATOR_NOTE, *extra_notes])
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
 
     # ------------------------------------------------------------------ provenance
     async def verify_provenance(

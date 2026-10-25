@@ -250,7 +250,9 @@ async def test_paid_call_succeeds_and_settles_the_quoted_amount_once(
         ("inspect", {}, 400, "invalid_request"),
         ("inspect", {"artifact_id": "bad id!"}, 404, "artifact_not_found"),
         ("query", {"artifact_id": "ARTIFACT", "sql": "DROP TABLE data"}, 400, "query_rejected"),
-        ("preview", {"artifact_id": "ARTIFACT", "limit": 0}, 400, "invalid_request"),
+        # A schema-invalid body ("limit": 0) is now refused before any quote (see
+        # test_fix_money_gate.py); this one passes the schema and fails in the service.
+        ("preview", {"artifact_id": "ARTIFACT", "columns": ["nope"]}, 400, "invalid_request"),
         ("convert", {"url": "http://127.0.0.1/data.csv"}, 422, "url_not_allowed"),
         ("convert", {"url": "ftp://example.com/data.csv"}, 422, "url_not_allowed"),
         (
@@ -306,10 +308,12 @@ async def test_paid_call_that_times_out_is_not_settled(
 async def test_failed_upload_conversion_is_not_settled(
     paid_app: kit.AppHarness, facilitator: kit.FakeFacilitator
 ) -> None:
+    # Valid options the conversion then refuses. (Options that are not ConvertOptions JSON are
+    # now refused before the quote: tests/integration/test_fix_money_upload_check.py.)
     r = await paid_app.paying.post(
         "/v1/convert/upload",
         files={"file": ("p.csv", PRICES_CSV, "text/csv")},
-        data={"options": "{not json"},
+        data={"options": '{"sort_by": ["no_such_column"]}'},
     )
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "invalid_request"
