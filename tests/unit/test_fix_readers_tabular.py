@@ -402,3 +402,45 @@ class TestValuesWithoutAPythonObject:
         pq.write_table(pa.table({"s": st, "n": [1, 2]}), path)
         result = preview(path, columns=None, offset=0, limit=5, fmt="csv", max_chars=99)
         assert result.text == 's,n\n"{""k"": 1, ""v"": ""x"", ""k_3"": 3}",1\n,2\n'
+
+    def test_nested_and_encoded_values_render_too(self) -> None:
+        ns = pa.array([1, None], pa.timestamp("ns"))
+        st = pa.StructArray.from_arrays(
+            [
+                pa.array(["a", "b"]).dictionary_encode(),
+                pa.ExtensionArray.from_storage(pa.uuid(), pa.array([b"0" * 16] * 2, pa.binary(16))),
+                ns,
+            ],
+            names=["d", "u", "t"],
+        )
+        table = pa.table(
+            {
+                "m": pa.MapArray.from_arrays([0, 1, 1], pa.array(["k"]), ns.slice(0, 1)),
+                "f": pa.FixedSizeListArray.from_arrays(pa.array([1, 2, 3, 4], pa.time64("ns")), 2),
+                "s": st,
+            }
+        )
+        result = tabular.render(table, fmt="json", truncated=False, max_chars=99)
+        assert result.rows == [
+            [
+                [["k", "1970-01-01T00:00:00.000000001"]],
+                ["00:00:00.000000001", "00:00:00.000000002"],
+                {"d": "a", "u": (b"0" * 16).hex(), "t": "1970-01-01T00:00:00.000000001"},
+            ],
+            [
+                [],
+                ["00:00:00.000000003", "00:00:00.000000004"],
+                {"d": "b", "u": (b"0" * 16).hex(), "t": None},
+            ],
+        ]
+
+    def test_a_value_that_still_cannot_be_shown_is_a_typed_error(self, monkeypatch) -> None:
+        def fails(arr: pa.Array) -> pa.Array:
+            raise pa.ArrowInvalid("no")
+
+        monkeypatch.setattr(tabular, "_displayable", fails)
+        table = pa.table({"t": pa.array([1], pa.timestamp("ns"))})
+        with pytest.raises(InvalidInput, match="Column 't' of type timestamp") as info:
+            tabular.render(table, fmt="json", truncated=False, max_chars=99)
+        assert info.value.hint is not None
+        assert "CAST" in info.value.hint

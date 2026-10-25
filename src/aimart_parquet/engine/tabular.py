@@ -68,7 +68,9 @@ MAX_RESULT_BYTES = 64 * 1024 * 1024
 # each value decoded once, so rows are cheap and batches can be large (see _rows_from).
 _PREVIEW_BATCH_BYTES = 4 * 1024 * 1024
 _PREVIEW_MAX_BATCH_ROWS = 65_536
-_PREVIEW_DICTIONARY_BATCH_ROWS = 8192
+# With text or binary columns at most this many: the footer's sizes are the writer's word (a
+# file can understate them), and a dictionary that grows (see _rows_from) is caught early.
+_PREVIEW_TEXT_BATCH_ROWS = 4096
 # Reading a row group again as plain text (after its dictionary grew, see _rows_from) may decode
 # each dictionary-encoded row as its longest value; a preview that would decode more than this
 # is refused instead of burning minutes of CPU (a 4 MB value x 8 columns x 20,000 rows is 640 GB).
@@ -500,8 +502,8 @@ def _rows_from(
         while done < need:
             per_row = max(_row_cost(group, read, shared) + plain, 1.0)
             size = max(1, min(need, _PREVIEW_MAX_BATCH_ROWS, int(_PREVIEW_BATCH_BYTES / per_row)))
-            if shared:  # small, so that a dictionary which grows is caught early
-                size = min(size, _PREVIEW_DICTIONARY_BATCH_ROWS)
+            if text:
+                size = min(size, _PREVIEW_TEXT_BATCH_ROWS)
             if plain and need * per_row > _PREVIEW_REREAD_BYTES:
                 raise InputTooLarge(
                     f"Previewing {need} rows into row group {index} would decode over "

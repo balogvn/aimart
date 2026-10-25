@@ -272,7 +272,7 @@ class TestDictionariesThatFallBackToPlainPages:
             str(path),
         )
         assert "ROWS 500 290000 00290499" in out
-        assert growth < 150, out
+        assert growth < 100, out
 
     @pytest.mark.parametrize(
         ("offset", "limit"),
@@ -299,6 +299,12 @@ class TestDictionariesThatFallBackToPlainPages:
             "list<element: string>",
             "struct<t: string, n: int64>",
         ]
+
+    def test_selected_columns_across_the_switch(self, tmp_path) -> None:
+        path = _high_cardinality(tmp_path / "fb.parquet", 30_000, dictionary_pagesize_limit=4096)
+        result = show(path, columns=["st", "s"], offset=16_000, limit=500, max_chars=300)
+        want = range(16_000, 16_500)
+        assert result.rows == [[{"t": f"t{i}", "n": i}, f"{i:08d}" + "y" * 200] for i in want]
 
     def test_reading_too_much_again_is_refused_unpaid(self, tmp_path, monkeypatch) -> None:
         path = _high_cardinality(
