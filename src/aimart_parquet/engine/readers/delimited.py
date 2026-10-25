@@ -49,6 +49,10 @@ class Dialect:
     delimiter: str
     width: int
     consistency: float
+    # Blank rows before the first real one. The header comes from the first non-blank row, so
+    # DuckDB must skip exactly these: read_csv(header=true) took a leading blank line as the
+    # header and read the real one as data (an extra row; a numeric column stayed text).
+    skip: int = 0
 
 
 def _cell_kind(cell: str) -> str:
@@ -64,25 +68,33 @@ def _cell_kind(cell: str) -> str:
     return "text"
 
 
-def _parse(sample: str, delimiter: str) -> list[list[str]]:
+def _parse(sample: str, delimiter: str) -> tuple[list[list[str]], int]:
+    """Non-blank rows, and how many blank rows came before the first of them.
+
+    Blank means no cell has a non-space character: an empty line, spaces, or `` , ,``. Like
+    DuckDB's ``skip``, a quoted record spanning lines counts once.
+    """
     reader = csv.reader(io.StringIO(sample), delimiter=delimiter, quotechar='"', strict=False)
     rows: list[list[str]] = []
+    leading = 0
     try:
         for row in reader:
             if row and any(cell.strip() for cell in row):
                 rows.append(row)
+            elif not rows:
+                leading += 1
             if len(rows) >= _SAMPLE_ROWS:
                 break
     except csv.Error:
         pass  # a broken quote late in the sample: score what parsed before it
-    return rows
+    return rows, leading
 
 
 def sniff_dialect(sample: str, forced: str | None) -> tuple[Dialect, list[list[str]]]:
     candidates = (forced,) if forced else _CANDIDATES
     best: tuple[tuple[bool, float, int], Dialect, list[list[str]]] | None = None
     for delim in candidates:
-        rows = _parse(sample, delim)
+        rows, leading = _parse(sample, delim)
         if not rows:
             continue
         widths = Counter(len(r) for r in rows)
@@ -90,7 +102,7 @@ def sniff_dialect(sample: str, forced: str | None) -> tuple[Dialect, list[list[s
         consistency = count / len(rows)
         score = (width > 1, consistency, width)
         if best is None or score > best[0]:
-            best = (score, Dialect(delim, width, consistency), rows)
+            best = (score, Dialect(delim, width, consistency, leading), rows)
     if best is None:
         return Dialect(forced or ",", 1, 1.0), []
     return best[1], best[2]
@@ -168,7 +180,7 @@ def read_delimited(
     columns_sql = "{" + ", ".join(f"{literal(s)}: 'VARCHAR'" for s in sources) + "}"
     csv_args = (
         f"{literal(str(info.path))}, delim={literal(dialect.delimiter)}, quote='\"', "
-        f"escape='\"', header={str(header).lower()}, auto_detect=false, "
+        f"escape='\"', header={str(header).lower()}, skip={dialect.skip}, auto_detect=false, "
         f"columns={columns_sql}, null_padding=true, max_line_size={_MAX_LINE}"
     )
     try:

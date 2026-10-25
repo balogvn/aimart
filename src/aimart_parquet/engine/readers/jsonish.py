@@ -8,25 +8,33 @@ Slow path, only when needed: the records live inside an envelope (``{"data": {"i
 or the document is broken (trailing commas, single quotes, comments). We parse in Python —
 repairing with ``json_repair`` up to a size cap, because it is pure Python and slow — locate the
 record array, and re-emit it as NDJSON for DuckDB.
+
+Both paths load through ``_load``: a strict read first (clean input, one pass), else a lenient one
+that skips malformed lines. DuckDB matches nested field names case-insensitively, so a lenient
+read also keeps only the first of ``{"k": 1, "K": 2}``, and it cannot name an empty nested key at
+all; when the data has such keys, they are renamed (``K_2``, ``unnamed``) in one streamed pass
+and the renames are reported. Only in objects DuckDB reads as a STRUCT: a MAP (an object with
+many distinct keys) or JSON text keeps every key apart, and its keys are data.
 """
 
 from __future__ import annotations
 
 import json
+import string
 from typing import TYPE_CHECKING, Any
 
+import duckdb
+from duckdb.sqltypes import DuckDBPyType
 from json_repair import repair_json
 
 from aimart_parquet.engine.duck import ident, literal
 from aimart_parquet.engine.models import InputFormat
 from aimart_parquet.engine.readers import RAW_TABLE, RawColumn, RawTable
 from aimart_parquet.engine.text import to_utf8
-from aimart_parquet.errors import InputTooLarge, InvalidInput, InvalidRequest
+from aimart_parquet.errors import AimartError, InputTooLarge, InvalidInput, InvalidRequest
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import duckdb
 
     from aimart_parquet.engine.limits import Limits
     from aimart_parquet.engine.models import ConvertOptions
@@ -35,13 +43,266 @@ _MAX_OBJECT = 64 * 1024 * 1024
 _SEARCH_DEPTH = 4
 # json.loads needs ~10x the text size in RAM; above this, insist on a streamable layout.
 _MAX_PYTHON_PARSE = 100 * 1024 * 1024
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+_RENAMES_SHOWN = 5
+_TOO_DEEP = "The JSON is nested too deeply to parse."
+# DuckDB 1.5's errors for nested keys it cannot keep: 'Duplicate name "K" in struct ...' (strict
+# mode only; lenient mode merges them) and 'A table cannot be created from an unnamed struct'
+# (``{"a": {"": 1}}``, both modes). Matching them is a shortcut: the key-structure check in
+# ``_load`` finds the same keys without it.
+_UNKEEPABLE_KEY_ERRORS = ("Duplicate name", "unnamed struct")
+_EMPTY_KEY_NAME = "unnamed"
+
+# A path to an object inside a record: keys, with None for "an element of this list" or "a value
+# of this map". DuckDB gives all of those, in every record, one type, so they share a path.
+_KeyPath = tuple[str | None, ...]
+# The type DuckDB reads a part of a record as; None when unknown, which is treated as a STRUCT
+# (the type that loses keys), so an unknown part is renamed rather than left to lose values.
+_Kind = DuckDBPyType | None
 
 
-def _read_json_sql(path: Path, fmt: str) -> str:
+def _read_json_sql(path: Path, fmt: str, *, strict: bool = False) -> str:
     return (
         f"read_json({literal(str(path))}, format={literal(fmt)}, sample_size=-1, "
-        f"maximum_object_size={_MAX_OBJECT}, ignore_errors=true, maximum_depth=-1)"
+        f"maximum_object_size={_MAX_OBJECT}, ignore_errors={str(not strict).lower()}, "
+        "maximum_depth=-1)"
     )
+
+
+def _objects_sql(path: Path, fmt: str) -> str:
+    """Each record as JSON text, no schema; a malformed NDJSON line is NULL."""
+    return (
+        f"read_json_objects({literal(str(path))}, format={literal(fmt)}, "
+        f"maximum_object_size={_MAX_OBJECT}, ignore_errors=true)"
+    )
+
+
+def _fold(key: str) -> str:
+    """The name DuckDB compares STRUCT fields by: ASCII letters only (``é`` and ``É`` differ)."""
+    return key.translate(_ASCII_LOWER)
+
+
+def _first_wins(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    # DuckDB keeps the first of {"k": 1, "k": 9}; json.loads keeps the last. Renaming must not
+    # change which one survives, or a value would depend on whether another key collided.
+    out = dict(pairs)
+    if len(out) < len(pairs):  # rare: rebuild, keeping each key's first value and position
+        out = {}
+        for key, value in pairs:
+            out.setdefault(key, value)
+    return out
+
+
+def _shape(node: Any, kind: _Kind) -> str | None:
+    """How DuckDB stores ``node``: "struct", "map", "list", or None when kept as sent.
+
+    Only a STRUCT's field names are lost; a MAP's keys are data, kept apart as sent, and JSON
+    text (DuckDB's type for a value whose records disagree) keeps everything.
+    """
+    if isinstance(node, list):
+        return "list" if kind is None or kind.id == "list" else None
+    if not isinstance(node, dict):
+        return None
+    if kind is None:
+        return "struct"
+    return kind.id if kind.id in {"struct", "map"} else None
+
+
+def _child(kind: _Kind, index: int) -> _Kind:
+    """A list's item type (0) or a map's value type (1)."""
+    child = kind.children[index][1] if kind is not None else None
+    return child if isinstance(child, DuckDBPyType) else None
+
+
+def _fields(kind: _Kind) -> dict[str, DuckDBPyType]:
+    """A STRUCT's field types by folded name (an unknown kind has none: all are unknown)."""
+    children = kind.children if kind is not None else []
+    return {_fold(name): t for name, t in children if isinstance(t, DuckDBPyType)}
+
+
+def _collides(node: Any, kind: _Kind) -> bool:
+    """True when a nested object (in ``json_group_structure`` output) has a key DuckDB loses.
+
+    That is two keys that fold alike, or an empty one, in an object DuckDB reads as a STRUCT.
+    """
+    shape = _shape(node, kind)
+    if shape == "list":
+        return any(_collides(v, _child(kind, 0)) for v in node)
+    if shape == "map":
+        return any(_collides(v, _child(kind, 1)) for v in node.values())
+    if shape != "struct":
+        return False
+    if "" in node or len({_fold(k) for k in node}) < len(node):
+        return True
+    fields = _fields(kind)
+    return any(_collides(v, fields.get(_fold(k))) for k, v in node.items())
+
+
+def _record_kinds(names: list[str], types: list[DuckDBPyType]) -> dict[str, _Kind]:
+    """Each record key's DuckDB type, from the lenient read's columns.
+
+    Columns are named after record keys, except when two keys differ only by case: DuckDB then
+    names them itself (``id``, ``ID_1``), and a real key could be called ``ID_1`` too. When a
+    name looks like that, no key can be matched to its column with certainty: all are unknown.
+    """
+    folds = {_fold(name) for name in names}
+    for name in names:
+        base, _, number = name.rpartition("_")
+        if base and number.isdigit() and _fold(base) in folds:
+            return {}
+    return dict(zip(names, types, strict=True))
+
+
+class _KeyRenamer:
+    """Gives nested keys DuckDB would merge (or cannot name) new names, the same in every record.
+
+    ``columns`` holds the type DuckDB reads each record key as: objects it reads as a MAP or as
+    JSON text keep their keys. A key missing from it is unknown, and treated as a STRUCT.
+    """
+
+    def __init__(self, columns: dict[str, _Kind] | None = None) -> None:
+        self._columns = columns or {}
+        self._names: dict[_KeyPath, dict[str, str]] = {}
+        self._taken: dict[_KeyPath, set[str]] = {}
+        self.renamed: list[str] = []
+
+    def record(self, node: Any) -> Any:
+        if not isinstance(node, dict):  # records that are not objects: all of it is nested
+            return self.value(node, (), None)
+        # Record keys become columns, which DuckDB keeps apart by itself.
+        return {key: self.value(v, (key,), self._columns.get(key)) for key, v in node.items()}
+
+    def value(self, node: Any, path: _KeyPath, kind: _Kind) -> Any:
+        shape = _shape(node, kind)
+        if shape == "list":
+            return [self.value(v, (*path, None), _child(kind, 0)) for v in node]
+        if shape == "map":
+            return {key: self.value(v, (*path, None), _child(kind, 1)) for key, v in node.items()}
+        if shape != "struct":
+            return node
+        fields = _fields(kind)
+        names = self._names.setdefault(path, {})
+        out: dict[str, Any] = {}
+        for key, v in node.items():
+            name = names.get(key)
+            if name is None:
+                name = self._name(path, key, node)
+            out[name] = self.value(v, (*path, name), fields.get(_fold(key)))
+        return out
+
+    def _name(self, path: _KeyPath, key: str, siblings: dict[str, Any]) -> str:
+        taken = self._taken.setdefault(path, set())
+        name = key
+        if not key or _fold(key) in taken:
+            # Never take the name of a real key in this object, even one that comes later.
+            others = {_fold(k) for k in siblings}
+            base, n = key or _EMPTY_KEY_NAME, 2
+            name = base
+            while _fold(name) in taken or _fold(name) in others:
+                name, n = f"{base}_{n}", n + 1
+            where = "".join("[]" if p is None else f".{p}" for p in path).removeprefix(".")
+            self.renamed.append(f"{where}.{key or '""'} is now {where}.{name}")
+        self._names[path][key] = name
+        taken.add(_fold(name))
+        return name
+
+
+def _structure_collides(structure: str, columns: dict[str, _Kind] | None = None) -> bool:
+    """Whether a ``json_group_structure`` result has nested keys DuckDB would lose."""
+    try:
+        doc = json.loads(structure)
+        if not isinstance(doc, dict):  # records that are not objects: all of it is nested
+            return _collides(doc, None)
+        return any(_collides(v, (columns or {}).get(k)) for k, v in doc.items())
+    except RecursionError as exc:
+        raise InvalidInput(_TOO_DEEP, hint="Flatten the document before sending.") from exc
+
+
+def _renamed_record(text: str, renamer: _KeyRenamer) -> str:
+    try:
+        return json.dumps(renamer.record(json.loads(text, object_pairs_hook=_first_wins)))
+    except RecursionError as exc:
+        raise InvalidInput(_TOO_DEEP, hint="Flatten the document before sending.") from exc
+
+
+def _rename_keys(
+    con: duckdb.DuckDBPyConnection, path: Path, fmt: str, out: Path, columns: dict[str, _Kind]
+) -> list[str]:
+    """Rewrite ``path`` as NDJSON with colliding nested keys renamed; malformed lines dropped."""
+    renamer = _KeyRenamer(columns)
+    reader = con.execute(f"SELECT CAST(json AS VARCHAR) FROM {_objects_sql(path, fmt)}")
+    with out.open("w", encoding="utf-8") as fh:
+        for batch in reader.to_arrow_reader(1024):
+            for text in batch.column(0).to_pylist():
+                if text is not None:  # None is a malformed line, skipped and counted as before
+                    fh.write(_renamed_record(text, renamer))
+                    fh.write("\n")
+    return renamer.renamed
+
+
+def _load(con: duckdb.DuckDBPyConnection, path: Path, fmt: str, workdir: Path) -> list[str]:
+    """Create RAW_TABLE from ``path`` without losing nested keys; returns warnings.
+
+    DuckDB matches STRUCT field names case-insensitively: ``{"a": {"k": 1, "K": 2}}`` (HTTP
+    header maps, mixed ``ID``/``id``) failed type detection with 'Duplicate name "K" in
+    struct', and with ignore_errors=true the read kept ``k`` and dropped every ``K`` value
+    without a warning, on every path; an empty nested key (``{"a": {"": 1}}``) failed the whole
+    read with a bare error. So: strict first (clean input, one pass). If that fails, DuckDB's
+    error or the data's key structure says whether there are such keys; only then are they
+    renamed and the file read again. The lenient read's types say where: renaming the keys of a
+    MAP (``{"The": 250, "the": 251}`` in a 250-word count) rewrote data that was never at risk.
+    """
+    table = ident(RAW_TABLE)
+    try:
+        con.execute(
+            f"CREATE TABLE {table} AS SELECT * FROM {_read_json_sql(path, fmt, strict=True)}"
+        )
+    except duckdb.Error as exc:
+        collides = any(e in str(exc) for e in _UNKEEPABLE_KEY_ERRORS)
+        con.execute(f"DROP TABLE IF EXISTS {table}")
+    else:
+        return []
+    names: list[str] = []
+    types: list[DuckDBPyType] = []
+    if collides:  # the lenient read binds (it merges the keys); only creating a table fails
+        try:
+            lenient = con.sql(f"SELECT * FROM {_read_json_sql(path, fmt)}")
+            names, types = lenient.columns, lenient.types
+        except duckdb.Error:
+            pass  # no types: every nested object is treated as a STRUCT, and renamed
+    else:  # malformed lines (skipped below), which may hide colliding keys too
+        con.execute(f"CREATE TABLE {table} AS SELECT * FROM {_read_json_sql(path, fmt)}")
+        lenient = con.sql(f"SELECT * FROM {table}")
+        names, types = lenient.columns, lenient.types
+    columns = _record_kinds(names, types)
+    if not collides:
+        row = con.execute(
+            f"SELECT json_group_structure(json) FROM {_objects_sql(path, fmt)}"
+        ).fetchone()
+        if not row or row[0] is None or not _structure_collides(row[0], columns):
+            return []
+        con.execute(f"DROP TABLE {table}")
+    renamed_path = workdir / "records_renamed.ndjson"
+    renamed = _rename_keys(con, path, fmt, renamed_path, columns)
+    try:
+        sql = _read_json_sql(renamed_path, "newline_delimited", strict=True)
+        con.execute(f"CREATE TABLE {table} AS SELECT * FROM {sql}")
+    except duckdb.Error as exc:  # DuckDB folded a key we did not: refuse rather than drop data
+        raise InvalidInput(
+            f"Nested keys in this JSON could not be kept apart: {str(exc).splitlines()[0]}",
+            hint="Rename nested keys so that none is empty and no two in one object differ "
+            "only by letter case.",
+        ) from exc
+    if not renamed:
+        return []
+    shown = "; ".join(renamed[:_RENAMES_SHOWN])
+    more = f"; and {len(renamed) - _RENAMES_SHOWN} more" if len(renamed) > _RENAMES_SHOWN else ""
+    return [
+        f"renamed {len(renamed)} nested key{'s' if len(renamed) > 1 else ''} whose values "
+        "would otherwise have been lost "
+        f"(nested field names are matched ignoring letter case, and cannot be empty): "
+        f"{shown}{more}"
+    ]
 
 
 def _first_char(path: Path) -> str:
@@ -222,10 +483,10 @@ def read_json(
             duck_fmt = "newline_delimited"
         if duck_fmt:
             try:
-                con.execute(
-                    f"CREATE TABLE {table} AS SELECT * FROM {_read_json_sql(info.path, duck_fmt)}"
-                )
+                warnings.extend(_load(con, info.path, duck_fmt, workdir))
                 loaded = True
+            except AimartError:
+                raise
             except Exception:  # noqa: BLE001 - any DuckDB failure falls back to the Python path
                 con.execute(f"DROP TABLE IF EXISTS {table}")
             if loaded:
@@ -258,9 +519,7 @@ def read_json(
                 out.write(json.dumps(rec if isinstance(rec, dict) else {"value": rec}))
                 out.write("\n")
         del records
-        con.execute(
-            f"CREATE TABLE {table} AS SELECT * FROM {_read_json_sql(ndjson, 'newline_delimited')}"
-        )
+        warnings.extend(_load(con, ndjson, "newline_delimited", workdir))
         if found_at:
             warnings.append(f"read records from JSON path '{found_at}'")
     columns = _describe(con, options.flatten_nested)
