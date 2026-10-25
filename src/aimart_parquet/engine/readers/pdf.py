@@ -310,10 +310,11 @@ def _filled(row: list[str]) -> int:
 def _year_names(row: list[str], typed: list[int], body: list[list[str]]) -> bool:
     """Years as column names ('Region', '2023', '2024'): a header the type check reads as data.
 
-    Found reviewing the fixes below: a title above such a header became the column names again,
-    and a second year-comparison table on the next page ('Department', '2023', '2024') was
-    merged into the first as a body row. Distinct years under every filled typed column, where
-    the body of each of those columns is not mostly years (a 'Year' column holds data).
+    Found reviewing the first header and continuation fixes: a title above such a header became
+    the column names again, and a second year-comparison table on the next page ('Department',
+    '2023', '2024') was merged into the first as a body row. Distinct years under every filled
+    typed column, where the body of each of those columns is not mostly years (a 'Year' column
+    holds data).
     """
     cells = {c: v for c in typed if (v := _cell(row, c))}
     if not cells or len(set(cells.values())) != len(cells):
