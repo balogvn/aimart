@@ -165,6 +165,13 @@ def _expected_expr(inferrer: TypeInferrer, out: _Output, col: ExpectedColumn) ->
     if col.type == "int64" and out.plan.type_name in {"float64", "decimal", "native"}:
         # DuckDB rounds 12.5 to 12 on cast; a fractional value must be a counted reject instead.
         return f"(CASE WHEN TRY_CAST({x} AS DOUBLE) = floor(TRY_CAST({x} AS DOUBLE)) THEN TRY_CAST({x} AS BIGINT) END)"
+    if col.type == "decimal" and out.plan.type_name in {"int64", "float64"} and out.raw is not None:
+        # A number inference read from text is read again from that text, where inference read
+        # one: through the inferred DOUBLE, '1234567890123456.78' became 1234567890123456.80.
+        # Resetting the column to its raw text instead made the 'NA' inference had nulled a
+        # counted reject, and strict refused a column that fits.
+        decimal = inferrer.cast_text(out.raw.source, col.type, target)
+        return f"(CASE WHEN {x} IS NOT NULL THEN {decimal} END)"
     if col.type == "decimal" and inferrer.is_number(out.plan.expr):
         return _unrounded(x, target)
     return f"TRY_CAST({x} AS {target})"
@@ -201,15 +208,10 @@ def _apply_expected_schema(
             result.append(_Output(col.name, None, plan, ["added as all-null: missing from input"]))
             continue
         typed = out.plan.type_name != "string"
-        from_text = col.type == "string" or (
-            col.type == "decimal" and out.plan.type_name in {"int64", "float64"}
-        )
-        if from_text and typed and out.raw is not None and out.raw.text:
+        if col.type == "string" and typed and out.raw is not None and out.raw.text:
             # Declaring a text column string asks for its text. Casting the inferred value back
             # rewrote it ('1.50' -> '1.5', '15/01/2025' -> '2025-01-15', '1.234' -> '1234') and
             # lost what the 98% tolerance had nulled ('oops' -> null, charged under strict).
-            # A decimal is read from the text too: through the inferred DOUBLE,
-            # '1234567890123456.78' became 1234567890123456.80.
             out = _Output(out.name, out.raw, inferrer.text_plan(out.raw.source), [])
         expr = _expected_expr(inferrer, out, col)
         row = con.sql(

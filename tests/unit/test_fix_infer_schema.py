@@ -264,3 +264,62 @@ class TestDecimalNeverRoundsSilently:
             expected_schema=[{"name": "flag", "type": "decimal"}],
         )
         assert result.rows["flag"] == [D("1.00"), D("0.00")]
+
+
+class TestDecimalFromAnInferredNumber:
+    """A number inference read from text is read again from its text for a decimal target.
+
+    The first version of that reset the column to its raw text, so the 'NA' and 'n/a' that
+    inference had read as nulls became counted rejects (strict refused a column that fits the
+    schema), and the report lost what inference had said ('stripped currency symbols').
+    """
+
+    SCHEMA = ({"name": "amount", "type": "decimal"}, {"name": "x", "type": "int64"})
+
+    @pytest.mark.parametrize("strict", [False, True])
+    def test_null_tokens_stay_nulls(self, tmp_path, strict) -> None:
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            "amount,x\n12.50,1\nNA,2\n0.40,3\nn/a,4\n",
+            expected_schema=list(self.SCHEMA),
+            strict=strict,  # failed: '2 values do not fit decimal'
+        )
+        assert result.rows["amount"] == [D("12.50"), None, D("0.40"), None]
+        amount = result.column("amount")
+        assert (amount.rejected_count, amount.rejected_examples, amount.null_count) == (0, [], 2)
+
+    def test_the_inference_report_is_kept(self, tmp_path) -> None:
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            'amount;x\n"€1.234,56";1\n"€12,50";2\n"€7";3\n',
+            expected_schema=list(self.SCHEMA),
+        )
+        assert result.rows["amount"] == [D("1234.56"), D("12.50"), D("7.00")]
+        amount = result.column("amount")
+        assert amount.inferred_from_text
+        assert amount.notes == [
+            "parsed eu-style number formatting",
+            "stripped currency symbols",
+            "cast to decimal per expected_schema",
+        ]
+
+    @pytest.mark.parametrize("strict", [False, True])
+    def test_tolerance_misfits_and_rounding_are_both_counted(self, tmp_path, strict) -> None:
+        cells = [f"{i}.25" for i in range(60)] + ["oops", "1.255", "NA"]  # 61 of 62 fit
+        csv = "amount,x\n" + "".join(f"{c},{i}\n" for i, c in enumerate(cells))
+        if strict:
+            with pytest.raises(SchemaViolation) as info:
+                kit.convert_bytes(
+                    tmp_path, "a.csv", csv, expected_schema=list(self.SCHEMA), strict=True
+                )
+            assert info.value.details["violations"] == [
+                {"column": "amount", "problem": "2 values do not fit decimal"}
+            ]
+            return
+        result = kit.convert_bytes(tmp_path, "a.csv", csv, expected_schema=list(self.SCHEMA))
+        assert result.rows["amount"][:2] == [D("0.25"), D("1.25")]
+        assert result.rows["amount"][60:] == [None, None, None]
+        amount = result.column("amount")
+        assert (amount.rejected_count, amount.rejected_examples) == (2, ["oops", "1.255"])
