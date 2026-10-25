@@ -323,3 +323,58 @@ class TestDecimalFromAnInferredNumber:
         assert result.rows["amount"][60:] == [None, None, None]
         amount = result.column("amount")
         assert (amount.rejected_count, amount.rejected_examples) == (2, ["oops", "1.255"])
+
+
+class TestBoolFromNumbers:
+    """DuckDB casts every nonzero number to true: 2, 5 and 0.5 became true with no reject.
+
+    The cast of a text column reads only 0 and 1 (and the bool words), so with inference on,
+    strict passed and charged for a column that failed strict with inference off.
+    """
+
+    SCHEMA = ({"name": "flag", "type": "bool"}, {"name": "x", "type": "string"})
+
+    @pytest.mark.parametrize("infer_types", [True, False])
+    def test_strict_fails_on_numbers_other_than_0_and_1(self, tmp_path, infer_types) -> None:
+        with pytest.raises(SchemaViolation) as info:
+            kit.convert_bytes(
+                tmp_path,
+                "a.csv",
+                "flag,x\n0,a\n1,b\n2,c\n5,d\n",
+                infer_types=infer_types,
+                expected_schema=list(self.SCHEMA),
+                strict=True,
+            )
+        assert info.value.details["violations"] == [
+            {"column": "flag", "problem": "2 values do not fit bool"}
+        ]
+
+    def test_typed_sources(self, tmp_path) -> None:
+        src = kit.write_parquet(
+            tmp_path / "in.parquet",
+            {
+                "n": pa.array([0, 1, 7, None], pa.int64()),
+                "d": pa.array([0.0, 1.0, 0.5, -1.0], pa.float64()),
+                "m": pa.array([D("1.00"), D("0.00"), D("0.01"), None], pa.decimal128(5, 2)),
+            },
+        )
+        result = kit.convert_path(
+            src, expected_schema=[{"name": c, "type": "bool"} for c in ("n", "d", "m")]
+        )
+        assert result.rows == {  # 7, 0.5, -1.0 and 0.01 were all true
+            "n": [False, True, None, None],
+            "d": [False, True, None, None],
+            "m": [True, False, None, None],
+        }
+        assert [c.rejected_count for c in result.report.columns] == [1, 2, 1]
+        assert result.column("d").rejected_examples == ["-1.0", "0.5"]
+
+    def test_zero_and_one_still_cast(self, tmp_path) -> None:
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            "flag,x\n0,a\n1,b\n1,c\n",
+            expected_schema=list(self.SCHEMA),
+            strict=True,
+        )
+        assert result.rows["flag"] == [False, True, True]

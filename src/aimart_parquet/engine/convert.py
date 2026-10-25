@@ -169,6 +169,10 @@ def _expected_expr(inferrer: TypeInferrer, out: _Output, col: ExpectedColumn) ->
     if out.plan.type_name == "string" and out.raw is not None:
         return inferrer.cast_text(out.raw.source, col.type, target)
     x = f"({out.plan.expr})"
+    if col.type == "bool" and inferrer.is_number(out.plan.expr):
+        # DuckDB casts every nonzero number to true: 2, 0.5 and -1 were true, uncounted, while
+        # the cast of a text column reads only 0 and 1. A number is a bool only if it is one.
+        return f"(CASE WHEN {x} = 0 THEN false WHEN {x} = 1 THEN true END)"
     if col.type == "int64" and out.plan.type_name in {"float64", "decimal", "native"}:
         # DuckDB rounds 12.5 to 12 on cast; a fractional value must be a counted reject instead.
         return f"(CASE WHEN TRY_CAST({x} AS DOUBLE) = floor(TRY_CAST({x} AS DOUBLE)) THEN TRY_CAST({x} AS BIGINT) END)"
