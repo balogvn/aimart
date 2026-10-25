@@ -172,3 +172,25 @@ async def test_gcs_paid_join_of_artifacts_bigger_than_the_cache_together(
         assert again.status_code == 200, again.text
     assert disk_bytes(settings.artifact_dir) <= budget  # trimmed back once the calls ended
     assert {key(art.id) for art in ids.values()} <= set(client.the_bucket.blobs)  # blobs untouched
+
+
+async def test_mcp_output_refused_for_a_full_store_is_not_settled(
+    make_settings: Callable[..., Settings],
+) -> None:
+    settings = make_settings()
+    fake = kit.FakeFacilitator()
+    async with kit.running_app(settings, facilitator=fake) as h:
+        size = await output_size(h)
+        h.app.state.service.store.max_total_bytes = int(size * 1.7)
+        first = await h.paying.post("/v1/convert", **convert_body("1.csv"))
+        assert first.status_code == 200
+        args = {"content_base64": kit.b64(CSV), "filename": "2.csv"}
+        async with kit.mcp_over_http(h.app) as client:
+            unpaid = await client.call_tool("convert_to_parquet", args)
+            meta = await kit.mcp_payment_meta(kit.paying_client(), unpaid.structured_content)
+            result = await client.call_tool("convert_to_parquet", args, meta=meta)
+    assert result.is_error
+    assert result.structured_content["error"]["code"] == "busy"
+    assert "not charged" in result.structured_content["error"]["hint"]
+    assert len(fake.settled) == 1  # only the REST call that was delivered
+    assert disk_bytes(settings.artifact_dir) == first.json()["artifact"]["size_bytes"]
