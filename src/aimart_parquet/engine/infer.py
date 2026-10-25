@@ -76,6 +76,8 @@ _NUMERIC_TYPES = frozenset(
     {"tinyint", "smallint", "integer", "bigint", "hugeint", "float", "double", "decimal"}
     | {"utinyint", "usmallint", "uinteger", "ubigint", "uhugeint"}
 )
+NAIVE_TIME_TYPES = frozenset({"date", "timestamp", "timestamp_s", "timestamp_ms", "timestamp_ns"})
+INSTANT_TYPE = "timestamp with time zone"
 _RE_DATE_LIKE = (
     r"\d{1,4}[-/. ]\d{1,2}[-/. ]\d{1,4}.*|.*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec).*"
 )
@@ -209,6 +211,11 @@ def _zoned_ts(v: str) -> str:
 def naive_as_utc_note(naive: int, total: int) -> str:
     """Said whenever a timestamptz column holds values that carried no offset of their own."""
     return f"values without a UTC offset were read as UTC ({naive} of {total})"
+
+
+def offset_to_utc_note(converted: int, total: int) -> str:
+    """Said whenever a naive date or timestamp column holds values that carried an offset."""
+    return f"values with a UTC offset were converted to UTC ({converted} of {total})"
 
 
 def _parse_ts(v: str, formats: list[str]) -> str:
@@ -409,9 +416,8 @@ class TypeInferrer:
                 f"SELECT count_if({assumed} AND ({expr}) IS NOT NULL), count({v}) FROM {self.table}"
             ).fetchone()
             if row and row[0]:
-                if type_name == "timestamptz":
-                    return naive_as_utc_note(int(row[0]), int(row[1]))
-                return f"values with a UTC offset were converted to UTC ({row[0]} of {row[1]})"
+                note = naive_as_utc_note if type_name == "timestamptz" else offset_to_utc_note
+                return note(int(row[0]), int(row[1]))
         return None
 
     def _fit_counts(self, fit: str, converted: str) -> tuple[int, int]:
@@ -572,10 +578,12 @@ class TypeInferrer:
         return f"TRY_CAST({e.v} AS {sql_type})"
 
     # ------------------------------------------------------------------ helpers
+    def type_id(self, expr: str) -> str:
+        """The DuckDB type id of expr over this table (natives may be anything)."""
+        return str(self.con.sql(f"SELECT {expr} FROM {self.table} LIMIT 0").types[0].id)
+
     def is_number(self, expr: str) -> bool:
-        """Whether expr over this table is a numeric DuckDB type (natives may be anything)."""
-        kind = self.con.sql(f"SELECT {expr} FROM {self.table} LIMIT 0").types[0].id
-        return kind in _NUMERIC_TYPES
+        return self.type_id(expr) in _NUMERIC_TYPES
 
     def _decimal_scale(self, sql_type: str) -> int:
         children = dict(self.con.sql(f"SELECT NULL::{sql_type}").types[0].children)

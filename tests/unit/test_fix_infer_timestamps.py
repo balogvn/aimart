@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import TYPE_CHECKING, Any
 
+import pyarrow as pa
 import pytest
 
 import aimart_testkit as kit
@@ -416,3 +417,95 @@ class TestInstantsPastYear9999:
             int(utc(2025, 1, 15, 9).timestamp()) * 10**6,
             int(utc(2025, 1, 15, 10).timestamp()) * 10**6,
         ]
+
+
+class TestTypedSourcesSayWhatTheCastAssumed:
+    """A cast between naive times and instants assumes UTC whatever the source column is.
+
+    The cast of a text column said so ('values with a UTC offset were converted to UTC'), the
+    same cast of the column inference had typed as timestamptz said nothing, so the report
+    depended on whether inference left the column as text; native columns (Parquet, Excel,
+    JSON) said nothing either way.
+    """
+
+    CONVERTED = "values with a UTC offset were converted to UTC"
+
+    @pytest.mark.parametrize(
+        ("type_name", "expected"),
+        [
+            ("timestamp", [dt.datetime(2025, 1, 16, 4), dt.datetime(2025, 1, 16, 19)]),
+            ("date", [dt.date(2025, 1, 16), dt.date(2025, 1, 16)]),
+        ],
+    )
+    @pytest.mark.parametrize("infer_types", [True, False])
+    def test_an_inferred_instant_cast_to_a_naive_type(
+        self, tmp_path, type_name, expected, infer_types
+    ) -> None:
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            "ts,x\n2025-01-15 23:00:00-05:00,a\n2025-01-16 11:00:00-08:00,b\n",
+            infer_types=infer_types,
+            expected_schema=[{"name": "ts", "type": type_name}],
+        )
+        assert result.rows["ts"] == expected
+        assert f"{self.CONVERTED} (2 of 2)" in result.column("ts").notes
+
+    def test_naive_values_in_an_inferred_instant_are_not_counted_as_offsets(self, tmp_path) -> None:
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            "ts,x\n" + "".join(f"{v},{i}\n" for i, v in enumerate(REVIEW)),
+            expected_schema=[{"name": "ts", "type": "timestamp"}],
+        )
+        assert result.rows["ts"] == [
+            dt.datetime(2025, 1, 15, 5),
+            dt.datetime(2025, 1, 15, 18),
+            dt.datetime(2025, 1, 15, 10),
+        ]
+        assert result.column("ts").notes == [
+            f"{READ_AS_UTC} (1 of 3)",
+            "cast to timestamp per expected_schema",
+            f"{self.CONVERTED} (2 of 3)",
+        ]
+
+    def test_native_columns(self, tmp_path) -> None:
+        src = kit.write_parquet(
+            tmp_path / "in.parquet",
+            {
+                "naive": pa.array([dt.datetime(2025, 1, 15, 10), None], pa.timestamp("ms")),
+                "day": pa.array([dt.date(2025, 1, 15), dt.date(2025, 1, 16)], pa.date32()),
+                "paris": pa.array(
+                    [dt.datetime(2025, 1, 15, 9, tzinfo=dt.UTC), None],
+                    pa.timestamp("us", tz="Europe/Paris"),
+                ),
+                "count": pa.array([1, 2], pa.int64()),
+            },
+        )
+        result = kit.convert_path(
+            src,
+            expected_schema=[
+                {"name": "naive", "type": "timestamptz"},
+                {"name": "day", "type": "timestamptz"},
+                {"name": "paris", "type": "timestamp"},
+                {"name": "count", "type": "float64"},
+            ],
+        )
+        assert as_utc(result.rows["naive"]) == [utc(2025, 1, 15, 10), None]
+        assert result.rows["paris"] == [dt.datetime(2025, 1, 15, 9), None]
+        notes = {c.name: c.notes[1:] for c in result.report.columns}
+        assert notes == {
+            "naive": [f"{READ_AS_UTC} (1 of 1)"],
+            "day": [f"{READ_AS_UTC} (2 of 2)"],
+            "paris": [f"{self.CONVERTED} (1 of 1)"],
+            "count": [],
+        }
+
+    def test_same_kind_casts_need_no_note(self, tmp_path) -> None:
+        result = kit.convert_bytes(
+            tmp_path,
+            "a.csv",
+            "ts,x\n2025-01-15 10:00:00,a\n2025-01-16 11:00:00,b\n",
+            expected_schema=[{"name": "ts", "type": "date"}],
+        )
+        assert result.column("ts").notes == ["cast to date per expected_schema"]
