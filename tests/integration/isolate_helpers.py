@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import signal
+import tempfile
 import time
 from pathlib import Path
 
@@ -71,3 +72,10 @@ def allocate(total_mb: int, step_mb: int = 20, hold_s: float = 0.0) -> int:
         for block in blocks:
             _ = block[::4096]  # one byte a page brings the page back in
     return len(blocks)
+
+
+def write_temp_then_sleep(seconds: float) -> None:
+    """Leave a temp folder behind (as a query's spill folder does), then get killed."""
+    folder = Path(tempfile.mkdtemp(prefix="aimart-q-"))
+    (folder / "input.parquet").write_bytes(b"x" * 1024)
+    time.sleep(seconds)

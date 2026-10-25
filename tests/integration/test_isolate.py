@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import tempfile
 import time
 from typing import TYPE_CHECKING
 
@@ -38,12 +39,23 @@ def test_child_error_keeps_type_code_hint_and_details() -> None:
     assert exc.details == {"column": "amount", "rows": [3, 7]}
 
 
-def test_unexpected_exception_is_an_internal_error() -> None:
+def test_unexpected_exception_is_an_internal_error(caplog: pytest.LogCaptureFixture) -> None:
     with pytest.raises(errors.AimartError) as info:
         run_isolated(helpers.raise_value_error, timeout_s=30)
     assert type(info.value) is errors.AimartError
     assert info.value.http_status == 500
-    assert "ValueError: unexpected bug" in info.value.message
+    # The exception's text can carry server paths: it is logged, and the caller sees its type.
+    assert info.value.message == "Internal error (ValueError)."
+    assert "unexpected bug" in caplog.text
+
+
+def test_the_job_temp_directory_is_removed_even_when_the_child_is_killed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    with pytest.raises(errors.Timeout):
+        run_isolated(helpers.write_temp_then_sleep, 60, timeout_s=2)
+    assert list(tmp_path.iterdir()) == []  # the child's aimart-job-* folder went with it
 
 
 def test_recursion_and_memory_errors_are_typed() -> None:
@@ -135,17 +147,20 @@ def test_memory_cap_kills_a_job_that_keeps_allocating() -> None:
     assert run_isolated(helpers.allocate, 40, timeout_s=60, memory_limit_mb=cap) == 2  # under it
 
 
-def test_memory_cap_stops_a_query_returning_huge_strings(tmp_path: Path) -> None:
+def test_memory_cap_stops_a_query_building_huge_values(tmp_path: Path) -> None:
     import aimart_testkit as kit
     from aimart_parquet.engine.tabular import query
 
     data = kit.write_parquet(tmp_path / "t.parquet", {"a": [1]})
     cap = _baseline_mb() + 150
+    # The engine cuts long cells before they reach Arrow, so a query returning huge strings no
+    # longer grows the child; a value DuckDB builds itself (700 MB here, behind a one-integer
+    # result) is what only the cap can stop.
     with pytest.raises(errors.InputTooLarge, match="memory budget"):
         run_isolated(
             query,
             {"data": data},
-            "SELECT repeat('x', 1000000) AS s FROM range(700)",
+            "SELECT length(string_agg(repeat('x', 1000000), '')) AS n FROM range(700)",
             limit=1000,
             fmt="json",
             query_timeout=60,

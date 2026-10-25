@@ -16,16 +16,16 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import duckdb
+
 from aimart_parquet.engine.duck import ident, literal
 from aimart_parquet.engine.models import InputFormat
 from aimart_parquet.engine.readers import RAW_TABLE, RawColumn, RawTable
 from aimart_parquet.engine.text import to_utf8
-from aimart_parquet.errors import InvalidInput
+from aimart_parquet.errors import InputTooLarge, InvalidInput
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import duckdb
 
     from aimart_parquet.engine.limits import Limits
     from aimart_parquet.engine.models import ConvertOptions
@@ -187,6 +187,13 @@ def read_delimited(
         con.execute(
             f"CREATE TABLE {ident(RAW_TABLE)} AS SELECT * FROM read_csv({csv_args}, strict_mode=false)"
         )
+    except duckdb.OutOfMemoryException as exc:
+        # The whole file is loaded into a table: past DuckDB's memory limit this is a size
+        # problem, not a parsing one, and the old message sent callers to the delimiter.
+        raise InputTooLarge(
+            "The file needs more memory to read than this server allows.",
+            hint="Send a smaller file, or split it into parts; you were not charged.",
+        ) from exc
     except Exception as exc:  # duckdb raises several unrelated exception types here
         raise InvalidInput(
             f"Could not parse the file as delimited text: {str(exc).splitlines()[0]}",

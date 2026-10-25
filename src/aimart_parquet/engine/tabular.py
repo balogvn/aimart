@@ -275,14 +275,15 @@ def _collect(
 def _python_values(column: pa.ChunkedArray, name: str) -> list[Any]:
     try:
         return column.to_pylist()  # type: ignore[no-any-return]
-    except (ValueError, pa.ArrowException):
+    except (ValueError, OverflowError, pa.ArrowException):
         # Nanosecond times that are not whole microseconds ('...00.000000001'::TIMESTAMP_NS),
-        # and structs with repeated or empty field names (row('a', 1), or a Parquet file), have
-        # no Python object; to_pylist() raised and the caller got a bare 500.
+        # structs with repeated or empty field names (row('a', 1), or a Parquet file), and
+        # times past year 9999 (a '9999-12-31 23:59-05:00' sentinel converted to UTC) have no
+        # Python object; to_pylist() raised and the caller got a bare 500.
         pass
     try:
         return [v for chunk in column.chunks for v in _displayable(chunk).to_pylist()]
-    except (ValueError, pa.ArrowException) as exc:
+    except (ValueError, OverflowError, pa.ArrowException) as exc:
         raise InvalidInput(
             f"Column {name!r} of type {type_name(column.type)} cannot be shown.",
             hint="Cast it to text (CAST(x AS VARCHAR)) or leave it out; you were not charged.",

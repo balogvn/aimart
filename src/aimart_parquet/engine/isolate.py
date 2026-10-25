@@ -24,10 +24,13 @@ from __future__ import annotations
 
 import ctypes
 import functools
+import logging
 import multiprocessing as mp
 import os
+import shutil
 import signal
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -39,6 +42,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 T = TypeVar("T")
+
+log = logging.getLogger("aimart.isolate")
 
 # BLAS thread pools do not survive fork() everywhere: on macOS (Accelerate) the quantum kernel
 # PCA segfaulted in a worker on one input and not another — BLAS only goes multi-threaded above
@@ -152,8 +157,13 @@ def _wait_for_report(receiver: Any, pid: int, timeout_s: float, memory_limit_mb:
 
 
 def _child(
-    conn: Any, fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
+    conn: Any, fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any], tmp: str
 ) -> None:
+    # Whatever the job puts in the temp directory lands in a folder the parent deletes once the
+    # child is gone. A child killed at the deadline or the memory cap skips its own cleanup, and
+    # a query's spill folder holds hard links to (or copies of) its inputs: RAM on Cloud Run.
+    tempfile.tempdir = tmp
+    os.environ["TMPDIR"] = tmp
     try:
         conn.send(("ok", fn(*args, **kwargs)))
     except errors.AimartError as exc:
@@ -179,7 +189,7 @@ def _child(
             )
         )
     except BaseException as exc:  # noqa: BLE001 - report anything; the parent decides
-        conn.send(("crash", f"{type(exc).__name__}: {exc}"))
+        conn.send(("crash", type(exc).__name__, f"{type(exc).__name__}: {exc}"))
     finally:
         conn.close()
 
@@ -210,17 +220,21 @@ def run_isolated[T](
     """
     if memory_limit_mb is None:
         memory_limit_mb = get_settings().job_memory_limit_mb
+    tmp = tempfile.mkdtemp(prefix="aimart-job-")
     receiver, sender = _CTX.Pipe(duplex=False)
-    proc = _CTX.Process(target=_child, args=(sender, fn, args, kwargs), daemon=True)
-    proc.start()
-    sender.close()
+    proc = _CTX.Process(target=_child, args=(sender, fn, args, kwargs, tmp), daemon=True)
     try:
-        message = _wait_for_report(receiver, proc.pid, timeout_s, memory_limit_mb)
+        proc.start()
+        sender.close()
+        try:
+            message = _wait_for_report(receiver, proc.pid, timeout_s, memory_limit_mb)
+        finally:
+            receiver.close()
+            if proc.is_alive():
+                proc.kill()
+            proc.join(5)
     finally:
-        receiver.close()
-        if proc.is_alive():
-            proc.kill()
-        proc.join(5)
+        shutil.rmtree(tmp, ignore_errors=True)
     if message is None:
         code = proc.exitcode
         signame = signal.Signals(-code).name if code is not None and code < 0 else str(code)
@@ -232,6 +246,8 @@ def run_isolated[T](
         return message[1]  # type: ignore[no-any-return]
     if message[0] == "err":
         raise _rebuild(*message[1:])
+    # The text of an unexpected exception can carry server paths: log it, never send it.
+    log.error("isolated job crashed: %s", message[2])
     raise errors.AimartError(
-        f"Internal error: {message[1]}", hint="Retry; if it persists, report it."
+        f"Internal error ({message[1]}).", hint="Retry; if it persists, report it."
     )

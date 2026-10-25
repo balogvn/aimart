@@ -171,7 +171,14 @@ class Service:
         """Run one engine call. Callers hold the job slot (``async with self._job()``)."""
         if isolate:
             # The child enforces the deadline (and is killed at it), so no outer timeout here.
-            call = functools.partial(run_isolated, fn, *args, timeout_s=timeout_s, **kwargs)
+            call = functools.partial(
+                run_isolated,
+                fn,
+                *args,
+                timeout_s=timeout_s,
+                memory_limit_mb=self.settings.job_memory_limit_mb,
+                **kwargs,
+            )
             return await anyio.to_thread.run_sync(call)
         try:
             with anyio.fail_after(timeout_s):

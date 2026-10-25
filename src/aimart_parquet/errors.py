@@ -95,3 +95,10 @@ class ArtifactNotFound(AimartError):
 class Busy(AimartError):
     code = "busy"
     http_status = 503
+
+
+class StorageUnavailable(AimartError):
+    """The artifact store (GCS) could not be reached; the call is refused, so it is unpaid."""
+
+    code = "storage_unavailable"
+    http_status = 503

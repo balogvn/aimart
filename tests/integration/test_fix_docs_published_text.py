@@ -231,15 +231,6 @@ def schema_descriptions(node: object, path: str = "") -> list[tuple[str, str]]:
 
 
 @pytest.mark.anyio
-@pytest.mark.xfail(
-    raises=AssertionError,
-    strict=True,
-    reason=(
-        "engine/models.py (not the docs area's file): ArtifactRef.expires_at still says the "
-        "artifact 'is deleted' at that time; see the cross-area request. Remove this marker in "
-        "the change that fixes the field."
-    ),
-)
 async def test_published_schemas_say_unreachable_at_expiry_not_deleted(
     free_app: kit.AppHarness,
 ) -> None:

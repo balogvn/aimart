@@ -17,8 +17,12 @@ import re
 
 import pyarrow as pa
 import pytest
+from pydantic import ValidationError
 
 import aimart_testkit as kit
+from aimart_parquet.engine.convert import convert_file
+from aimart_parquet.engine.limits import Limits
+from aimart_parquet.engine.models import ConvertOptions, ExpectedColumn
 from aimart_parquet.errors import InvalidRequest, SchemaViolation
 
 D = decimal.Decimal
@@ -52,21 +56,38 @@ class TestDecimalScaleZero:
         assert result.rows["amt"] == [D("12.50")]
 
 
+@pytest.mark.parametrize(
+    ("column", "message"),
+    [
+        ({"precision": 4, "scale": 6}, "decimal scale 6 exceeds precision 4"),
+        ({"precision": 1}, "decimal scale 2 (the default) exceeds precision 1"),
+    ],
+)
 class TestImpossibleDecimal:
-    @pytest.mark.parametrize(
-        ("column", "message"),
-        [
-            ({"precision": 4, "scale": 6}, "decimal scale 6 exceeds precision 4"),
-            ({"precision": 1}, "decimal scale 2 (the default) exceeds precision 1"),
-        ],
-    )
+    def test_the_request_schema_refuses_it(self, column, message) -> None:
+        # Refused while the request is validated: before any work, and before any payment.
+        with pytest.raises(ValidationError, match=re.escape(message)):
+            ConvertOptions(expected_schema=[{"name": "amt", "type": "decimal", **column}])
+
     def test_is_an_invalid_request_not_a_crash(self, tmp_path, column, message) -> None:
+        # Models built without validation (model_construct) still get a 400, never a 500.
+        unchecked = ExpectedColumn.model_construct(
+            name="amt",
+            type="decimal",
+            nullable=True,
+            **{"precision": None, "scale": None, **column},
+        )
+        src = kit.write(tmp_path / "a.csv", "amt\n1\n")
         with pytest.raises(InvalidRequest, match=re.escape(message)) as info:
-            kit.convert_bytes(
-                tmp_path,
-                "a.csv",
-                "amt\n1\n",
-                expected_schema=[{"name": "amt", "type": "decimal", **column}],
+            convert_file(
+                src,
+                tmp_path / "out.parquet",
+                filename="a.csv",
+                options=ConvertOptions.model_construct(
+                    **{**ConvertOptions().model_dump(), "expected_schema": [unchecked]}
+                ),
+                workdir=tmp_path,
+                limits=Limits(),
             )
         assert info.value.http_status == 400
         assert info.value.details == {"column": "amt"}

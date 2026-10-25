@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class InputFormat(StrEnum):
@@ -54,8 +54,31 @@ class ExpectedColumn(BaseModel):
     name: str = Field(description="Column name after normalization (snake_case by default).")
     type: ColumnType
     nullable: bool = True
-    precision: int | None = Field(default=None, ge=1, le=38, description="decimal only")
-    scale: int | None = Field(default=None, ge=0, le=38, description="decimal only")
+    precision: int | None = Field(
+        default=None, ge=1, le=38, description="decimal only: total digits. Default 18."
+    )
+    scale: int | None = Field(
+        default=None,
+        ge=0,
+        le=38,
+        description=(
+            "decimal only: digits after the point, at most precision. Default 2; 0 for whole "
+            "numbers. A value that would round to fit is a counted reject, never rounded."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _scale_fits(self) -> ExpectedColumn:
+        # Checked here so the request schema refuses it before any work (or any payment);
+        # convert repeats the check for callers that build the model without validation.
+        if self.type == "decimal":
+            precision = 18 if self.precision is None else self.precision
+            scale = 2 if self.scale is None else self.scale
+            if scale > precision:
+                default = " (the default)" if self.scale is None else ""
+                msg = f"decimal scale {scale}{default} exceeds precision {precision}"
+                raise ValueError(msg)
+        return self
 
 
 class ConvertOptions(BaseModel):
@@ -195,7 +218,12 @@ class ArtifactRef(BaseModel):
     filename: str
     size_bytes: int
     sha256: str
-    expires_at: str = Field(description="RFC 3339 UTC time after which the artifact is deleted.")
+    expires_at: str = Field(
+        description=(
+            "RFC 3339 UTC time after which the artifact and its download link are unreachable "
+            "(deletion follows; see data_retention in /pricing)."
+        )
+    )
     download_url: str | None = Field(
         default=None, description="Signed HTTPS link to the Parquet file, valid until expiry."
     )

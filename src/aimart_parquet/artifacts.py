@@ -43,7 +43,13 @@ import time
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-from aimart_parquet.errors import AimartError, ArtifactNotFound, Busy, InputTooLarge
+from aimart_parquet.errors import (
+    AimartError,
+    ArtifactNotFound,
+    Busy,
+    InputTooLarge,
+    StorageUnavailable,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -60,11 +66,6 @@ MIN_RESIDENCY_S = 600
 # the sweep for orphaned blobs is rationed across all instances by a marker in the bucket.
 LISTING_INTERVAL_S = 6 * 3600
 _LISTING_MARKER = "sweeps/last-listing"  # outside artifacts/: never listed, never swept
-
-
-class StorageUnavailable(AimartError):
-    code = "storage_unavailable"
-    http_status = 503
 
 
 @dataclass(frozen=True)

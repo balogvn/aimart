@@ -604,7 +604,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     p.add_argument("--expect-base-url", help="Origin the server should advertise (default: url)")
     p.add_argument(
-        "--expect-price", action="append", default=[], metavar="OP=PRICE", help="e.g. convert=0.01"
+        "--expect-price", action="append", default=[], metavar="OP=PRICE", help="e.g. convert=0.02"
     )
     p.add_argument("--expect-version", help="Package version /health and MCP must report")
     p.add_argument(

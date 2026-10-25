@@ -42,15 +42,21 @@ async def test_preview_and_inspect_decode_in_the_isolated_worker(
     # Before: preview (and inspect) ran with isolate=False, so a 258-byte Parquet dictionary
     # bomb decoded inside the API process and took the only instance over its memory limit.
     ran: list[str] = []
+    caps: list[int | None] = []
 
     def recording_run_isolated(
-        fn: Callable[..., Any], *args: Any, timeout_s: float, **kw: Any
+        fn: Callable[..., Any],
+        *args: Any,
+        timeout_s: float,
+        memory_limit_mb: int | None = None,
+        **kw: Any,
     ) -> Any:
         ran.append(fn.__name__)
+        caps.append(memory_limit_mb)
         return fn(*args, **kw)
 
     monkeypatch.setattr(service_module, "run_isolated", recording_run_isolated)
-    service = make_service(make_settings(isolate_jobs=True))
+    service = make_service(make_settings(isolate_jobs=True, job_memory_limit_mb=640))
     art = (
         await service.convert(
             SourceRef(content_base64=kit.b64(CSV), filename="s.csv"), ConvertOptions()
@@ -61,6 +67,7 @@ async def test_preview_and_inspect_decode_in_the_isolated_worker(
     inspected = await service.inspect(src)
     queried = await service.query({"data": src}, "SELECT count(*) FROM data", limit=5, fmt="json")
     assert ran == ["convert_file", "preview", "inspect_parquet", "query"]
+    assert caps == [640] * 4  # the instance's own setting, not the 700 MB field default
     assert preview.rows == [["North", 10], ["South", 20]]
     assert inspected.rows == 3
     assert queried.rows == [[3]]
