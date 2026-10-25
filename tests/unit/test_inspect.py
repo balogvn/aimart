@@ -171,6 +171,34 @@ def test_stats_with_incomparable_types_are_dropped(tmp_path, monkeypatch) -> Non
 
     monkeypatch.setattr(inspect_module.pq, "ParquetFile", Patched)
     (col,) = inspect_parquet(path).columns
-    assert col.min is None
-    assert col.null_count is None
+    assert (col.min, col.max) == (None, None)
+    assert col.null_count == 0  # counted without comparing anything
     json.dumps(col.model_dump())
+
+
+def test_values_beyond_python_dates_degrade_to_unknown(tmp_path) -> None:
+    """RV4: Python stops at year 9999; Parquet and DuckDB do not.
+
+    An offset applied to a '9999-12-31 23:59:59-05:00' sentinel lands in year 10000, and
+    reading the footer max as a Python datetime raised OverflowError: convert failed with a
+    bare 500 ('Internal error ... Retry') on a valid file.
+    """
+    past_9999 = 253402300800 * 10**6  # 10000-01-01 00:00 UTC, in microseconds
+    path = tmp_path / "t.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "tz": pa.array([past_9999, 0, None], pa.timestamp("us", tz="UTC")),
+                "naive": pa.array([2**63 - 1, None, None], pa.timestamp("us")),  # 'infinity'
+                "day": pa.array([3_000_000, 0, None], pa.date32()),
+                "ok": pa.array([dt.date(2025, 1, 15), None, None], pa.date32()),
+            }
+        ),
+        path,
+        row_group_size=1,
+    )
+    columns = {c.name: c for c in inspect_parquet(path).columns}
+    for name in ("tz", "naive", "day"):
+        assert (columns[name].min, columns[name].max) == (None, None), name
+    assert [columns[n].null_count for n in ("tz", "naive", "day", "ok")] == [1, 2, 1, 2]
+    assert (columns["ok"].min, columns["ok"].max) == ("2025-01-15", "2025-01-15")

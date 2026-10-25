@@ -73,21 +73,26 @@ def inspect_parquet(path: Path) -> InspectResult:
         )
         j = leaf_index.get(field.name)
         if j is not None:
-            nulls, lo, hi, complete = 0, None, None, True
+            nulls, lo, hi, counted, ranged = 0, None, None, True, True
             for rg in range(md.num_row_groups):
                 st = md.row_group(rg).column(j).statistics
                 if st is None:
-                    complete = False
+                    counted = ranged = False
                     break
                 nulls += st.null_count if st.has_null_count else 0
-                if st.has_min_max:
+                if st.has_min_max and ranged:
                     try:
                         lo = st.min if lo is None or st.min < lo else lo
                         hi = st.max if hi is None or st.max > hi else hi
-                    except TypeError:
-                        complete = False
-            if complete:
+                    except (TypeError, ValueError, OverflowError):
+                        # Incomparable, or past what Python holds: an offset applied to a
+                        # '9999-12-31 23:59:59-05:00' sentinel is in year 10000, and reading it
+                        # as a datetime raised OverflowError, a bare 500 from convert. The
+                        # range is unknown; the null count is still exact.
+                        ranged = False
+            if counted:
                 stats.null_count = nulls
+            if counted and ranged:
                 stats.min = _jsonable(lo)
                 stats.max = _jsonable(hi)
         columns.append(stats)
