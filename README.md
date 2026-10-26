@@ -261,6 +261,11 @@ an operator can change:
 | time | 120 s to convert, 15 s to inspect, preview or query | 504 `timeout` |
 | concurrency | 2 jobs and a short queue | 503 `busy` |
 
+**Large CSVs, roughly over 180 MB uncompressed, may be refused on the default hosted
+instance** (413, unpaid). Converting a CSV takes about 3.5 times its uncompressed size in
+memory, and each job may use 700 MB, so split such files or convert them with the free local
+server.
+
 Password-protected and scanned PDFs (422 `invalid_input`), a column preview or query cannot show,
 such as a time past year 9999 (422; cast it to text), and a storage failure (503
 `storage_unavailable`) are refused the same way. Every code, and what to do about it, is in the
@@ -332,7 +337,9 @@ In short:
 - DuckDB is locked down: no external access, file access only to the job's own directory,
   configuration locked. Queries are exactly one `SELECT`, with a row cap and an interrupt at
   the deadline.
-- Heavy parsers run in a killable child process, so a parser crash fails one unpaid call.
+- Every parse of a caller's file (convert, inspect, preview, query) runs in a killable child
+  process with a deadline and a memory cap, so a parser crash or a memory bomb fails one
+  unpaid call.
 - Decompression is streamed against hard caps.
 - Request bodies are size-limited and clients are rate-limited.
 - The server holds no private keys, only receive (`payTo`) addresses.

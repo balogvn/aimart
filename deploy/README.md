@@ -23,6 +23,16 @@ synthetic.yml (every 6 h) ─► scripts/smoke.py against production ─► issu
 Service shape (set by `deploy.yml`): 1 vCPU, 2 GiB, `concurrency=4`, `max-instances=1`,
 `min-instances=0`, 120 s request timeout, startup CPU boost, CPU billed only during requests.
 
+Memory on that instance is shared by the API (about 250 MB), the forkserver (about 250 MB), two
+jobs (`AIMART_MAX_CONCURRENT_JOBS=2`) and, without a bucket, the artifacts in RAM-backed `/tmp`.
+Each job is a child process that the parent kills once its resident memory passes
+`AIMART_JOB_MEMORY_LIMIT_MB` (700 by default; `0` disables the cap), and the call fails with 413
+`input_too_large`, unpaid ([ADR 0005](../docs/adr/0005-job-isolation-forkserver.md)). The cost of
+that cap: CSV conversion peaks at about 3.5 times the decompressed CSV size, so CSVs above
+roughly 180-200 MB decompressed are refused on this instance (measured at e8d228e: 200 MB peaked
+at about 706 MB, 450 MB at about 1.4 GB). Raising the cap without more memory per instance
+trades those refusals for an out-of-memory restart that fails every in-flight call.
+
 ---
 
 ## 1. First deploy, step by step
