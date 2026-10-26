@@ -35,7 +35,7 @@ from x402.schemas.config import ResourceConfig
 from aimart_parquet.artifacts import discard_withheld, outputs_of
 from aimart_parquet.config import NetworkMode, Settings
 from aimart_parquet.payments.bazaar import EXAMPLES
-from aimart_parquet.payments.mcp_gate import X402McpGate
+from aimart_parquet.payments.mcp_gate import X402McpGate, payments_unavailable
 from aimart_parquet.payments.pricing import Operation, active_operations, usd_to_atomic
 
 if TYPE_CHECKING:
@@ -246,16 +246,8 @@ class Payments:
                 await self.ensure_initialized()
             except Exception:
                 log.exception("facilitator initialization failed")
-                return JSONResponse(
-                    {
-                        "error": {
-                            "code": "payments_unavailable",
-                            "message": "The payment facilitator is unreachable.",
-                            "hint": "Retry shortly; you were not charged.",
-                        }
-                    },
-                    status_code=503,
-                )
+                unavailable = payments_unavailable()
+                return JSONResponse(unavailable.to_dict(), status_code=unavailable.http_status)
             with outputs_of(store) as produced:
                 try:
                     response = await inner(request, call_next)

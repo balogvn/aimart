@@ -30,6 +30,7 @@ from x402 import parse_payment_payload
 from x402.schemas import PaymentPayload
 
 from aimart_parquet.artifacts import discard_withheld, outputs_of
+from aimart_parquet.errors import AimartError
 from aimart_parquet.payments.pricing import active_operations
 
 if TYPE_CHECKING:
@@ -44,6 +45,21 @@ log = logging.getLogger("aimart.payments.mcp")
 
 PAYMENT_META_KEY = "x402/payment"
 PAYMENT_RESPONSE_META_KEY = "x402/payment-response"
+
+
+class PaymentsUnavailable(AimartError):
+    code = "payments_unavailable"
+    http_status = 503
+
+
+def payments_unavailable() -> PaymentsUnavailable:
+    """The facilitator could not be reached to set up payments: nothing was verified or paid.
+
+    One error for both transports: REST answers it as a 503, MCP as an ``isError`` result.
+    """
+    return PaymentsUnavailable(
+        "The payment facilitator is unreachable.", hint="Retry shortly; you were not charged."
+    )
 
 
 def _result(body: dict[str, Any]) -> CallToolResult:
@@ -99,7 +115,13 @@ class X402McpGate(Extension):
             refused = self.check_arguments(params.name, params.arguments or {})
             if refused is not None:
                 return refused
-        reqs, resource = await self.payments.mcp_requirements(op)
+        try:
+            reqs, resource = await self.payments.mcp_requirements(op)
+        except Exception:  # any facilitator failure: nothing can be quoted
+            # It escaped the SDK's tool handling as a JSON-RPC -32603, with no code or hint,
+            # where REST answers the same outage with a typed 503 that says "not charged".
+            log.exception("facilitator initialization failed", extra={"tool": params.name})
+            return _result(payments_unavailable().to_dict())
         if raw is None:
             return await self._payment_required(reqs, resource, "Payment required")
         try:
