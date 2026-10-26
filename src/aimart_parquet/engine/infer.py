@@ -99,6 +99,19 @@ def _fmt_list(formats: list[str]) -> str:
     return "[" + ", ".join(literal(f) for f in formats) + "]"
 
 
+def _one_of(expr: str, values: tuple[str, ...]) -> str:
+    """expr is one of the constants: never ``expr IN (...)`` in generated SQL.
+
+    DuckDB 1.5.6 plans ``IN`` over five or more constants as a MARK hash join against the list.
+    Each join held 6-12 MB however small the input, and the ladder repeats the null-token test
+    several times per column, so a 100-row CSV with 30 date columns ran out of memory in the
+    final COPY (a 500). The join also broke insertion order: once a file had more than one
+    122,880-row group, its rows were written out of source order, and preview offset 0 showed
+    row 122,881. ``list_contains`` is a plain function: no join, no reordering.
+    """
+    return f"list_contains({_fmt_list(list(values))}, {expr})"
+
+
 @dataclass
 class ColumnPlan:
     source: str
@@ -119,8 +132,7 @@ class _Exprs:
 
     @classmethod
     def build(cls, col: str, tokens: tuple[str, ...]) -> _Exprs:
-        token_list = ", ".join(literal(t) for t in tokens)
-        v = f"(CASE WHEN lower(trim({col})) IN ({token_list}) THEN NULL ELSE trim({col}) END)"
+        v = f"(CASE WHEN {_one_of(f'lower(trim({col}))', tokens)} THEN NULL ELSE trim({col}) END)"
         n = (
             f"regexp_replace(regexp_replace({v}, '^([+-]?)\\s*{_CURRENCY}\\s*', '\\1'), "
             f"'\\s*{_CURRENCY}$', '')"
@@ -256,9 +268,10 @@ class TypeInferrer:
     def text_plan(self, source: str) -> ColumnPlan:
         """Keep text, trimming whitespace; only '' and caller-listed tokens become null."""
         col = ident(source)
-        tokens = ("", *self.extra)
-        token_list = ", ".join(literal(t) for t in dict.fromkeys(tokens))
-        expr = f"(CASE WHEN lower(trim({col})) IN ({token_list}) THEN NULL ELSE trim({col}) END)"
+        tokens = tuple(dict.fromkeys(("", *self.extra)))
+        expr = (
+            f"(CASE WHEN {_one_of(f'lower(trim({col}))', tokens)} THEN NULL ELSE trim({col}) END)"
+        )
         return ColumnPlan(source=source, expr=expr, type_name="string")
 
     def plan(self, sources: list[str]) -> dict[str, ColumnPlan]:
@@ -283,7 +296,7 @@ class TypeInferrer:
             m_int = _match(e.n, _RE_INT)
             aggs += [
                 f"count({e.v})",
-                f"count_if(lower({e.v}) IN ({', '.join(map(literal, TRUE_TOKENS + FALSE_TOKENS))}))",
+                f"count_if({_one_of(f'lower({e.v})', TRUE_TOKENS + FALSE_TOKENS)})",
                 f"count_if({_match(e.n, _RE_LEADING_ZERO)})",
                 f"count_if({m_int} AND length(regexp_replace({e.n}, '[^0-9]', '', 'g')) > 15)",
                 f"count_if({m_int})",
@@ -308,11 +321,9 @@ class TypeInferrer:
             text.notes.append("all values empty")
             return text
         if n_bool == n:
-            true_list = ", ".join(map(literal, TRUE_TOKENS))
-            false_list = ", ".join(map(literal, FALSE_TOKENS))
             expr = (
-                f"(CASE WHEN lower({e.v}) IN ({true_list}) THEN true "
-                f"WHEN lower({e.v}) IN ({false_list}) THEN false END)"
+                f"(CASE WHEN {_one_of(f'lower({e.v})', TRUE_TOKENS)} THEN true "
+                f"WHEN {_one_of(f'lower({e.v})', FALSE_TOKENS)} THEN false END)"
             )
             return ColumnPlan(source, expr, "bool")
         if n_lead0 or n_long:
@@ -557,11 +568,9 @@ class TypeInferrer:
                 )
             return f"(CASE {whens} END)"
         if type_name == "bool":
-            true_list = ", ".join(map(literal, (*TRUE_TOKENS, "1")))
-            false_list = ", ".join(map(literal, (*FALSE_TOKENS, "0")))
             return (
-                f"(CASE WHEN lower({e.v}) IN ({true_list}) THEN true "
-                f"WHEN lower({e.v}) IN ({false_list}) THEN false END)"
+                f"(CASE WHEN {_one_of(f'lower({e.v})', (*TRUE_TOKENS, '1'))} THEN true "
+                f"WHEN {_one_of(f'lower({e.v})', (*FALSE_TOKENS, '0'))} THEN false END)"
             )
         formats = self.mdy_formats if self.date_order is DateOrder.MDY else self.dmy_formats
         if type_name in {"date", "timestamp"}:
