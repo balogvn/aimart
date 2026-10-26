@@ -23,7 +23,7 @@ import ssl
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 
 import anyio
 import httpcore
@@ -42,6 +42,8 @@ _IPV4_COMPATIBLE = ipaddress.ip_network("::/96")  # deprecated ::a.b.c.d form; i
 # SMTP, Redis or SSH on public addresses.
 ALLOWED_PORTS = frozenset({80, 443, 8080, 8443})
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+_ASCII = "".join(map(chr, range(128)))  # quote(..., safe=_ASCII) escapes only non-ASCII
+_NON_ASCII_BYTE = re.compile(rb"[\x80-\xff]")
 
 
 def ip_is_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -138,11 +140,27 @@ def safe_filename(name: str) -> str:
     return cleaned[:120]
 
 
-def _validate_url(url: str) -> None:
-    parts = urlsplit(url)
+def _malformed() -> UrlNotAllowed:
+    return UrlNotAllowed("The URL is malformed.", hint="Check the URL; pass a full https:// URL.")
+
+
+def validate_url(url: str, *, allow_private: bool = False) -> str:
+    """Refuse a URL the fetcher could never fetch, from the text alone; return it as fetched.
+
+    Runs before a price is quoted, and again for every redirect hop. ``urlsplit`` raises
+    ValueError on a malformed bracketed host ('http://[::1/a.csv', 'http://[zz]/') and httpcore
+    TypeError on any non-ASCII character: both escaped as bare 500s after the payment was
+    verified. A non-ASCII path or query is percent-encoded as UTF-8, as a browser does. An IP
+    literal that is not public is refused here; a hostname is checked when it is resolved.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError as exc:
+        raise _malformed() from exc
     if parts.scheme not in {"http", "https"}:
         raise UrlNotAllowed("Only http and https URLs are supported.", hint="Pass an https:// URL.")
-    if not parts.hostname:
+    host = parts.hostname
+    if not host:
         raise UrlNotAllowed("The URL has no host.", hint="Pass a full https:// URL.")
     try:
         port = parts.port if parts.port is not None else (443 if parts.scheme == "https" else 80)
@@ -153,6 +171,31 @@ def _validate_url(url: str) -> None:
             f"Port {port} is not allowed.",
             hint=f"Use a URL on one of ports {sorted(ALLOWED_PORTS)}.",
         )
+    if not parts.netloc.isascii():
+        raise UrlNotAllowed(
+            "The URL's host is not ASCII.", hint="Use the host's ASCII (xn--) form."
+        )
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        ip = None  # a hostname: GuardedBackend checks every address it resolves to
+    if ip is not None and not allow_private and not ip_is_public(ip):
+        raise UrlNotAllowed(
+            f"Host {host!r} resolves to a non-public address.",
+            hint="Only publicly reachable http(s) URLs can be fetched.",
+        )
+    if url.isascii():
+        return url
+    try:
+        return urlunsplit(
+            parts._replace(
+                path=quote(parts.path, safe=_ASCII),
+                query=quote(parts.query, safe=_ASCII),
+                fragment=quote(parts.fragment, safe=_ASCII),
+            )
+        )
+    except UnicodeError as exc:  # a lone surrogate has no UTF-8 form
+        raise _malformed() from exc
 
 
 async def fetch_url(
@@ -182,7 +225,7 @@ async def fetch_url(
                 retries=0,
             ) as pool:
                 for _hop in range(MAX_REDIRECTS + 1):
-                    _validate_url(current)
+                    current = validate_url(current, allow_private=allow_private)
                     async with pool.stream("GET", current, headers=headers) as resp:
                         if resp.status in {301, 302, 303, 307, 308}:
                             location = _header(resp.headers, b"location")
@@ -190,7 +233,7 @@ async def fetch_url(
                                 raise FetchFailed(
                                     "Redirect without a Location header.", hint="Check the URL."
                                 )
-                            current = urljoin(current, location.decode("latin-1"))
+                            current = _redirect_target(current, location)
                             continue
                         if resp.status >= 400:
                             raise FetchFailed(
@@ -235,6 +278,16 @@ async def fetch_url(
         raise FetchFailed(
             f"Could not download the URL: {exc}", hint="Check the URL and its TLS certificate."
         ) from exc
+
+
+def _redirect_target(current: str, location: bytes) -> str:
+    """Where a Location header points, as ASCII: raw non-ASCII bytes (servers send UTF-8 there)
+    are percent-encoded byte for byte, so the next request names exactly what the server sent."""
+    escaped = _NON_ASCII_BYTE.sub(lambda m: b"%%%02X" % m[0][0], location).decode("ascii")
+    try:
+        return urljoin(current, escaped)
+    except ValueError as exc:  # a malformed bracketed host, as in validate_url
+        raise _malformed() from exc
 
 
 def _header(headers: list[tuple[bytes, bytes]], name: bytes) -> bytes | None:
