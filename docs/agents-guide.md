@@ -144,14 +144,43 @@ Errors look like `{"error": {"code", "message", "hint", "details"?}}`, with HTTP
 an MCP `isError` result. **A failed call is never charged.** Follow the `hint`, which is
 written to be acted on.
 
-**A call that can only fail is refused before the quote.** A REST body that fails the
-operation's schema gets 400 `invalid_request` ("The request body is invalid.", with the fields
-in `details.problems`) instead of a 402, so you never sign for it. Over MCP, invalid tool
-arguments get an `isError` result before any PaymentRequired, and a tool this deployment does
-not serve is a free "Unknown tool" error. An unpaid empty body (or `{}`), an unpaid upload form
-without its file, and an unpaid MCP call with no arguments still get the price quote. For
-`/v1/convert/upload`, put the `options` part before the `file` part: only the first 1 MiB of
-the form is checked before the quote.
+**A call that can only fail is refused before the quote**, so you never sign for it: on REST
+instead of the 402, over MCP as an `isError` result before any PaymentRequired. These are
+decided from the request alone:
+
+- A body that fails the operation's schema: 400 `invalid_request`, "The request body is
+  invalid.", with each field in `details.problems`. Besides types and ranges, that covers an
+  `artifact_id` that is not one `convert` issues ("String should match pattern
+  '^[A-Za-z0-9_-]{22,64}$'") and these `options`: `pdf_pages` that no PDF has ("pdf_pages range
+  '5-2' is invalid: pages start at 1, and a range runs low to high."), an `encoding` that is
+  unknown or not a text codec ("Unknown encoding 'utf-9'.", "'rot13' is not a text
+  encoding."), a `delimiter` of `"`, a line break or NUL ("delimiter '"' cannot separate
+  fields: it is the quote character. Omit delimiter to detect it."), and an `expected_schema`
+  that names one column twice ("expected_schema names column 'a' twice."). Names are
+  case-insensitive, so `a` and `A` are one column. Text that DuckDB reads (`sql`,
+  `null_values`, `sort_by`, `expected_schema` names) must not hold a NUL ("must not contain a
+  NUL character (\x00)") or a lone surrogate such as `\ud800`. Over MCP the same arguments get
+  the SDK's "Error executing tool <name>: ..." text, and on `/v1/convert/upload` invalid
+  `options` get "options is not valid ConvertOptions JSON.".
+- Not exactly one input: 400 `invalid_request`, "Provide exactly one input; got 0 (none)." or
+  "Provide exactly one input; got 2 (url, artifact_id).". For a query, also "No tables to
+  query.", "Table name 'data' is used twice." (`data` is the top-level input) and "Table 't':
+  provide exactly one input; got 0 (none).".
+- A URL the server can never fetch: 422 `url_not_allowed`, with "Only http and https URLs are
+  supported.", "The URL is malformed.", "The URL has no host.", "Port 22 is not allowed." (ports
+  80, 443, 8080 and 8443 are), "The URL's host is not ASCII." (use its `xn--` form), or, for an
+  IP address that is not public, "Host '127.0.0.1' resolves to a non-public address.". A host
+  name is resolved and checked when it is fetched, after the quote.
+- SQL of up to 256 characters that is not one read-only SELECT: 400 `query_rejected`, such as
+  "Only read-only SELECT queries are allowed; got DROP.", "Send exactly one statement; got 2."
+  or "SQL syntax error: ...". Longer SQL is checked where the query runs: a paid call is
+  verified first, then refused, and not charged.
+
+An unpaid empty body (or `{}`), an unpaid upload form without its file, and an unpaid MCP call
+with no arguments still get the price quote. Sent with a payment, they are refused like any
+other request that can only fail. A tool this deployment does not serve is a free "Unknown
+tool" error. For `/v1/convert/upload`, put the `options` part before the `file` part: only the
+first 1 MiB of the form is checked before the quote.
 
 | code | HTTP | what to do |
 |---|---:|---|
@@ -160,12 +189,12 @@ the form is checked before the quote.
 | `artifact_not_found` | 404 | the artifact expired: convert again |
 | `input_too_large` | 413 | something is over a limit, and the message says which (list below) |
 | `unsupported_format` | 415 | pass `options.format`, or convert to a supported format |
-| `invalid_input`, `schema_violation`, `fetch_failed`, `url_not_allowed`, `query_failed` | 422 | read `message` and `hint`. `url_not_allowed` means a private or non-web-port URL |
-| `busy` | 503 | "The server is at capacity.": retry after a few seconds. "The server's output storage is full right now: ...": retry in a few minutes, or send a smaller extract |
+| `invalid_input`, `schema_violation`, `fetch_failed`, `url_not_allowed`, `query_failed` | 422 | read `message` and `hint`. `url_not_allowed` means a URL that is not http(s), is malformed, uses a port other than 80, 443, 8080 or 8443, or reaches a private address |
+| `busy` | 503 | "The server is at capacity.": every job slot was taken for the 10 s a call waits for one, or too many calls were already waiting; retry after a few seconds. "The server's output storage is full right now: ...": retry in a few minutes, or send a smaller extract |
 | `storage_unavailable` | 503 | the output could not be stored, read back or linked ("Could not store the output file."): retry in a minute |
-| `payments_unavailable` | 503 | the facilitator is unreachable: retry shortly |
+| `payments_unavailable` | 503 | "The payment facilitator is unreachable.", on REST and MCP alike: retry shortly |
 | `timeout` | 504 | send a smaller file or a simpler query |
-| `internal_error` | 500 | an unexpected failure; the message names only its type, as in `Internal error (KeyError).` Retry, and report it if it persists |
+| `internal_error` | 500 | an unexpected failure, never charged; the message names only its type, as in "Internal error (KeyError).". Retry, and report it if it persists |
 
 The `input_too_large` messages, and what to change (numbers are the defaults):
 
