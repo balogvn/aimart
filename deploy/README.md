@@ -130,6 +130,7 @@ so both the deploy and the synthetic check can read them; every value here is pu
 | `AIMART_GCS_BUCKET` | no | bucket name; artifacts then leave the instance's RAM |
 | `AIMART_FACILITATOR_URLS` | no | comma-separated override of the default facilitators |
 | `AIMART_ENABLE_QUANTUM` | no | `true` serves the premium quantum tools (off by default); both smoke checks then require them |
+| `AIMART_JOB_MEMORY_LIMIT_MB` | no | `700` (the application default when unset): resident memory, in MB, one isolated job may use before the parent kills it and the call fails with 413 `input_too_large`, unpaid; `0` disables the cap. Sized for the 2 GiB instance (see the service shape above) |
 | `SMOKE_SIGNING_KEY_SHA256` | no, recommended | pins the public signing key (section 1.7) |
 
 `deploy.yml` always sets `AIMART_TRUST_FORWARDED_FOR=true` (Google's front end sets

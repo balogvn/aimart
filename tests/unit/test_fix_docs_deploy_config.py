@@ -19,6 +19,8 @@ from typing import Any
 import pytest
 import yaml
 
+from aimart_parquet.config import Settings
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
 SMOKE_FLAGS = ROOT / "deploy" / "smoke-flags.sh"
@@ -325,3 +327,32 @@ def test_discovery_doc_explains_how_to_switch_on_the_demand_report() -> None:
     assert "GCP_SECRET_ADMIN_TOKEN" in demand
     assert "demand_signal" in demand
     assert "without" in demand.lower()  # what you get with no token: the log lines
+
+
+# ------------------------------------------------------------------ the per-job memory cap
+@needs_bash
+def test_job_memory_limit_reaches_the_service_only_when_set(tmp_path: Path) -> None:
+    """The cap's setting landed in config.py, but deploy.yml overwrites the service's whole
+    environment on every deploy and never passed it, so production could not change it."""
+    off = run_config_step(tmp_path)["env_vars"].splitlines()
+    assert not [line for line in off if line.startswith("AIMART_JOB_MEMORY_LIMIT_MB")]
+    for value in ("500", "0"):
+        on = run_config_step(tmp_path, AIMART_JOB_MEMORY_LIMIT_MB=value)["env_vars"].splitlines()
+        assert on == [*off, f"AIMART_JOB_MEMORY_LIMIT_MB={value}"]
+
+
+@needs_bash
+@pytest.mark.parametrize("value", ["-1", "700MB", "1.5", "0700", " 700", "700,AIMART_X=y"])
+def test_job_memory_limit_is_validated(tmp_path: Path, value: str) -> None:
+    with pytest.raises(subprocess.CalledProcessError):
+        run_config_step(tmp_path, AIMART_JOB_MEMORY_LIMIT_MB=value)
+
+
+def test_job_memory_limit_variable_is_the_one_settings_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A misspelt name would deploy cleanly and leave every job at the default.
+    env = step_with_id("deploy.yml", "config")["env"]
+    assert env["AIMART_JOB_MEMORY_LIMIT_MB"] == "${{ vars.AIMART_JOB_MEMORY_LIMIT_MB }}"
+    monkeypatch.setenv("AIMART_JOB_MEMORY_LIMIT_MB", "512")
+    assert Settings(_env_file=None).job_memory_limit_mb == 512  # type: ignore[call-arg]
