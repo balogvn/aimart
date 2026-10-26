@@ -17,9 +17,10 @@ Correctness beats cleverness on purpose:
   ``NA`` may be Namibia, so text keeps it unless the caller lists it in ``null_values``.
 * When ``03/04/2025`` parses both ways and no value disambiguates, ``date_order`` decides and
   the report says so. Likewise ``1,234`` and ``1.234`` (thousands or decimals?): when no value
-  in the column settles it, the file's dialect decides (decimal comma in semicolon files) and
-  the report says so. The expected_schema cast of a text column decides the same way, for the
-  whole column, so a value never depends on whether inference left its column as text.
+  in the column settles it, the file's other number columns decide, then its dialect (decimal
+  comma in semicolon files), and the report says so. The expected_schema cast of a text
+  column decides the same way, for the whole column, so a value never depends on whether
+  inference left its column as text.
 * A decimal cast never rounds: a digit beyond the requested scale makes the value a reject.
 * A UTC offset is never dropped. DuckDB's ``TIMESTAMP`` cast silently discards it, so text
   with an offset or zone is only ever read as ``TIMESTAMPTZ``. And only such text: that cast
@@ -314,6 +315,7 @@ class TypeInferrer:
         self.tokens = tuple(dict.fromkeys(DEFAULT_NULL_TOKENS + self.extra))
         self.date_order = date_order
         self.prefer_decimal_comma = prefer_decimal_comma
+        self._file_decimal_comma: bool | None = None
         self.dmy_formats, self.mdy_formats = _date_formats(date_order)
 
     # ------------------------------------------------------------------ public
@@ -395,8 +397,8 @@ class TypeInferrer:
             return text
         winners = [style for style, fit in fits.items() if fit == top]
         style = winners[0]  # plain, then us: a decimal point unless the dialect says otherwise
-        if n_ambiguous and "eu" in winners and self.prefer_decimal_comma:
-            # '1,234' and '1.234' fit both conventions; a semicolon file writes decimal commas.
+        if n_ambiguous and "eu" in winners and self._decimal_comma():
+            # '1,234' and '1.234' fit both conventions; the file's other numbers decide.
             # Plain used to win outright, reading thousands '1.234' as 1.234 (1000x too small).
             style = "eu"
         rival = fits["us"] if style == "eu" else fits["eu"]
@@ -579,10 +581,11 @@ class TypeInferrer:
         """The number convention of a text column ('us' or 'eu'), decided for the whole column.
 
         Values only one convention reads are the evidence ('1.5' and '1,234.5' have a decimal
-        point, '1,5' and '1.234,5' a decimal comma); the dialect breaks a tie, including the
-        tie of no evidence at all. Reading each value on its own, dialect first, made '1.234'
-        1234 in a semicolon file whose '1.5' and '2.75' prove dot decimals, while inference read
-        the same column as 1.234: the value depended on whether inference left it as text.
+        point, '1,5' and '1.234,5' a decimal comma); the file's convention (``_decimal_comma``)
+        breaks a tie, including the tie of no evidence at all, as it does in inference.
+        Reading each value on its own, dialect first, made '1.234' 1234 in a semicolon file
+        whose '1.5' and '2.75' prove dot decimals, while inference read the same column as
+        1.234: the value depended on whether inference left it as text.
         """
         e = _Exprs.build(ident(source), self.tokens)
         point, comma = _style_fit(e.n, "us"), _style_fit(e.n, "eu")
@@ -593,7 +596,42 @@ class TypeInferrer:
         point_only, comma_only = (int(row[0]), int(row[1])) if row else (0, 0)
         if point_only != comma_only:
             return "us" if point_only > comma_only else "eu"
-        return "eu" if self.prefer_decimal_comma else "us"
+        return "eu" if self._decimal_comma() else "us"
+
+    def _decimal_comma(self) -> bool:
+        """The file's convention for values that either one reads ('1,234', '16.469').
+
+        Decided once per file, before the delimiter: each number column (every value, or 98%,
+        fits a convention) votes for the convention of its values that only one convention
+        reads ('398.53', '0.250' and '1,234.5' have a decimal point, '12,5' and '1.234,5' a
+        decimal comma), and the dialect breaks a tie, including the tie of no evidence at
+        all. The delimiter alone read every '16.469' kg in a semicolon file as 16469, beside
+        a price of '398.53' in the same row that only a decimal point writes.
+        """
+        if self._file_decimal_comma is None:
+            texts = self.con.sql(f"SELECT * FROM {self.table} LIMIT 0")
+            sources = [c for c, t in zip(texts.columns, texts.types, strict=True) if t == "VARCHAR"]
+            votes = 0  # decimal comma minus decimal point
+            for start in range(0, len(sources), _BATCH):
+                aggs: list[str] = []
+                for s in sources[start : start + _BATCH]:
+                    e = _Exprs.build(ident(s), self.tokens)
+                    point, comma = _style_fit(e.n, "us"), _style_fit(e.n, "eu")
+                    aggs += [
+                        f"count({e.v})",
+                        f"count_if({point} OR {comma})",
+                        f"count_if({point} AND NOT {comma})",
+                        f"count_if({comma} AND NOT {point})",
+                    ]
+                row = self.con.sql(f"SELECT {', '.join(aggs)} FROM {self.table}").fetchone()
+                assert row is not None
+                for i in range(0, len(aggs), 4):
+                    n, fit, point_only, comma_only = (int(x or 0) for x in row[i : i + 4])
+                    tolerant = n >= MIN_ROWS_FOR_TOLERANCE
+                    if n and (fit == n or (tolerant and fit >= MIN_FIT * n)):
+                        votes += (comma_only > point_only) - (point_only > comma_only)
+            self._file_decimal_comma = votes > 0 if votes else self.prefer_decimal_comma
+        return self._file_decimal_comma
 
     def cast_text(self, source: str, type_name: str, sql_type: str) -> str:
         """Best-effort cast of a text column to a caller-mandated type (expected_schema)."""
