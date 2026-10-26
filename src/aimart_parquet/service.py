@@ -10,16 +10,19 @@ downloads must count toward capacity and share one byte budget per call.
 
 Before a price is quoted, REST and MCP ask ``check_input`` / ``check_query`` what the service
 would refuse about a request from the request alone, so an agent never signs for a call that
-can only fail.
+can only fail. ``internal_error`` is the one answer, on both transports, for an exception that
+is not an ``AimartError``.
 """
 
 from __future__ import annotations
 
 import contextlib
 import functools
+import logging
 import re
 import shutil
 import tempfile
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -68,6 +71,7 @@ if TYPE_CHECKING:
     )
 
 T = TypeVar("T")
+log = logging.getLogger("aimart")
 _QUEUE_FACTOR = 4  # callers allowed to wait per worker slot before we answer "busy"
 MAX_QUERY_TABLES = 8
 TABLE_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
@@ -127,6 +131,27 @@ class _InputBudget:
             "do not count), or send smaller extracts; you were not charged.",
             limit_bytes=self.total,
         )
+
+
+def internal_error(exc: BaseException, **context: Any) -> AimartError:
+    """The typed 500 for an exception that is not an ``AimartError``, logged without its text.
+
+    The text can quote server paths or the caller's data, so the caller gets only the type and
+    the log gets the type and the frames. Raised on a paid call, it is never settled (REST
+    settles below 400, MCP only a result that is not an error).
+    """
+    frames = [
+        f"{Path(frame.filename).name}:{frame.lineno} in {frame.name}"
+        for frame in traceback.extract_tb(exc.__traceback__)
+    ]
+    log.error(
+        "internal error",
+        extra={"error_type": type(exc).__name__, "frames": frames[-30:], **context},
+    )
+    return AimartError(
+        f"Internal error ({type(exc).__name__}).",
+        hint="Retry; if it persists, report it. You were not charged.",
+    )
 
 
 class Service:

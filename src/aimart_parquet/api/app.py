@@ -2,7 +2,8 @@
 
 Layering, outermost first:
 
-    AccessLog -> RateLimit -> BodyLimit -> FormPeek (upload form fields, read and replayed)
+    AccessLog -> RateLimit -> BodyLimit -> InternalError (typed 500 for any other exception)
+      -> FormPeek (upload form fields, read and replayed)
       -> x402 payment middleware (REST /v1 routes only)
       -> FastAPI routes | MCP app mounted at "/" (endpoint /mcp, paid per tool via extension)
 
@@ -38,6 +39,7 @@ from fastapi.routing import APIRoute
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, ValidationError
 from starlette.requests import ClientDisconnect
+from starlette.types import ASGIApp, Message, Receive, Send
 
 from aimart_parquet import __version__
 from aimart_parquet.api import discovery
@@ -68,7 +70,7 @@ from aimart_parquet.mcp.server import argument_checker, build_mcp
 from aimart_parquet.payments.pricing import BY_KEY, quantum_enabled
 from aimart_parquet.provenance import Signer
 from aimart_parquet.quantum.models import PortfolioResult, QuantumCompressResult
-from aimart_parquet.service import Service
+from aimart_parquet.service import Service, internal_error
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
@@ -277,6 +279,38 @@ class Prechecked(Protocol):
     """A paid body that can say, from itself alone, what the service would refuse."""
 
     def precheck(self, service: Service) -> None: ...
+
+
+class InternalErrorMiddleware:
+    """Any exception that is not an ``AimartError`` becomes the typed 500, never a bare one.
+
+    Such an exception used to reach the server as "Internal Server Error", with no code or
+    hint, on paid routes too. It is raised inside the payment middleware, which therefore never
+    settles it, and inside BodyLimit, whose 413 still wins for an oversized body. The text can
+    carry server paths or the caller's data: only its type goes out (``internal_error``).
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = False
+
+        async def tracked(message: Message) -> None:
+            nonlocal started
+            started = started or message["type"] == "http.response.start"
+            await send(message)
+
+        try:
+            await self.app(scope, receive, tracked)
+        except Exception as exc:  # noqa: BLE001 - the backstop: every other error is typed
+            error = internal_error(exc, path=scope.get("path"))
+            if started:  # too late for a status: end the response, as the server would
+                return
+            await JSONResponse(error.to_dict(), status_code=error.http_status)(scope, receive, send)
 
 
 def create_app(
@@ -536,6 +570,7 @@ def create_app(
 
     app.mount("/", mcp_app)  # after every route: a "/" mount swallows anything declared later
 
+    app.add_middleware(InternalErrorMiddleware)
     app.add_middleware(
         BodyLimitMiddleware,
         default_limit=JSON_BODY_LIMIT,

@@ -46,7 +46,7 @@ from aimart_parquet.quantum.models import (
     QuantumCompressOptions,
     QuantumCompressResult,
 )
-from aimart_parquet.service import Service, SourceRef
+from aimart_parquet.service import Service, SourceRef, internal_error
 
 PARQUET_MIME = "application/vnd.apache.parquet"
 
@@ -126,11 +126,15 @@ async def _wrap(coro: Awaitable[BaseModel]) -> CallToolResult:
 
 
 async def _guard(fn: Callable[[], Awaitable[CallToolResult]]) -> CallToolResult:
-    """Every failure becomes an isError result — which the payment gate never settles."""
+    """Every failure becomes a typed isError result — which the payment gate never settles."""
     try:
         return await fn()
     except AimartError as exc:
         return _err(exc)
+    except Exception as exc:  # noqa: BLE001 - the backstop for a bug: typed, its text kept out
+        # The SDK answered these "Error executing tool <name>": no code, no hint, no word on
+        # whether the caller was charged.
+        return _err(internal_error(exc))
 
 
 def _tables(
@@ -191,6 +195,8 @@ def argument_checker(
             _precheck(service, validated)
         except AimartError as exc:
             return _err(exc)
+        except Exception as exc:  # noqa: BLE001 - a bug in a check is refused, typed, unquoted
+            return _err(internal_error(exc, tool=name))
         return None
 
     return check
