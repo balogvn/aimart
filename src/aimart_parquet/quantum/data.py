@@ -10,7 +10,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as pads
 import pyarrow.parquet as pq
 
-from aimart_parquet.errors import InvalidInput, InvalidRequest
+from aimart_parquet.errors import InvalidInput, InvalidRequest, without_paths
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -29,7 +29,7 @@ def open_schema(path: Path) -> pa.Schema:
         return pq.ParquetFile(path).schema_arrow
     except (pa.ArrowInvalid, OSError) as exc:
         raise InvalidInput(
-            f"Not a readable Parquet file: {exc}",
+            f"Not a readable Parquet file: {without_paths(exc)}",
             hint="Run convert_to_parquet first and pass its artifact_id.",
         ) from exc
 
@@ -71,8 +71,18 @@ def load_matrix(
 ) -> tuple[np.ndarray, pa.Table | None, int]:
     """(rows x columns float64 matrix without null rows, extra columns for kept rows, rows dropped)."""
     wanted = list(dict.fromkeys([*columns, *(extra or []), *([sort_by] if sort_by else [])]))
-    dataset = pads.dataset(path)
-    table = dataset.head(max_rows, columns=wanted) if max_rows else dataset.to_table(columns=wanted)
+    try:
+        dataset = pads.dataset(path)
+        table = (
+            dataset.head(max_rows, columns=wanted) if max_rows else dataset.to_table(columns=wanted)
+        )
+    except (pa.ArrowException, OSError) as exc:
+        # A readable footer over corrupt pages: this raised a bare OSError, which the worker
+        # reported as "Internal error" (500) instead of the caller's broken file.
+        raise InvalidInput(
+            f"The Parquet file is corrupt: {without_paths(exc)}",
+            hint="Re-create the file, or convert the original again; you were not charged.",
+        ) from exc
     if sort_by:
         table = table.sort_by(sort_by)
     matrix = (
