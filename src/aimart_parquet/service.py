@@ -188,17 +188,33 @@ class Service:
         disk until it ends (``store.hold``): on GCS, fetching a query's second table evicted
         the cached copy of its first, and the join failed on a missing file.
         """
+        busy = Busy(
+            "The server is at capacity.", hint="Retry in a few seconds; you were not charged."
+        )
         stats = self._limiter.statistics()
         if (
             stats.borrowed_tokens >= stats.total_tokens
             and stats.tasks_waiting >= _QUEUE_FACTOR * stats.total_tokens
         ):
-            raise Busy(
-                "The server is at capacity.", hint="Retry in a few seconds; you were not charged."
-            )
-        async with self._limiter:
+            raise busy
+        # A paid call's signed authorization expires (payments.PAYMENT_WINDOW_S): waiting for a
+        # slot as long as the calls ahead took (up to 4 x 180 s) ran work that could no longer
+        # settle. queue_wait_s bounds the wait; a free slot is taken even when it is 0.
+        acquired = False
+        try:
+            self._limiter.acquire_nowait()
+            acquired = True
+        except anyio.WouldBlock:
+            with anyio.move_on_after(self.settings.queue_wait_s):
+                await self._limiter.acquire()
+                acquired = True
+        if not acquired:
+            raise busy
+        try:
             with self.store.hold():
                 yield
+        finally:
+            self._limiter.release()
 
     async def _execute(
         self, fn: Callable[..., T], *args: Any, timeout_s: float, isolate: bool, **kwargs: Any

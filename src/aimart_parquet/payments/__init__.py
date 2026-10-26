@@ -71,6 +71,13 @@ PAYMENT_HEADERS = ("payment-signature", "x-payment")
 SERVICE_NAME = "AImart Parquet"  # <= 32 ASCII chars, or facilitator catalogs drop it
 TAGS = ["data", "parquet", "etl", "csv", "mcp"]  # <= 5 tags
 
+# How long a caller's signed authorization stays valid (``maxTimeoutSeconds``; EIP-3009
+# validBefore). Waiting for a job slot, downloading the input and running the job all happen
+# inside it, and settlement after them: past it, the work is done and cannot be paid for.
+PAYMENT_WINDOW_S = 300
+# Kept free in the window for the upload, verify and settle around the work.
+SETTLE_MARGIN_S = 60
+
 
 def carries_payment(request: Request) -> bool:
     return any(request.headers.get(name) for name in PAYMENT_HEADERS)
@@ -103,6 +110,7 @@ class Payments:
                 "AIMART_PAY_TO_SVM (or AIMART_PAYMENTS_ENABLED=false for a free deployment)"
             )
             raise ValueError(msg)
+        self._check_payment_window()
         self._initialized = False
         self._init_lock = anyio.Lock()
         self._mcp_requirements: dict[str, list[PaymentRequirements]] = {}
@@ -111,6 +119,28 @@ class Payments:
         self._by_tool: dict[str, Operation] = {}
         for op in active_operations(settings):
             self._by_tool.setdefault(op.tool, op)
+
+    def _check_payment_window(self) -> None:
+        """Refuse to start when a paid call could outlast its own payment authorization.
+
+        ``queue_wait_s`` was never read, and a call queued behind 4 x 180 s of jobs ran its work
+        after the authorization expired: unsettleable, so served for free.
+        """
+        s = self.settings
+        longest = max(
+            s.convert_timeout_s,
+            s.query_timeout_s + 5,  # Service.query's outer deadline
+            s.quantum_timeout_s if s.enable_quantum else 0.0,
+        )
+        needed = s.queue_wait_s + s.fetch_timeout_s + longest
+        if needed + SETTLE_MARGIN_S > PAYMENT_WINDOW_S:
+            msg = (
+                f"queue_wait_s + fetch_timeout_s + the longest operation timeout is {needed:g} s; "
+                f"with {SETTLE_MARGIN_S} s to verify and settle it exceeds the {PAYMENT_WINDOW_S} s "
+                "a payment authorization is valid for, so paid calls could not settle. Lower "
+                "AIMART_QUEUE_WAIT_S, AIMART_FETCH_TIMEOUT_S or the operation timeouts."
+            )
+            raise ValueError(msg)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Payments:
@@ -188,7 +218,7 @@ class Payments:
                         price=op.price(self.settings),
                         network=network,
                         pay_to=pay_to,
-                        max_timeout_seconds=300,
+                        max_timeout_seconds=PAYMENT_WINDOW_S,
                         extra=self._extra(),
                     )
                     for network, pay_to in self.accepted
@@ -277,7 +307,7 @@ class Payments:
                         network=network,
                         pay_to=pay_to,
                         price=op.price(self.settings),
-                        max_timeout_seconds=300,
+                        max_timeout_seconds=PAYMENT_WINDOW_S,
                         extra=self._extra(),
                     )
                 )
