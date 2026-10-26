@@ -6,10 +6,13 @@ LLMs read to decide how to call us, so they are written for that reader.
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from aimart_parquet.engine.text import encoding_problem
 
 
 class InputFormat(StrEnum):
@@ -48,10 +51,60 @@ ColumnType = Literal[
 ]
 
 
+def _no_nul(value: str) -> str:
+    # DuckDB reads the SQL it is given as a C string: a NUL ends it. In a name or a null token
+    # that cut the statement short inside a quote (a bare 500 after payment); in a query it
+    # silently dropped everything after it ("SELECT * FROM data\0 WHERE ..." ran unfiltered).
+    if "\x00" in value:
+        msg = "must not contain a NUL character (\\x00)"
+        raise ValueError(msg)
+    return value
+
+
+NoNul = AfterValidator(_no_nul)
+"""For text that reaches DuckDB: refused when it holds a NUL, which DuckDB reads as its end."""
+
+# Values ``delimiter`` can never take: csv.reader refuses the quote character and line breaks
+# (a ValueError, a bare 500 after payment), and a NUL ends the SQL literal DuckDB is given.
+_UNUSABLE_DELIMITERS = {
+    '"': "the quote character",
+    "\n": "a line break",
+    "\r": "a line break",
+    "\x00": "NUL",
+}
+# One part of pdf_pages, as the PDF reader parses it: '3' or '1-5', spaces allowed.
+_PAGE_RANGE = re.compile(r"^\s*(\d+)\s*(?:-\s*(\d+))?\s*$")
+
+
+def pdf_page_ranges(spec: str) -> list[tuple[int, int]]:
+    """'1-3,7' -> [(1, 3), (7, 7)]; ValueError for a part no PDF has, decided from the text alone.
+
+    How many pages a range selects depends on the document, so that is the reader's to check.
+    """
+    ranges: list[tuple[int, int]] = []
+    for part in spec.split(","):
+        match = _PAGE_RANGE.match(part)
+        if not match:
+            msg = f"pdf_pages {spec!r} is not a page list. Use a form like '1-3,7'."
+            raise ValueError(msg)
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if start < 1 or end < start:
+            msg = (
+                f"pdf_pages range {part.strip()!r} is invalid: pages start at 1, and a range "
+                "runs low to high."
+            )
+            raise ValueError(msg)
+        ranges.append((start, end))
+    return ranges
+
+
 class ExpectedColumn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(description="Column name after normalization (snake_case by default).")
+    name: Annotated[str, NoNul] = Field(
+        min_length=1, description="Column name after normalization (snake_case by default)."
+    )
     type: ColumnType
     nullable: bool = True
     precision: int | None = Field(
@@ -100,9 +153,13 @@ class ConvertOptions(BaseModel):
         default=None, description="Whether the first row is a header. Omit to auto-detect."
     )
     encoding: str | None = Field(
-        default=None, description="Text encoding, e.g. 'latin-1'. Omit to auto-detect."
+        default=None,
+        description=(
+            "Text encoding as a Python codec name, e.g. 'latin-1', 'cp1252' or 'utf-16-le'. "
+            "Omit to auto-detect."
+        ),
     )
-    null_values: list[str] = Field(
+    null_values: list[Annotated[str, NoNul]] = Field(
         default_factory=list,
         max_length=50,
         description="Extra tokens to treat as null, in addition to '', NA, N/A, null, None, -.",
@@ -161,6 +218,54 @@ class ConvertOptions(BaseModel):
     )
     compression: Literal["zstd", "snappy", "gzip", "none"] = "zstd"
     row_group_size: int = Field(default=122_880, ge=1_000, le=10_000_000)
+
+    # The rules below are decided by the request alone, so the request schema refuses them
+    # before any price is quoted. Each used to be found only after the payment was verified.
+    @field_validator("delimiter")
+    @classmethod
+    def _usable_delimiter(cls, value: str | None) -> str | None:
+        if value is not None and value in _UNUSABLE_DELIMITERS:
+            msg = (
+                f"delimiter {value!r} cannot separate fields: it is "
+                f"{_UNUSABLE_DELIMITERS[value]}. Omit delimiter to detect it."
+            )
+            raise ValueError(msg)
+        return value
+
+    @field_validator("encoding")
+    @classmethod
+    def _text_encoding(cls, value: str | None) -> str | None:
+        problem = encoding_problem(value) if value is not None else None
+        if problem is not None:
+            raise ValueError(problem)
+        return value
+
+    @field_validator("pdf_pages")
+    @classmethod
+    def _page_list(cls, value: str | None) -> str | None:
+        if value is not None:
+            pdf_page_ranges(value)
+        return value
+
+    @model_validator(mode="after")
+    def _unique_expected_names(self) -> ConvertOptions:
+        # Two declarations of one column (DuckDB names are case-insensitive) each became an
+        # output: DuckDB renamed the second ('a_1'), the report described the first twice, and
+        # 'a' with 'A' crashed the report (KeyError: 'A'), all after the payment was verified.
+        seen: dict[str, str] = {}
+        for col in self.expected_schema or ():
+            key = col.name.lower()  # the key _apply_expected_schema matches input columns by
+            if key in seen:
+                first = seen[key]
+                case = (
+                    ""
+                    if first == col.name
+                    else f" (as {first!r} and {col.name!r}; names are case-insensitive)"
+                )
+                msg = f"expected_schema names column {first!r} twice{case}."
+                raise ValueError(msg)
+            seen[key] = col.name
+        return self
 
 
 class ColumnReport(BaseModel):
