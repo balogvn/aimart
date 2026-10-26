@@ -166,9 +166,21 @@ class Service:
                 yield
 
     async def _execute(
-        self, fn: Callable[..., T], *args: Any, timeout_s: float, isolate: bool, **kwargs: Any
+        self,
+        fn: Callable[..., T],
+        *args: Any,
+        timeout_s: float,
+        isolate: bool,
+        job_dirs: tuple[Path, ...] = (),
+        **kwargs: Any,
     ) -> T:
-        """Run one engine call. Callers hold the job slot (``async with self._job()``)."""
+        """Run one engine call. Callers hold the job slot (``async with self._job()``).
+
+        ``job_dirs`` are the call's work directories: the isolated job's memory cap counts the
+        bytes in them, because on Cloud Run they are RAM too. A 1.5 MB gzip CSV decompressed to
+        501 MiB in the work directory while the cap, counting only the child's own memory, saw
+        nothing; two such calls at once were enough to take the instance down, unpaid.
+        """
         if isolate:
             # The child enforces the deadline (and is killed at it), so no outer timeout here.
             call = functools.partial(
@@ -177,6 +189,7 @@ class Service:
                 *args,
                 timeout_s=timeout_s,
                 memory_limit_mb=self.settings.job_memory_limit_mb,
+                job_dirs=job_dirs,
                 **kwargs,
             )
             return await anyio.to_thread.run_sync(call)
@@ -307,6 +320,8 @@ class Service:
                     limits=self.limits,
                     timeout_s=self.settings.convert_timeout_s,
                     isolate=self.settings.isolate_jobs,
+                    # An upload sits in convert_upload's own work directory.
+                    job_dirs=(workdir, *([src.upload.parent] if src.upload else [])),
                 )
             except UnsupportedFormat:
                 self.demand.unsupported_format(name)  # roadmap signal: what agents tried to send
@@ -401,6 +416,7 @@ class Service:
                     path,
                     timeout_s=self.settings.query_timeout_s,
                     isolate=self.settings.isolate_jobs,
+                    job_dirs=(workdir,),
                 )
             finally:
                 shutil.rmtree(workdir, ignore_errors=True)
@@ -429,6 +445,7 @@ class Service:
                     max_chars=self.settings.max_cell_chars,
                     timeout_s=self.settings.query_timeout_s,
                     isolate=self.settings.isolate_jobs,
+                    job_dirs=(workdir,),
                 )
             finally:
                 shutil.rmtree(workdir, ignore_errors=True)
@@ -475,6 +492,7 @@ class Service:
                     threads=self.settings.duckdb_threads,
                     timeout_s=self.settings.query_timeout_s + 5,
                     isolate=self.settings.isolate_jobs,
+                    job_dirs=(workdir,),
                 )
             finally:
                 shutil.rmtree(workdir, ignore_errors=True)
@@ -518,6 +536,7 @@ class Service:
                 options,
                 timeout_s=self.settings.quantum_timeout_s,
                 isolate=self.settings.isolate_jobs,
+                job_dirs=(workdir,),
             )
             stem = Path(name).name.split(".")[0] if name else "data"
             ref = self._publish(
@@ -546,6 +565,7 @@ class Service:
                     options,
                     timeout_s=self.settings.quantum_timeout_s,
                     isolate=self.settings.isolate_jobs,
+                    job_dirs=(workdir,),
                 )
                 extra_notes = fields.pop("notes", [])
                 return PortfolioResult(**fields, notes=[SIMULATOR_NOTE, *extra_notes])

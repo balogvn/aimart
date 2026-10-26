@@ -25,12 +25,15 @@ Service shape (set by `deploy.yml`): 1 vCPU, 2 GiB, `concurrency=4`, `max-instan
 
 Memory on that instance is shared by the API (about 250 MB), the forkserver (about 250 MB), two
 jobs (`AIMART_MAX_CONCURRENT_JOBS=2`) and, without a bucket, the artifacts in RAM-backed `/tmp`.
-Each job is a child process that the parent kills once its resident memory passes
-`AIMART_JOB_MEMORY_LIMIT_MB` (700 by default; `0` disables the cap), and the call fails with 413
-`input_too_large`, unpaid ([ADR 0005](../docs/adr/0005-job-isolation-forkserver.md)). The cost of
-that cap: CSV conversion peaks at about 3.5 times the decompressed CSV size, so CSVs above
-roughly 180-200 MB decompressed are refused on this instance (measured at e8d228e: 200 MB peaked
-at about 706 MB, 450 MB at about 1.4 GB). Raising the cap without more memory per instance
+Each job is a child process that the parent kills once its resident memory plus its temporary
+files pass `AIMART_JOB_MEMORY_LIMIT_MB` (700 by default; `0` disables the cap), and the call
+fails with 413 `input_too_large`, unpaid ([ADR 0005](../docs/adr/0005-job-isolation-forkserver.md)).
+The files count because `/tmp` is RAM here: a 1.5 MB gzip CSV once decompressed to 500 MB there
+while the job's resident memory alone stayed under the cap. The cost of that cap: CSV conversion
+peaks at about 3.5 times the decompressed CSV size in memory, plus the decompressed file, so CSVs
+above roughly 120-150 MB decompressed are refused on this instance, and an input that expands
+past the decompression limit (`max_decompressed_bytes`, 256 MB: nothing larger converted under
+the default cap) is refused as soon as it does. Raising the cap without more memory per instance
 trades those refusals for an out-of-memory restart that fails every in-flight call.
 
 ---
@@ -130,7 +133,7 @@ so both the deploy and the synthetic check can read them; every value here is pu
 | `AIMART_GCS_BUCKET` | no | bucket name; artifacts then leave the instance's RAM |
 | `AIMART_FACILITATOR_URLS` | no | comma-separated override of the default facilitators |
 | `AIMART_ENABLE_QUANTUM` | no | `true` serves the premium quantum tools (off by default); both smoke checks then require them |
-| `AIMART_JOB_MEMORY_LIMIT_MB` | no | `700` (the application default when unset): resident memory, in MB, one isolated job may use before the parent kills it and the call fails with 413 `input_too_large`, unpaid; `0` disables the cap. Sized for the 2 GiB instance (see the service shape above) |
+| `AIMART_JOB_MEMORY_LIMIT_MB` | no | `700` (the application default when unset): memory, in MB, one isolated job may use, counting its resident memory plus its temporary files in `/tmp` (RAM on Cloud Run), before the parent kills it and the call fails with 413 `input_too_large`, unpaid; `0` disables the cap. Sized for the 2 GiB instance (see the service shape above) |
 | `SMOKE_SIGNING_KEY_SHA256` | no, recommended | pins the public signing key (section 1.7) |
 
 `deploy.yml` always sets `AIMART_TRUST_FORWARDED_FOR=true` (Google's front end sets

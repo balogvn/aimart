@@ -79,3 +79,18 @@ def write_temp_then_sleep(seconds: float) -> None:
     folder = Path(tempfile.mkdtemp(prefix="aimart-q-"))
     (folder / "input.parquet").write_bytes(b"x" * 1024)
     time.sleep(seconds)
+
+
+def write_then_sleep(folder: str | None, mb: int, seconds: float) -> str:
+    """Write ``mb`` MB into ``folder`` (None: the job's own temp directory), then hold it."""
+    target = Path(folder) if folder is not None else Path(tempfile.mkdtemp(prefix="aimart-q-"))
+    with (target / "spill.bin").open("wb") as out:
+        for _ in range(mb):
+            out.write(os.urandom(1024 * 1024))
+    time.sleep(seconds)
+    return "woke up"
+
+
+def raise_with_secret_text() -> None:
+    """An unexpected exception whose text quotes caller data, as a KeyError naming a column."""
+    raise KeyError("Customer: Zoë Example, card ending 4242")

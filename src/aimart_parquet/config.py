@@ -68,7 +68,18 @@ class Settings(BaseSettings):
 
     # ---------------------------------------------------------------- limits
     max_input_bytes: int = 50 * 1024 * 1024
-    max_decompressed_bytes: int = 512 * 1024 * 1024
+    max_decompressed_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        description=(
+            "Bytes a gzip/bz2/zip input, or the XML of an xlsx/ods, may expand to; past it the "
+            "call fails with 413 input_too_large, unpaid. Sized to the job memory cap, which "
+            "counts the expanded file: measured with the 700 MB default, the largest inputs "
+            "that converted were 120 MB of decompressed CSV and an xlsx of 144 MB of XML, and "
+            "every CSV of 150 MB and the xlsx of 254 MB failed, so 256 MB refuses nothing that "
+            "can convert. A zip or xlsx over it is refused from its directory before anything "
+            "is inflated. Was 512 MB. Raise it together with job_memory_limit_mb."
+        ),
+    )
     max_json_repair_bytes: int = 5 * 1024 * 1024
     max_preview_rows: int = 500
     max_query_rows: int = 1000
@@ -85,13 +96,16 @@ class Settings(BaseSettings):
         default=700,
         ge=0,
         description=(
-            "Resident memory (MB) one isolated job may use; over it the job is killed and the "
-            "call fails with 413 input_too_large, unpaid. Sized for a 2 GiB instance: the API "
-            "(~250 MB) and the forkserver (~250 MB) plus max_concurrent_jobs=2 jobs at 700 MB, "
-            "since a 1.6 KB PDF or a query of huge strings once took one job to 2 GB. On Linux "
-            "it includes the ~160 MB of preloaded engine each child shares with the forkserver. "
-            "Ordinary inputs peak at 250-500 MB; about 200 MB of decompressed CSV reaches the "
-            "limit. 0 disables it. Needs isolate_jobs (the parent polls the child's RSS)."
+            "Memory (MB) one isolated job may use, counting its resident memory plus its "
+            "temporary files (the call's work directory and the job's own temp directory: on "
+            "Cloud Run /tmp is RAM inside the same instance); over it the job is killed and "
+            "the call fails with 413 input_too_large, unpaid. Sized for a 2 GiB instance: the "
+            "API (~250 MB) and the forkserver (~250 MB) plus max_concurrent_jobs=2 jobs at "
+            "700 MB, since a 1.6 KB PDF or a query of huge strings once took one job to 2 GB, "
+            "and a 1.5 MB gzip CSV wrote 500 MB of temporary files. On Linux it includes the "
+            "~160 MB of preloaded engine each child shares with the forkserver. Ordinary inputs "
+            "peak at 250-500 MB; about 120-150 MB of decompressed CSV reaches the limit. 0 "
+            "disables it. Needs isolate_jobs (the parent polls the child's RSS and files)."
         ),
     )
     queue_wait_s: float = 10.0

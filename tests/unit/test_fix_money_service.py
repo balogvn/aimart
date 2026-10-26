@@ -49,6 +49,7 @@ async def test_preview_and_inspect_decode_in_the_isolated_worker(
         *args: Any,
         timeout_s: float,
         memory_limit_mb: int | None = None,
+        job_dirs: Any = (),
         **kw: Any,
     ) -> Any:
         ran.append(fn.__name__)

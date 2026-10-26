@@ -15,6 +15,11 @@ Why a process and not a thread:
   raising ``InputTooLarge`` (unpaid). ``RLIMIT_AS``/``RLIMIT_DATA`` cannot do this: measured
   on Linux, a child starts at 2 GB virtual (DuckDB, Arrow, PennyLane and glibc arenas reserve
   address space) with 160 MB resident, and a 1.5 GB limit already failed a 200k-row CSV.
+* The job's files count against the same cap. On Cloud Run ``/tmp`` is RAM inside the same
+  2 GiB, and resident memory never shows it: a 1.5 MB gzip CSV wrote 501 MiB of decompressed
+  text into its work directory while the child's RSS climbed to the cap on its own, and two
+  such calls held about 2.5 GB between them, unpaid. The parent adds the bytes under the job's
+  directories (its own temp directory and the work directory the caller names) to the RSS.
 
 Children fork from a ``forkserver`` that has already imported the engine, so a job costs a
 fork (milliseconds), not a fresh interpreter importing pyarrow and DuckDB.
@@ -32,6 +37,7 @@ import signal
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -39,7 +45,7 @@ from aimart_parquet import errors
 from aimart_parquet.config import get_settings
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
 T = TypeVar("T")
 
@@ -78,6 +84,10 @@ if _METHOD == "forkserver":
 # The parent checks the child's memory this often. A job allocating as fast as it can gains
 # a few hundred MB between checks; the default limit leaves that much headroom on 2 GiB.
 _POLL_S = 0.1
+# A job's directories hold a handful of files (its input, a decompressed or transcoded copy,
+# DuckDB's spill files, the output), so a full walk every poll costs microseconds. The walk stops
+# after this many entries, so a job that made a million files cannot slow its own watchdog.
+_MAX_WALK_ENTRIES = 10_000
 _PROC = Path("/proc")
 _LIBPROC = "/usr/lib/libproc.dylib"
 _PROC_PIDTASKINFO = 4  # proc_pidinfo flavor returning struct proc_taskinfo
@@ -131,8 +141,74 @@ def _read_rss(pid: int) -> int | None:
     return reader(pid) if reader is not None else None
 
 
-def _wait_for_report(receiver: Any, pid: int, timeout_s: float, memory_limit_mb: int) -> Any:
-    """The child's message, or None if it died without one. Enforces the deadline and memory."""
+def _disk_bytes(roots: Iterable[Path]) -> int:
+    """Bytes the files under ``roots`` occupy, as RAM on a memory-backed ``/tmp``.
+
+    Symlinks are never followed (a link is not the job's data, and could point anywhere). A
+    file hard-linked from outside ``roots`` takes no space of its own, and a query's input
+    linked from the artifact store is in the artifact budget already, so a file counts once all
+    of its links were seen here: a query linking eight 100 MB artifacts must not look like
+    800 MB. Files and folders that vanish mid-walk (the job deleting its own) are skipped.
+    """
+    files: dict[tuple[int, int], list[int]] = {}  # (device, inode) -> [links seen, links, bytes]
+    folders = [str(root) for root in roots]
+    walked = 0
+    while folders and walked < _MAX_WALK_ENTRIES:
+        try:
+            with os.scandir(folders.pop()) as entries:
+                for entry in entries:
+                    walked += 1
+                    if walked > _MAX_WALK_ENTRIES:
+                        break
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            folders.append(entry.path)
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue  # a symlink, socket or fifo holds no data of the job's
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    seen = files.setdefault((st.st_dev, st.st_ino), [0, st.st_nlink, 0])
+                    seen[0] += 1
+                    # Allocated blocks rather than the length: what a sparse file really uses.
+                    seen[2] = getattr(st, "st_blocks", 0) * 512 or st.st_size
+        except OSError:
+            continue
+    return sum(size for seen, links, size in files.values() if seen >= links)
+
+
+def _over_budget(pid: int, memory_limit_mb: int, job_dirs: tuple[Path, ...]) -> None:
+    """Raise ``InputTooLarge`` once the child's memory plus its files pass the limit."""
+    limit = memory_limit_mb * 1024 * 1024
+    rss = _read_rss(pid) or 0  # unreadable (an exotic platform, a child just gone): files only
+    disk = _disk_bytes(job_dirs)
+    if rss + disk <= limit:
+        return
+    raise errors.InputTooLarge(
+        f"The job exceeded its memory budget ({memory_limit_mb} MB) and was stopped: "
+        f"{rss // (1024 * 1024)} MB in memory plus {disk // (1024 * 1024)} MB of temporary "
+        "files, which count toward the budget.",
+        hint=(
+            "Send a smaller file (a compressed file counts at its decompressed size; for a PDF, "
+            "fewer pages via pdf_pages), or a query that returns less data; you were not "
+            "charged."
+        ),
+        limit_bytes=limit,
+        memory_bytes=rss,
+        temp_file_bytes=disk,
+    )
+
+
+def _wait_for_report(
+    receiver: Any,
+    pid: int,
+    timeout_s: float,
+    memory_limit_mb: int,
+    job_dirs: tuple[Path, ...] = (),
+) -> Any:
+    """The child's message, or None if it died without one. Enforces the deadline and the cap
+    on memory plus the files under ``job_dirs``."""
     deadline = time.monotonic() + timeout_s
     while (remaining := deadline - time.monotonic()) > 0:
         if receiver.poll(min(remaining, _POLL_S) if memory_limit_mb else remaining):
@@ -140,16 +216,8 @@ def _wait_for_report(receiver: Any, pid: int, timeout_s: float, memory_limit_mb:
                 return receiver.recv()
             except EOFError:
                 return None  # the child died before reporting: a crash
-        rss = _read_rss(pid) if memory_limit_mb else None
-        if rss is not None and rss > memory_limit_mb * 1024 * 1024:
-            raise errors.InputTooLarge(
-                f"The job exceeded its memory budget ({memory_limit_mb} MB) and was stopped.",
-                hint=(
-                    "Send a smaller file (for a PDF, fewer pages via pdf_pages), or a query that "
-                    "returns less data; you were not charged."
-                ),
-                limit_bytes=memory_limit_mb * 1024 * 1024,
-            )
+        if memory_limit_mb:
+            _over_budget(pid, memory_limit_mb, job_dirs)
     raise errors.Timeout(
         f"The operation did not finish within {timeout_s:g} seconds.",
         hint="Send a smaller file or a simpler query; you were not charged.",
@@ -189,9 +257,22 @@ def _child(
             )
         )
     except BaseException as exc:  # noqa: BLE001 - report anything; the parent decides
-        conn.send(("crash", type(exc).__name__, f"{type(exc).__name__}: {exc}"))
+        conn.send(("crash", type(exc).__name__, _where(exc)))
     finally:
         conn.close()
+
+
+def _where(exc: BaseException) -> str:
+    """Where ``exc`` was raised, as traceback frames (file, line, function), with no message.
+
+    The published retention policy says logs never hold file contents, and an exception's text
+    can: a KeyError names a column, a ValueError quotes the cell it could not parse. Its type
+    and its frames are enough to find the bug.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)
+    lines = [f"{type(exc).__name__} (message withheld)"]
+    lines += [f'  File "{f.filename}", line {f.lineno}, in {f.name}' for f in frames]
+    return "\n".join(lines)
 
 
 def _rebuild(
@@ -208,26 +289,30 @@ def run_isolated[T](
     *args: Any,
     timeout_s: float,
     memory_limit_mb: int | None = None,
+    job_dirs: Iterable[Path] = (),
     **kwargs: Any,
 ) -> T:
     """Run ``fn(*args, **kwargs)`` in a child process. Blocking; call from a worker thread.
 
-    The child is killed at ``timeout_s`` (``Timeout``) or once its resident memory exceeds
-    ``memory_limit_mb`` (``InputTooLarge``; 0 disables the cap). None means the configured
-    ``job_memory_limit_mb`` of ``get_settings()``, the settings the server runs with: callers
-    that pass nothing (``Service`` among them) were held at the field's 700 MB default, and
-    ``AIMART_JOB_MEMORY_LIMIT_MB`` did nothing.
+    The child is killed at ``timeout_s`` (``Timeout``) or once its resident memory plus the
+    bytes of the files under its directories exceed ``memory_limit_mb`` (``InputTooLarge``; 0
+    disables the cap). Its directories are the per-job temp directory made here and
+    ``job_dirs``, the work directories the caller gives the job (where a convert decompresses
+    its input). None means the configured ``job_memory_limit_mb`` of ``get_settings()``, the
+    settings the server runs with: callers that pass nothing (``Service`` among them) were held
+    at the field's 700 MB default, and ``AIMART_JOB_MEMORY_LIMIT_MB`` did nothing.
     """
     if memory_limit_mb is None:
         memory_limit_mb = get_settings().job_memory_limit_mb
     tmp = tempfile.mkdtemp(prefix="aimart-job-")
+    watched = (Path(tmp), *job_dirs)
     receiver, sender = _CTX.Pipe(duplex=False)
     proc = _CTX.Process(target=_child, args=(sender, fn, args, kwargs, tmp), daemon=True)
     try:
         proc.start()
         sender.close()
         try:
-            message = _wait_for_report(receiver, proc.pid, timeout_s, memory_limit_mb)
+            message = _wait_for_report(receiver, proc.pid, timeout_s, memory_limit_mb, watched)
         finally:
             receiver.close()
             if proc.is_alive():
@@ -246,7 +331,8 @@ def run_isolated[T](
         return message[1]  # type: ignore[no-any-return]
     if message[0] == "err":
         raise _rebuild(*message[1:])
-    # The text of an unexpected exception can carry server paths: log it, never send it.
+    # Neither the caller nor the log gets an unexpected exception's text: it can carry server
+    # paths (the caller) and a column name or cell value (the log; see _where).
     log.error("isolated job crashed: %s", message[2])
     raise errors.AimartError(
         f"Internal error ({message[1]}).", hint="Retry; if it persists, report it."

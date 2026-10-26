@@ -67,13 +67,16 @@ flowchart LR
 4. **Isolated job.** Every engine call (convert, inspect, preview, query and the quantum
    tools; with the default `AIMART_ISOLATE_JOBS=true`) runs in a child forked from a `forkserver` that has already imported the engine, so
    a job costs a fork, not a fresh interpreter. The parent kills the child at its deadline
-   (504 `timeout`) or when its resident memory passes `AIMART_JOB_MEMORY_LIMIT_MB` (700 MB by
-   default; 413 `input_too_large`), and deletes the job's own temporary directory either way.
-   A crash becomes `InvalidInput`; any other unexpected exception is logged and reported by
-   its type only. All of these are unpaid. The cap is an RSS watchdog, not `RLIMIT_AS`: a
-   Linux child starts at about 2 GB of virtual memory. Its cost: a CSV converts at about 3.5
-   times its decompressed size, so on the default 2 GiB instance CSVs above roughly 180-200 MB
-   are refused. See [ADR 0005](adr/0005-job-isolation-forkserver.md).
+   (504 `timeout`) or when its resident memory plus its temporary files (under its own temp
+   directory and the call's work directory: RAM on Cloud Run) pass
+   `AIMART_JOB_MEMORY_LIMIT_MB` (700 MB by default; 413 `input_too_large`), and deletes the
+   job's own temporary directory either way. A crash becomes `InvalidInput`; any other
+   unexpected exception is reported by its type only, and logged by its type and traceback
+   frames, never its text. All of these are unpaid. The cap is an RSS-plus-files watchdog, not
+   `RLIMIT_AS`: a Linux child starts at about 2 GB of virtual memory. Its cost: a CSV converts
+   at about 3.5 times its decompressed size in memory, plus the decompressed file itself, so on
+   the default 2 GiB instance CSVs above roughly 120-150 MB decompressed are refused, and
+   `max_decompressed_bytes` is 256 MB. See [ADR 0005](adr/0005-job-isolation-forkserver.md).
 5. **Engine** (`engine/`). Detection by magic bytes (`detect.py`) is followed by bomb-safe
    decompression (`safety.py`) and UTF-8 transcoding (`text.py`). A reader (`readers/`)
    produces a raw table in a locked-down DuckDB connection (`duck.py`). Next come type
