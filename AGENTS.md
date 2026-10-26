@@ -357,8 +357,9 @@ each test's docstring has the incident.
 
 Known gaps: ISO date formats accept 1-digit years ('1/2/3' becomes 0001-02-03); JSON timestamps
 that all carry offsets become naive UTC with no note; DuckDB's `memory_limit` (1 GB) is above the
-700 MB job cap, so the watchdog can stop a job before DuckDB would spill. The 422 for a time past
-9999 in `tabular.py` and the 413 for `read_csv` running out of memory lack their own tests.
+700 MB job cap, so the watchdog can stop a job before DuckDB would spill. (The 422 for a time past
+9999 in preview and query and the 413 for `read_csv` running out of memory are now tested, in
+`integration/test_final_isolate_gaps.py`.)
 
 ## Agent tooling
 
