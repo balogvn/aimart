@@ -536,7 +536,16 @@ def _split_captions(
     if not typed:
         return rows, []
     first = next((i for i, row in enumerate(rows) if _data_row(row, typed, tail)), None)
-    if first is None or first < 2:  # one row above the data at most: nothing to choose
+    if first is None or first == 0:
+        return rows, []
+    if first == 1:
+        # One row above the data: the header, or a running page title on a page that does
+        # not repeat the header. Kept, that title became the page's header, so the page was
+        # neither a repeat nor a continuation of page 1's table: a ledger titled on every
+        # page came back as 80 of its 120 rows, its columns named after the title. A header
+        # names every typed column, and only a row that does not is worth a glyph pass.
+        if _names(rows[0], typed, tail) < len(typed) and running(0):
+            return rows[1:], [" ".join(c for c in rows[0] if c)]
         return rows, []
     names = [_names(rows[i], typed, tail) for i in range(first)]
     ranked = sorted((i for i in range(first) if names[i]), key=lambda i: (-names[i], i))
@@ -730,6 +739,21 @@ def _continues(table: _Table, rows: list[list[str]]) -> bool:
     return bool(typed) and _data_row(rows[0], typed, table.rows)
 
 
+def _squashed(text: str) -> str:
+    return "".join(text.split())
+
+
+def _repeats_caption(item: _Found, table: _Table) -> bool:
+    """Is ``item``'s first row a line dropped above ``table``'s header (a running title)?
+
+    Compared without spaces: the alignment pass cuts the line at each page's column edges.
+    """
+    if len(item.rows) < 2 or not table.captions:
+        return False
+    line = _squashed("".join(item.rows[0]))
+    return bool(line) and line in {_squashed(c) for c in table.captions}
+
+
 def _span(pages: list[int]) -> str:
     """[2, 3, 4, 7] -> '2-4,7': a pdf_pages value the caller can send back as is."""
     parts: list[str] = []
@@ -747,6 +771,11 @@ def _merge(found: list[_Found]) -> list[_Table]:
     last: _Table | None = None  # the table that took the previous found item
     last_page = 0
     for item in found:
+        if last is not None and item.page > last.pages[-1] and _repeats_caption(item, last):
+            # The title already dropped above this table's header, repeated at the top of a
+            # later page. In one column, positions cannot tell it from a header row.
+            item.captions.append(" ".join(c for c in item.rows[0] if c))
+            item.rows = item.rows[1:]
         header = item.rows[0]
         same = next((t for t in tables if t.header == header), None)
         if same is not None:  # a repeated header: the table continues on this page
@@ -888,7 +917,8 @@ def read_pdf(
     if len(chosen.pages) > 1:
         warnings.append(f"merged a table that continues across {len(chosen.pages)} pages")
     if chosen.captions:
-        shown = "; ".join(repr(c[:80]) for c in chosen.captions[:3])
+        # A running title is dropped once a page: show each line once.
+        shown = "; ".join(repr(c[:80]) for c in list(dict.fromkeys(chosen.captions))[:3])
         warnings.append(f"dropped {len(chosen.captions)} line(s) above the header: {shown}")
     warnings.append(f"tables detected by {chosen.strategy}")
 
