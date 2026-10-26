@@ -42,6 +42,7 @@ notes and, on the hosted service, a provenance block with a 3,309-byte ML-DSA-65
 - [Quickstart for agents](#quickstart-for-agents)
 - [Pricing](#pricing)
 - [Supported formats](#supported-formats)
+- [Limits and errors](#limits-and-errors)
 - [Premium quantum tier](#premium-quantum-tier)
 - [Post-quantum provenance](#post-quantum-provenance)
 - [Security model](#security-model)
@@ -234,9 +235,36 @@ must be switched on explicitly by the operator. See [docs/payments.md](docs/paym
 
 Any of these can also arrive gzip-, bz2- or zip-compressed. Detection uses magic bytes before
 extensions. Every column in the report carries its type, null count, rejected values with
-examples, and notes such as "assumed day-first". `expected_schema` with `strict` turns the
-conversion into a validation step. The full option list is in the `ConvertOptions` schema
-(`/openapi.json`, or the tool's input schema).
+examples, and notes on anything the service assumed: "assumed day-first", "ambiguous
+thousands/decimal separator; assumed a decimal comma, so '1.234' is 1234", "values without a
+UTC offset were read as UTC (k of n)", "values with a UTC offset were rejected (k of n)" or
+"converted to UTC". Report warnings say when nested JSON keys that differ only by case were
+renamed (`a.K is now a.K_2`) or title lines above a PDF table were dropped. `expected_schema`
+with `strict` turns the conversion into a validation step. The full option list is in the
+`ConvertOptions` schema (`/openapi.json`, or the tool's input schema), and the notes are listed
+in the [agents guide](docs/agents-guide.md#3-convert).
+
+## Limits and errors
+
+A failed call is never charged: every refusal is HTTP ≥ 400 (or an MCP `isError` result) with
+a `code`, a `message` and a `hint`. A call whose body or arguments can only fail is refused
+(400 `invalid_request`, or an MCP error result) before any price is quoted. The defaults, which
+an operator can change:
+
+| limit | default | over it |
+|---|---|---|
+| input size (`url`, `content_base64` or upload) | 50 MB per call, all inputs of the call together; stored `artifact_id`s do not count | 413 `input_too_large` |
+| decompressed size | 512 MB | 413 `input_too_large` |
+| memory per job | 700 MB | 413 `input_too_large` ("The job exceeded its memory budget") |
+| stored outputs | 512 MiB for all outputs together (256 MiB on the Cloud Run deploy without a bucket) | 413 for one output larger than the whole budget; 503 `busy` while the space is held by recent outputs or outputs still settling |
+| preview and query results | 500 preview rows, 1,000 query rows, cells cut to 2,000 characters, 64 MB in all | more rows: `truncated: true`; over 64 MB: 413 |
+| time | 120 s to convert, 15 s to inspect, preview or query | 504 `timeout` |
+| concurrency | 2 jobs and a short queue | 503 `busy` |
+
+Password-protected and scanned PDFs (422 `invalid_input`), a column preview or query cannot show,
+such as a time past year 9999 (422; cast it to text), and a storage failure (503
+`storage_unavailable`) are refused the same way. Every code, and what to do about it, is in the
+[agents guide](docs/agents-guide.md#6-handle-errors).
 
 ## Premium quantum tier
 
