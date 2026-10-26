@@ -322,8 +322,11 @@ Run pricing page before relying on them.
   spend cap (1.2 A) is the control that bounds them; the alert budget (1.2 B) is how you hear
   about it.
 - **Artifacts:** without a bucket they sit in `/tmp`, which on Cloud Run is the instance's RAM
-  (counted inside the 2 GiB, wiped when the instance stops), hence the 256 MiB budget. With
-  `AIMART_GCS_BUCKET`, downloads are V4 signed GCS URLs and leave Cloud Run's 1 GiB egress
+  (counted inside the 2 GiB, wiped when the instance stops), hence the 256 MiB budget. Every
+  output there is kept until its `expires_at` (the TTL), never evicted sooner, so once an hour's
+  outputs fill the budget a new convert is refused with 503 `busy` (unpaid, with when to retry)
+  until the oldest expire. With `AIMART_GCS_BUCKET`, the local copy is only a cache that can be
+  evicted at any time, downloads are V4 signed GCS URLs, and they leave Cloud Run's 1 GiB egress
   allowance alone.
 - **Retention** (what `/pricing` publishes as `data_retention`): an artifact becomes unreachable
   at `AIMART_ARTIFACT_TTL_S` (60 minutes) and is normally deleted within minutes after that, by a

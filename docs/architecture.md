@@ -87,8 +87,9 @@ flowchart LR
    or `GcsArtifactStore` (V4 signed URLs). The caller gets a reference (`artifact_id` and
    `download_url`), not the bytes ([ADR 0007](adr/0007-artifact-references-not-bytes.md)).
    Room is made before an output is stored, never by evicting an unsettled output, a local
-   one delivered in the last 10 minutes, or one a running call reads: an output that cannot
-   fit is refused (413 over the whole budget, 503 `busy` otherwise), unpaid.
+   one that has not expired (its response promised it until `expires_at`; on GCS eviction
+   drops only the cached copy), or one a running call reads: an output that cannot fit is
+   refused (413 over the whole budget, 503 `busy` with when to retry otherwise), unpaid.
    At the TTL an artifact becomes unreachable; a sweep on the request path deletes it soon
    after ([privacy.md](privacy.md) has the retention promise and its worst case).
 7. **Provenance.** `Service._publish`, the single place every output passes through, signs a
