@@ -24,12 +24,15 @@ Correctness beats cleverness on purpose:
 * A UTC offset is never dropped. DuckDB's ``TIMESTAMP`` cast silently discards it, so text
   with an offset or zone is only ever read as ``TIMESTAMPTZ``. And only such text: that cast
   reads a naive value in the zone named by an earlier row ('10:00' after '09:00 EST' is EST).
+* A zone is an offset, UTC, an IANA name or one of a few abbreviations with one meaning
+  (``ZONE_ABBREVIATIONS``), never what ICU makes of a name: it reads 'BST' as Asia/Dhaka.
+  Any other name makes the value a counted reject, or keeps the column text, with a note.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from aimart_parquet.engine.duck import ident, literal
 from aimart_parquet.engine.models import DateOrder
@@ -84,6 +87,30 @@ _RE_DATE_LIKE = (
 # A time followed by an explicit offset. Zero offsets ('Z', '+00:00', 'UTC') are why this exists:
 # _has_zone catches every other offset and zone name by comparing casts.
 _RE_TZ_SUFFIX = r".*\d:\d{2}(:\d{2}([.,]\d+)?)?\s*(Z|[+-]\d{2}(:?\d{2}){0,2}|UTC)"
+# Zone abbreviations read as times, each as the one offset it names, all year. ICU never reads
+# an abbreviation: it resolves them through legacy Java IDs and the rules of the zone it picks.
+# BST was Asia/Dhaka (+6, not British Summer Time), AST Alaska (not Atlantic), ART Cairo, NST
+# Auckland, ECT Paris, SST Guadalcanal, PST Los Angeles (-7 in July), MST Phoenix (-6 in July
+# 1967): a UK log came back with every summer instant five hours early, a 200 with no note.
+# Listed are only names with one meaning in data. CST is also China (Java prints it for
+# Asia/Shanghai), IST is India, Ireland and Israel, and the standard name of a zone that keeps
+# summer time (PST, CET) is written in July for either offset. Any other name is not a zone:
+# the value is a counted reject, or the column stays text, and the report names it.
+ZONE_ABBREVIATIONS = {
+    "GMT": "+00:00",
+    "EST": "-05:00",
+    "MST": "-07:00",
+    "HST": "-10:00",
+    "JST": "+09:00",
+}
+# The zones a value may name after its time: an attached offset or 'Z' (DuckDB's own parser),
+# a listed abbreviation, UTC with whole hours (ICU cut 'UTC+05:30' to +05:00), or an IANA
+# Area/City name, which ICU reads with that zone's rules, as the name means.
+_RE_KNOWN_ZONE = (
+    r".*\d(Z|[+-]\d{2}(:?\d{2}){0,2}|\s+(?i:UTC([+-]\d{1,2}(:?00)?)?|"
+    + "|".join(ZONE_ABBREVIATIONS)
+    + r"|[a-z_]+(/[a-z0-9_+-]+)+))"
+)
 
 _ISO = ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"]
 _DMY = ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%b-%Y", "%d %b %Y", "%d %B %Y"]
@@ -190,16 +217,25 @@ def _date_formats(order: DateOrder) -> tuple[list[str], list[str]]:
     return iso + _with_times(_DMY), iso + _with_times(_MDY)
 
 
+def _tz(v: str) -> str:
+    """Zoned text as an instant, with a listed abbreviation read as its offset, never by ICU."""
+    for name, offset in ZONE_ABBREVIATIONS.items():
+        v = f"regexp_replace({v}, {literal(rf'(\d)\s+(?i:{name})$')}, {literal(rf'\1{offset}')})"
+    return f"TRY_CAST({v} AS TIMESTAMPTZ)"
+
+
 def _has_zone(v: str) -> str:
-    """True for text carrying a UTC offset or zone name.
+    """True for text carrying a UTC offset or a zone name this module reads (_RE_KNOWN_ZONE).
 
     DuckDB's TIMESTAMP cast drops an offset without applying it ('10:00+05:00' and
     '10:00-08:00' both become 10:00, 13 hours apart made equal), and returns NULL for zone
-    names other than UTC; the TIMESTAMPTZ cast applies both.
+    names other than UTC; the TIMESTAMPTZ cast applies both. A zone name it reads but this
+    module does not ('09:30 BST', see ZONE_ABBREVIATIONS) has no zone here, and no naive
+    reading either: the value is NULL in every rung.
 
     The TIMESTAMPTZ cast of text must never see a value without a zone in the same call as
-    one with a zone name: a name such as 'EST' becomes the zone of every later naive value in
-    its 2048-row vector (DuckDB 1.5.6), so '10:00' after '09:00 EST' reads as 15:00 UTC.
+    one with a zone name: a name such as 'Asia/Tokyo' becomes the zone of every later naive
+    value in its 2048-row vector (DuckDB 1.5.6), so '10:00' after it reads as 01:00 UTC.
     Comparing it with the TIMESTAMP cast over the whole column took those naive values for
     zoned ones and shifted them, silently. So each CASE branch below casts a set that cannot
     leak: values the TIMESTAMP cast rejects (zone names, and junk that both casts reject; a
@@ -208,16 +244,32 @@ def _has_zone(v: str) -> str:
     DuckDB runs a CASE branch only on the rows that take it.
     """
     naive = f"TRY_CAST({v} AS TIMESTAMP)"
-    tz = f"TRY_CAST({v} AS TIMESTAMPTZ)"
     return (
-        f"(CASE WHEN {naive} IS NULL THEN {tz} IS NOT NULL "
-        f"ELSE {_match(v, _RE_TZ_SUFFIX)} OR {tz}::TIMESTAMP != {naive} END)"
+        f"(CASE WHEN {naive} IS NULL THEN {_match(v, _RE_KNOWN_ZONE)} AND {_tz(v)} IS NOT NULL "
+        f"ELSE {_match(v, _RE_TZ_SUFFIX)} OR TRY_CAST({v} AS TIMESTAMPTZ)::TIMESTAMP != {naive} END)"
+    )
+
+
+def _unread_zone(v: str) -> str:
+    """The zone name ending text that ICU would read as an instant and this module does not."""
+    return (
+        f"(CASE WHEN TRY_CAST({v} AS TIMESTAMP) IS NULL AND NOT {_match(v, _RE_KNOWN_ZONE)} "
+        f"AND TRY_CAST({v} AS TIMESTAMPTZ) IS NOT NULL THEN regexp_extract({v}, '\\S+$') END)"
     )
 
 
 def _zoned_ts(v: str) -> str:
     """Text with a zone as an instant; NULL for anything else, which the cast would misread."""
-    return f"(CASE WHEN {_has_zone(v)} THEN TRY_CAST({v} AS TIMESTAMPTZ) END)"
+    return f"(CASE WHEN {_has_zone(v)} THEN {_tz(v)} END)"
+
+
+def unread_zone_note(name: str, count: int, total: int) -> str:
+    """Said whenever values name a zone that has another meaning (ZONE_ABBREVIATIONS)."""
+    return (
+        f"zone '{name[:32]}' was not read as a zone ({count} of {total}): abbreviations such as "
+        "BST, IST or CST name several zones, and DuckDB reads BST as Asia/Dhaka; write a UTC "
+        "offset (+01:00) or a zone name (Europe/London)"
+    )
 
 
 def naive_as_utc_note(naive: int, total: int) -> str:
@@ -241,7 +293,7 @@ def _parse_ts(v: str, formats: list[str]) -> str:
 def _instant(v: str, formats: list[str]) -> str:
     """Text as an instant: a zone where it has one, UTC where it has none (say so in a note)."""
     return (
-        f"(CASE WHEN {_has_zone(v)} THEN TRY_CAST({v} AS TIMESTAMPTZ) "
+        f"(CASE WHEN {_has_zone(v)} THEN {_tz(v)} "
         f"ELSE timezone('UTC', {_parse_ts(v, formats)}) END)"
     )
 
@@ -451,19 +503,25 @@ class TypeInferrer:
                 f"count({mdy})",
                 f"count_if({dmy} IS DISTINCT FROM {mdy} AND {dmy} IS NOT NULL AND {mdy} IS NOT NULL)",
                 f"count_if(coalesce({dmy}, {mdy})::TIME != TIME '00:00:00')",
+                f"count({_unread_zone(v)})",
+                f"min({_unread_zone(v)})",
             ]
         row = self.con.sql(f"SELECT {', '.join(aggs)} FROM {self.table}").fetchone()
         assert row is not None
-        width = 6
+        width = 8
         return {
             s: self._decide_temporal(s, row[i * width : (i + 1) * width])
             for i, s in enumerate(sources)
         }
 
-    def _decide_temporal(self, source: str, stats: tuple[int, ...]) -> ColumnPlan:
-        n, n_tz, n_dmy, n_mdy, n_conflict, n_time = stats
+    def _decide_temporal(self, source: str, stats: tuple[Any, ...]) -> ColumnPlan:
+        n, n_tz, n_dmy, n_mdy, n_conflict, n_time, n_unread = (int(x or 0) for x in stats[:7])
+        unread = str(stats[7])
         v = _Exprs.build(ident(source), self.tokens).v
         text = self.text_plan(source)
+        if n_unread:
+            # Kept as text, or counted rejects: either way the report names the zone.
+            text.notes.append(unread_zone_note(unread, n_unread, n))
         tolerant = n >= MIN_ROWS_FOR_TOLERANCE
         if n and n_tz == n:
             return ColumnPlan(source, _zoned_ts(v), "timestamptz")
@@ -478,7 +536,7 @@ class TypeInferrer:
             total = base + count
             return total == n or (tolerant and total >= MIN_FIT * n)
 
-        notes: list[str] = []
+        notes: list[str] = list(text.notes)
         if self.date_order is DateOrder.MDY:
             order = "mdy" if fits(n_mdy) else None
         elif self.date_order in {DateOrder.DMY, DateOrder.YMD}:
@@ -577,7 +635,7 @@ class TypeInferrer:
             # An offset is applied (UTC, as a timestamptz column cast to timestamp is), never
             # dropped by the TIMESTAMP cast.
             parsed = (
-                f"(CASE WHEN {_has_zone(e.v)} THEN timezone('UTC', TRY_CAST({e.v} AS TIMESTAMPTZ)) "
+                f"(CASE WHEN {_has_zone(e.v)} THEN timezone('UTC', {_tz(e.v)}) "
                 f"ELSE {_parse_ts(e.v, formats)} END)"
             )
             return f"CAST({parsed} AS DATE)" if type_name == "date" else parsed
