@@ -167,6 +167,23 @@ class _Exprs:
         )
         return cls(v, n)
 
+    @classmethod
+    def projected(
+        cls, cols: list[str], tokens: tuple[str, ...], table: str
+    ) -> tuple[str, list[_Exprs]]:
+        """A FROM clause computing each column's v and n once, and the fragments naming them.
+
+        For the statistics queries only (a plan's expression runs over the raw table). Inlined,
+        v is planned again at every use, and the date rungs use it about 60 times a column:
+        planning alone took seconds for 30 date columns of 100 rows.
+        """
+        exprs = [cls.build(col, tokens) for col in cols]
+        select = ", ".join(
+            f"{e.v} AS {ident(f'v{i}')}, {e.n} AS {ident(f'n{i}')}" for i, e in enumerate(exprs)
+        )
+        names = [cls(ident(f"v{i}"), ident(f"n{i}")) for i in range(len(cols))]
+        return f"(SELECT {select} FROM {table})", names
+
 
 def _match(expr: str, pattern: str) -> str:
     return f"regexp_full_match({expr}, {literal(pattern)})"
@@ -345,8 +362,8 @@ class TypeInferrer:
     # ------------------------------------------------------------------ rungs
     def _plan_numeric_batch(self, sources: list[str]) -> dict[str, ColumnPlan]:
         aggs: list[str] = []
-        for s in sources:
-            e = _Exprs.build(ident(s), self.tokens)
+        table, exprs = _Exprs.projected([ident(s) for s in sources], self.tokens, self.table)
+        for e in exprs:
             m_int = _match(e.n, _RE_INT)
             aggs += [
                 f"count({e.v})",
@@ -359,7 +376,7 @@ class TypeInferrer:
                 f"count_if({e.v} != {e.n})",
                 f"count_if({_match(f'lower({e.v})', _RE_DATE_LIKE)})",
             ]
-        row = self.con.sql(f"SELECT {', '.join(aggs)} FROM {self.table}").fetchone()
+        row = self.con.sql(f"SELECT {', '.join(aggs)} FROM {table}").fetchone()
         assert row is not None
         width = 12
         return {
@@ -495,8 +512,8 @@ class TypeInferrer:
 
     def _plan_temporal_batch(self, sources: list[str]) -> dict[str, ColumnPlan]:
         aggs: list[str] = []
-        for s in sources:
-            v = _Exprs.build(ident(s), self.tokens).v
+        table, exprs = _Exprs.projected([ident(s) for s in sources], self.tokens, self.table)
+        for v in (e.v for e in exprs):
             dmy, mdy = _parse_ts(v, self.dmy_formats), _parse_ts(v, self.mdy_formats)
             aggs += [
                 f"count({v})",
@@ -508,7 +525,7 @@ class TypeInferrer:
                 f"count({_unread_zone(v)})",
                 f"min({_unread_zone(v)})",
             ]
-        row = self.con.sql(f"SELECT {', '.join(aggs)} FROM {self.table}").fetchone()
+        row = self.con.sql(f"SELECT {', '.join(aggs)} FROM {table}").fetchone()
         assert row is not None
         width = 8
         return {
@@ -614,8 +631,9 @@ class TypeInferrer:
             votes = 0  # decimal comma minus decimal point
             for start in range(0, len(sources), _BATCH):
                 aggs: list[str] = []
-                for s in sources[start : start + _BATCH]:
-                    e = _Exprs.build(ident(s), self.tokens)
+                batch = [ident(s) for s in sources[start : start + _BATCH]]
+                table, exprs = _Exprs.projected(batch, self.tokens, self.table)
+                for e in exprs:
                     point, comma = _style_fit(e.n, "us"), _style_fit(e.n, "eu")
                     aggs += [
                         f"count({e.v})",
@@ -623,7 +641,7 @@ class TypeInferrer:
                         f"count_if({point} AND NOT {comma})",
                         f"count_if({comma} AND NOT {point})",
                     ]
-                row = self.con.sql(f"SELECT {', '.join(aggs)} FROM {self.table}").fetchone()
+                row = self.con.sql(f"SELECT {', '.join(aggs)} FROM {table}").fetchone()
                 assert row is not None
                 for i in range(0, len(aggs), 4):
                     n, fit, point_only, comma_only = (int(x or 0) for x in row[i : i + 4])
