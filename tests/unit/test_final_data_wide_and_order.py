@@ -104,18 +104,38 @@ def _ids(path: Path) -> list[int]:
     return pq.read_table(path, columns=["id"]).column("id").to_pylist()
 
 
-@pytest.mark.parametrize("fmt", ["csv", "ndjson"])
+def _typed_row(i: int) -> str:
+    """A row with a value for every kind of rung, and null tokens among them."""
+    day = f"2025-{1 + i % 12:02d}-{1 + i % 28:02d}"
+    amount = "NA" if i % 11 == 0 else f"{i % 1000}.{i % 100:02d}"
+    at = f"{day} {i % 24:02d}:00:00{'+05:00' if i % 3 else 'Z'}"
+    return f"{i},customer {i % 977},{day},{'yes' if i % 2 else 'no'},{amount},{at}\n"
+
+
+@pytest.mark.parametrize("fmt", ["csv", "typed csv", "ndjson"])
 def test_rows_keep_source_order_past_one_row_group(tmp_path: Path, fmt: str) -> None:
     if fmt == "csv":
         data = "id,name\n" + "".join(f"{i},customer {i % 977}\n" for i in range(1, N_ROWS + 1))
+    elif fmt == "typed csv":
+        data = "id,name,day,flag,amount,at\n" + "".join(map(_typed_row, range(1, N_ROWS + 1)))
     else:
         data = "".join(
             json.dumps({"id": i, "name": f"customer {i % 977}", "n": "NA" if i % 7 else str(i)})
             + "\n"
             for i in range(1, N_ROWS + 1)
         )
-    result = kit.convert_bytes(tmp_path, f"rows.{fmt}", data)
+    result = kit.convert_bytes(tmp_path, f"rows.{fmt.rsplit(maxsplit=1)[-1]}", data)
     assert result.report.rows == N_ROWS
+    if fmt == "typed csv":
+        types = [c.type for c in result.report.columns]
+        assert types == [
+            "int64",
+            "string",
+            "date32[day]",
+            "bool",
+            "double",
+            "timestamp[us, tz=UTC]",
+        ]
     assert _ids(result.path) == list(range(1, N_ROWS + 1))  # rows 122,881.. came first
     first = preview(result.path, columns=None, offset=0, limit=1, fmt="json", max_chars=100)
     assert first.rows is not None

@@ -209,6 +209,7 @@ def read_delimited(
         source_format=InputFormat.TSV if dialect.delimiter == "\t" else InputFormat.CSV,
         encoding=info.encoding,
         delimiter=dialect.delimiter,
+        # The last resort for '1.234': the file's own numbers decide first (TypeInferrer).
         prefer_decimal_comma=dialect.delimiter == ";",
         text_bytes=info.path.stat().st_size,
         warnings=warnings,
