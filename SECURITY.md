@@ -74,11 +74,20 @@ exists only for tests.
   `AIMART_MAX_DECOMPRESSED_BYTES` (512 MB). Zip archives are checked from the central
   directory before any member is inflated: at most 10,000 members, and a ratio above 250× is
   refused. Excel files are zips and get the same check.
-- **Parser crashes.** Conversion, queries and the quantum tools run in a short-lived child
-  forked from a `forkserver` (`engine/isolate.py`). Native code can crash rather than raise:
-  DuckDB's `read_json` segfaults on JSON nested about 21,600 levels deep. In the child, that
-  becomes one failed and unpaid call, and the server keeps running. The child is killed at
-  its deadline (120 s for convert, 15 s for query), and its memory goes back to the OS.
+- **Parser crashes and memory bombs.** Every parse of a caller's file (convert, inspect,
+  preview, query, and the quantum tools) runs in a short-lived child forked from a
+  `forkserver` (`engine/isolate.py`). Native code can crash rather than raise: DuckDB's
+  `read_json` segfaults on JSON nested about 21,600 levels deep. In the child, that becomes
+  one failed and unpaid call, and the server keeps running. The child is killed at its
+  deadline (120 s for convert, 15 s for inspect, preview and query) or when its resident
+  memory passes `AIMART_JOB_MEMORY_LIMIT_MB` (700 MB; a 1.6 KB PDF once reached 2 GB in 15 s),
+  and its memory goes back to the OS. The cap is a watchdog in the parent, not `RLIMIT_AS`: a
+  Linux child starts at about 2 GB of virtual memory. Each job's temporary files are in a
+  directory the parent deletes, even after a kill. An unexpected exception reaches the caller
+  as its type only, since its text can carry server paths.
+- **Hostile PDFs.** The PDF reader budgets drawn characters and shapes (100,000 a page,
+  2,000,000 a document) and its table search, stops reference chains after 32 hops, never
+  resolves metadata or page labels, and clamps `pdf_pages` to the page count.
 - Broken-JSON repair only runs on documents under `AIMART_MAX_JSON_REPAIR_BYTES` (5 MB).
 - Caller-supplied filenames pass through `safe_filename`. Remote callers can never name a
   server path: `path` and `output_path` inputs exist only in the local stdio mode.
@@ -87,11 +96,15 @@ exists only for tests.
 
 Every DuckDB connection (`engine/duck.py`) disables extension autoload and autoinstall, sets
 `allowed_directories` to the job's own directories, turns `enable_external_access` off, and
-sets `lock_configuration` **last**, so SQL cannot undo any of it with `SET`. The query path
-is stricter still. Data arrives only as registered Arrow datasets, so there is no filesystem
-access. Spill files go to a private throwaway directory (the default `<cwd>/.tmp` leaked the
-server's path through `current_setting()`). Exactly one statement is allowed, and it must be a
-`SELECT`. Results are capped (`AIMART_MAX_QUERY_ROWS`), long cells are truncated, a watchdog
+sets `lock_configuration` **last**, so SQL cannot undo any of it with `SET`. No setting names
+a host path, because SQL can read every setting: the home, secret and extension directories
+point at a path that does not exist, and persistent secrets are off. The query path is stricter
+still. Its only readable directory is a private throwaway one, which holds its spill files
+(the default `<cwd>/.tmp` leaked the server's path through `current_setting()`) and hard links
+to, or copies of, its input tables. The tables are views over DuckDB's own Parquet reader, or
+registered Arrow scans for types that reader would change, so SQL can read nothing but its own
+inputs. Exactly one statement is allowed, and it must be a `SELECT`. Results are capped
+(`AIMART_MAX_QUERY_ROWS` rows, 64 MB), long cells are truncated inside DuckDB, a watchdog
 interrupts DuckDB at the deadline, and file paths are scrubbed from error messages.
 
 ### HTTP surface
@@ -104,7 +117,12 @@ interrupts DuckDB at the deadline, and file paths are scrubbed from error messag
   `X-Forwarded-For` (the entries the proxies appended), because the left side is whatever the
   client chose to send.
 - Concurrency: a fixed number of job slots (`AIMART_MAX_CONCURRENT_JOBS`) and a bounded
-  queue. Beyond that the server answers 503 `busy`, and nothing is charged.
+  queue. Beyond that the server answers 503 `busy`, and nothing is charged. A call takes its
+  slot before it downloads or copies any input, and all URL and base64 inputs of one call
+  share one `AIMART_MAX_INPUT_BYTES` budget.
+- A request that can only fail (an invalid body, form or tool arguments, or a tool this
+  deployment does not serve) is refused before any price is quoted, so nobody signs a payment
+  for it.
 - The MCP endpoint checks `Host` and `Origin` against the public base URL, which protects
   against DNS rebinding.
 - The container runs as a non-root user (uid 1000). Base images are pinned by digest.
@@ -113,7 +131,11 @@ interrupts DuckDB at the deadline, and file paths are scrubbed from error messag
 
 Artifacts have random 144-bit IDs (`secrets.token_urlsafe(18)`) and become unreachable after
 `AIMART_ARTIFACT_TTL_S` (1 hour). A sweep that runs at most once a minute while the service has
-traffic then deletes them, normally within minutes, and a size budget evicts old ones. Local
+traffic then deletes them, normally within minutes. A size budget makes room before each
+output is stored, but never evicts an output whose payment is still settling, a local one
+delivered less than 10 minutes ago, or one a running call reads; an output that cannot fit is
+refused (413, or 503 `busy`), unpaid. Outputs of a paid call that does not settle are deleted
+at once. Local
 downloads need an HMAC-SHA256-signed, expiring link (`exp` and `sig`). Set
 `AIMART_SIGNING_SECRET`, or a random per-boot secret is used. With `AIMART_GCS_BUCKET`,
 downloads are GCS V4 signed URLs, the sweep deletes the stored copies too, and a copy orphaned

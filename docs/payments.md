@@ -28,6 +28,18 @@ This order is what guarantees that no caller pays for an error and no work is gi
 - **MCP:** `payments/mcp_gate.py` verifies, calls the tool, and settles only if the tool
   result has `isError=false`. Every tool wraps its work in `_guard`, which turns any
   `AimartError` into an `isError` result.
+- **Nothing is quoted that can only fail.** Before the 402 or PaymentRequired, a REST body is
+  validated against its route's own model (`_body_check` in `api/app.py`), an upload form's
+  small fields are read by `FormPeekMiddleware` and checked (`_form_check`), and MCP tool
+  arguments go through the SDK's own validation (`argument_checker` in `mcp/server.py`). An
+  invalid one is a 400 `invalid_request` or an `isError` result, and a tool this deployment
+  does not serve is a free "Unknown tool" error. An unpaid empty body or `{}`, an unpaid form
+  without its file, and an unpaid MCP call with no arguments stay price probes: catalogs
+  replay them to read the price.
+- **An output nobody paid for does not stay.** Outputs stored during a paid call are
+  provisional (`artifacts.outputs_of`) until the payment settles. The REST middleware and the
+  MCP gate commit them on settlement and delete them otherwise: an error status, an `isError`
+  result, a failed settlement, an exception, or a cancellation.
 - Prices are strings such as `"$0.02"`. The x402 SDK turns them into integer atomic units on
   the wire (USDC has 6 decimals, so `"$0.02"` becomes `20000`); `pricing.usd_to_atomic` is an
   independent exact re-implementation used for the facilitator price-floor check and as the
