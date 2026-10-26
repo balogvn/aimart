@@ -88,6 +88,7 @@ jobs:
           AIMART_GCS_BUCKET: ${{ vars.AIMART_GCS_BUCKET }}
           AIMART_FACILITATOR_URLS: ${{ vars.AIMART_FACILITATOR_URLS }}
           AIMART_ENABLE_QUANTUM: ${{ vars.AIMART_ENABLE_QUANTUM }}
+          AIMART_JOB_MEMORY_LIMIT_MB: ${{ vars.AIMART_JOB_MEMORY_LIMIT_MB }}
         run: |
           set -euo pipefail
           fail() { echo "::error::$*"; exit 1; }
@@ -142,6 +143,13 @@ jobs:
             true|false) lines+=("AIMART_ENABLE_QUANTUM=${AIMART_ENABLE_QUANTUM}") ;;
             *) fail "AIMART_ENABLE_QUANTUM must be true or false, got '${AIMART_ENABLE_QUANTUM}'" ;;
           esac
+          # Resident memory one isolated job may use (MB) before it is killed with an unpaid 413.
+          # Unset: the application default (700), sized for this 2 GiB instance with two jobs.
+          if [ -n "$AIMART_JOB_MEMORY_LIMIT_MB" ]; then
+            [[ "$AIMART_JOB_MEMORY_LIMIT_MB" =~ ^(0|[1-9][0-9]{0,5})$ ]] || fail "AIMART_JOB_MEMORY_LIMIT_MB must be a whole number of MB (0 disables the cap), got '${AIMART_JOB_MEMORY_LIMIT_MB}'"
+            [ "$AIMART_JOB_MEMORY_LIMIT_MB" != 0 ] || echo "::warning::AIMART_JOB_MEMORY_LIMIT_MB=0 disables the per-job memory cap: one hostile file can exhaust the instance"
+            lines+=("AIMART_JOB_MEMORY_LIMIT_MB=${AIMART_JOB_MEMORY_LIMIT_MB}")
+          fi
           if [ -n "$AIMART_FACILITATOR_URLS" ]; then
             # The action splits KEY=VALUE pairs on commas unless escaped.
             lines+=("AIMART_FACILITATOR_URLS=${AIMART_FACILITATOR_URLS//,/\\,}")

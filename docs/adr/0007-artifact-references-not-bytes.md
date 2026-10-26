@@ -20,8 +20,8 @@ the download link is also attached as a `resource_link`.
 Two stores sit behind one interface (`artifacts.py`):
 
 - `LocalArtifactStore`: disk with a TTL (`AIMART_ARTIFACT_TTL_S`, 1 hour) and a size budget
-  that evicts the oldest artifacts first. Links are HMAC-SHA256 signed and expiring (`exp`,
-  `sig`).
+  that evicts the oldest artifacts first (amended below). Links are HMAC-SHA256 signed and
+  expiring (`exp`, `sig`).
 - `GcsArtifactStore`: for Cloud Run, where local disk vanishes on scale-to-zero (ADR 0004).
   Downloads are V4 signed URLs served by GCS, with a lifecycle rule as the cleanup backstop.
 
@@ -30,6 +30,19 @@ published retention promised deletion. Expired artifacts and their GCS blobs are
 by a request-path sweep (at most once a minute); a bucket-listing sweep (at most every 6 h)
 catches blobs whose local record a restart lost, and the 1-day lifecycle rule is the last
 resort, which bounds the worst case at about a day ([privacy.md](../privacy.md)).
+
+**Amendment: the size budget (review of 6f99145).** "Evicts the oldest first" charged callers
+for links that died: an output larger than the whole budget was stored, evicted at once and
+paid for, and of two concurrent converts that fit alone but not together, the second evicted
+the first a moment after its caller paid. Now every stored output counts toward
+`AIMART_ARTIFACT_MAX_TOTAL_BYTES`, outputs whose payment is still settling included, and room
+is made before an output is stored. Three kinds are never evicted: outputs of a paid call that
+has not settled (committed when it settles, deleted when it does not), local outputs delivered
+less than 10 minutes ago (`MIN_RESIDENCY_S`, capped at the TTL; on GCS eviction drops only the
+cached copy), and artifacts a running call reads (`hold()`; on GCS a join's second table had
+evicted its first). An output larger than the whole budget is refused with 413
+`input_too_large`, and one that cannot fit without evicting a protected artifact with 503
+`busy`. Both happen before the output is stored, so neither is paid for.
 
 Local stdio mode writes the file next to the input, or to `output_path`, and returns its
 `path`.

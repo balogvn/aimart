@@ -11,7 +11,7 @@ a decision, write a new record that supersedes the old one, and set the old one'
 | [0002](0002-x402-v2-rest-middleware-and-mcp-extension.md) | x402 v2: SDK middleware for REST, our own MCP extension, lazy facilitator init | accepted |
 | [0003](0003-facilitators-and-price-floors.md) | Free keyless facilitators by default; $0.002 price floor | accepted |
 | [0004](0004-hosting-cloud-run.md) | Host on Cloud Run's free tier with a hard spend cap | accepted |
-| [0005](0005-job-isolation-forkserver.md) | Heavy jobs in forkserver children; BLAS pinned to one thread | accepted |
+| [0005](0005-job-isolation-forkserver.md) | Heavy jobs in forkserver children; BLAS pinned to one thread; a memory cap per job | accepted |
 | [0006](0006-duckdb-copy-writer.md) | DuckDB `COPY` as the default Parquet writer | accepted |
 | [0007](0007-artifact-references-not-bytes.md) | Return artifact references, not file bytes | accepted |
 | [0008](0008-quantum-tier-honesty.md) | Quantum tier: simulator disclosed, classical baseline always | accepted |

@@ -59,15 +59,18 @@ Module docstrings explain the why; read the one you are about to change.
   prices, limits, artifact storage, signing keys. There is no private-key setting, on purpose.
 - `errors.py`: `AimartError` subclasses, each with `code`, `http_status` (always >= 400) and a
   concrete `hint`. Raising one is what guarantees the caller is not charged.
-- `engine/`: the pure conversion engine. `detect.py` (magic bytes over extensions), `safety.py`
-  (gzip/zip bomb caps), `text.py` (UTF-8 transcoding), `duck.py` (sandboxed DuckDB),
+- `engine/`: the pure conversion engine. `detect.py` (magic bytes over extensions; a `%PDF-`
+  header anywhere in the first 1 KB), `safety.py` (gzip/zip bomb caps), `text.py` (UTF-8
+  transcoding), `duck.py` (sandboxed DuckDB; `NOWHERE` for every `$HOME`-derived setting),
   `readers/` (delimited, jsonish, excel, statistical, columnar, pdf; the `READERS` map is in
-  `convert.py`), `infer.py` (type ladder in SQL), `names.py`, `convert.py` (pipeline and
-  report), `writer.py` (DuckDB `COPY` by default, pyarrow when labels exist), `inspect.py`
-  (footer-only stats), `tabular.py` (preview and SELECT-only query; rows are positional, so
-  duplicate column names survive), `isolate.py` (forkserver child per heavy job, with a deadline
-  and a per-job memory cap, `AIMART_JOB_MEMORY_LIMIT_MB`), `models.py` (the pydantic contract
-  agents read).
+  `convert.py`), `infer.py` (type ladder in SQL; the number convention is decided per column,
+  and text with a zone only ever becomes TIMESTAMPTZ), `names.py`, `convert.py` (pipeline,
+  `expected_schema`, report), `writer.py` (DuckDB `COPY` by default, pyarrow when labels exist),
+  `inspect.py` (footer-only stats), `tabular.py` (preview and SELECT-only query: inputs are views
+  over DuckDB's own Parquet reader (`_native_view`), long cells are cut inside DuckDB, rows are
+  built by position, results over `MAX_RESULT_BYTES` are refused), `isolate.py` (forkserver
+  child per job: deadline, RSS watchdog for `job_memory_limit_mb`, a per-job temp directory the
+  parent deletes), `models.py` (the pydantic contract agents read).
 - `quantum/`: premium tools (`kernel_pca.py`, `portfolio.py`, `data.py`, `models.py`). Served only
   when the `quantum` extra is installed AND `AIMART_ENABLE_QUANTUM=true` (off by default; a buyer
   panel valued them at $0). `pricing.active_operations(settings)` decides. Spec:
@@ -83,17 +86,29 @@ Module docstrings explain the why; read the one you are about to change.
   a bucket-listing sweep at most every 6 h catches blobs a restart orphaned, and the bucket's
   1-day lifecycle rule is the last resort). The TTL makes an artifact unreachable; the sweeps
   delete it. `discovery.retention_policy()` publishes exactly that, so change both together.
+  The budget: `put()` makes room before storing and refuses instead (413 over the whole budget,
+  503 `busy` when room needs a protected artifact); `track_puts`/`outputs_of` keep a paid call's
+  outputs provisional until `commit()` or `discard_withheld()`; `hold()` pins what a running
+  call reads; `MIN_RESIDENCY_S` (10 min) protects a freshly delivered local output.
 - `service.py`: `Service`, the **one** implementation of every operation, used by REST and MCP.
+  `_job()` holds a job slot and `store.hold()` from before any input is fetched; all URL and
+  base64 inputs of a call share one `max_input_bytes` budget; `convert_upload` copies an upload
+  inside the slot; `_execute` runs every engine call (inspect and preview too) in the child.
   `query` takes a map of table names (`data` + up to 7 joined artifacts) for one query price.
 - `payments/`: `pricing.py` (`OPERATIONS`, the single source of prices, routes and tool names;
   `usd_to_atomic`), `__init__.py` (`Payments`: x402 resource server, REST route configs with the
-  Bazaar extension, lazy facilitator init, price-floor check), `mcp_gate.py` (x402 for MCP tool
-  calls), `bazaar.py` (catalog examples).
+  Bazaar extension, lazy facilitator init, price-floor check; `http_middleware(prevalidate=,
+  store=)` commits or deletes a paid call's outputs from its final status), `mcp_gate.py` (x402
+  for MCP tool calls, same commit or delete), `bazaar.py` (catalog examples).
 - `mcp/server.py`: `build_mcp(...)`, the tools and their descriptions (the whole interface an
   agent sees). Remote mode takes `url`/`content_base64`/`artifact_id`; local mode adds `path`.
-- `api/`: `app.py` (`create_app`; routes, OpenAPI `x-payment-info`, middleware order),
-  `middleware.py` (access log, rate limit, body limit), `discovery.py` (`/llms.txt`, server card,
-  pricing, `retention_policy()`: the one data-retention statement), `schemas.py`.
+  `argument_checker` validates tool arguments before the gate quotes a price.
+- `api/`: `app.py` (`create_app`; routes, OpenAPI `x-payment-info`, middleware order;
+  `_body_check` and `_form_check` refuse a request that can only fail before the 402),
+  `middleware.py` (access log, rate limit, body limit, `FormPeekMiddleware`: reads up to 1 MiB of
+  an upload form before the payment middleware, then replays it unchanged), `discovery.py`
+  (`/llms.txt`, server card, pricing, `retention_policy()`: the one data-retention statement),
+  `schemas.py`.
 - `cli.py`: `serve`, `mcp`, `convert`, `inspect`.
 
 Outside `src/`: `tests/` (`aimart_testkit.py` helpers, `unit/`, `integration/`, `quantum/`),
@@ -140,6 +155,13 @@ Docs: [architecture](docs/architecture.md), [payments](docs/payments.md), [priva
 5. **Receive-only server.** Only `payTo` addresses in config. Never add a private key setting,
    never log a payment payload in full.
 6. **Testnet by default.** Mainnet only by explicit owner configuration.
+7. **Never quote what can only fail.** A paid request with an invalid body, form or tool
+   arguments, or an unserved tool, is refused (400 / `isError` / free "Unknown tool") before
+   any 402 or PaymentRequired. An empty or `{}` unpaid body, and an unpaid form without its
+   file, stay price probes (catalogs replay them).
+8. **An output nobody paid for does not stay.** Outputs stored during a paid call are
+   provisional until settlement: committed when settled, deleted otherwise (error status,
+   `isError`, failed settle, exception, or cancellation, which is a `BaseException`).
 
 ## Quantum honesty contract
 
@@ -167,6 +189,12 @@ more; "tamper-proof via quantum kernels" is not a real technique and must not be
 - **`Settings(isolate_jobs=False)` in unit tests** (fast, coverage-visible). Keep a few tests
   that exercise the isolated child for real. Any script or test module that triggers isolated
   jobs as `__main__` needs an `if __name__ == "__main__":` guard: forkserver re-imports `__main__`.
+- **Isolated-job tests assert the error type, not wall-clock time** (the forkserver's first
+  start took over 15 s under load); memory-cap tests keep touching their allocation (macOS pages
+  idle memory out before the poll sees it). Never give DuckDB ~1,500-level JSON in-process.
+- A streamed paid upload needs `io.BytesIO` through the plain client with an explicit payment
+  header (ASGITransport and x402's transport send one message). The shared fake GCS client is
+  `tests/fixtures/money/fake_gcs.py`.
 - No real network in default tests (`allow_private_urls=True` only to fetch from a local test
   server). Mark anything else `network` or `testnet`.
 
@@ -178,11 +206,15 @@ more; "tamper-proof via quantum kernels" is not a real technique and must not be
   with `ip_is_public`, connect to the checked address; re-check every redirect hop.
   `allow_private_urls` is for tests only.
 - **DuckDB lockdown on every connection** (`engine/duck.connect`): `allowed_directories` limited
-  to the job's own directories, `enable_external_access=false`, no extension autoload, then
-  `lock_configuration=true` last. The query path runs exactly one SELECT with a row cap and an
-  interrupt at the deadline.
+  to the job's own directories, `enable_external_access=false`, no extension autoload, no
+  setting that names a host path (SQL can read every setting), then `lock_configuration=true`
+  last. The query path runs exactly one SELECT with a row cap and an interrupt at the deadline;
+  its inputs are hard links (or copies) in its own spill directory, the only one it may read.
 - **Decompression is streamed against caps**; zips are checked from the central directory
-  before inflating; heavy parsing runs in the forkserver child with a hard deadline.
+  before inflating. Every parse of a caller's file, caller Parquet included (inspect, preview,
+  query), runs in the forkserver child with a deadline and a memory cap. The cap is the parent's
+  RSS watchdog: never `RLIMIT_AS`/`RLIMIT_DATA`, as a Linux child starts at about 2 GB virtual.
+  A child's unexpected exception is logged; the caller sees only its type.
 - **Secrets**: never read, print or commit `.env*` (except `.env.example`), `.wallets/`,
   `.local/`, `*.pem`, `*.key`. Check a secret by length (`${#NAME}`), never by value. The server
   holds no private keys; a paying test wallet's key stays on the client side with the user.
@@ -242,7 +274,6 @@ test suite.
 - **The forkserver re-imports `__main__`.** A script that triggers isolated jobs
   (`Settings(isolate_jobs=True)`, the default) without an `if __name__ == "__main__":` guard
   re-runs itself in the forkserver. Under pytest it works; in ad-hoc scripts, guard.
-
 - **Text that promised more than the code did.** The published retention said "deleted 60
   minutes after creation" while the code only made artifacts unreachable; the README's decoded
   402 kept a `$0.01` amount after convert moved to `$0.02`; discovery summaries never mentioned
@@ -267,6 +298,67 @@ Found by the engine unit suite (commit 0fea70d), each with a regression test:
   without one set `temp_directory = ''` (`engine/duck.py`, `engine/tabular.py`).
 - **Short cp1252/Latin-1 files were misdetected as cp437/cp1250**, giving silent mojibake.
   cp1252 is preferred when its decoding reads as Latin text (`engine/text.py`).
+
+## Bug classes guarded since the review of 6f99145
+
+Each was a 200 for wrong data, a charge for nothing, or a bare 500. Paths are under `tests/`;
+each test's docstring has the incident.
+
+- **Charged for a link that dies, or for nothing.** An output over the whole artifact budget is
+  a 413 before it is stored; eviction spares unsettled outputs, fresh local ones
+  (`MIN_RESIDENCY_S`) and what a running call reads (`hold`; on GCS a join's second table
+  evicted its first), and when room needs one of those, `put()` is a 503 `busy` that evicts
+  nothing. Never add an eviction path that ignores `_provisional` or `_pins`. Withheld results
+  delete their outputs (invariant 8). (`unit/test_fix_money_artifacts.py`,
+  `{unit,integration}/test_fix_money_capacity.py`, `integration/test_fix_money_withheld.py`)
+- **Quoting what cannot succeed** (invariant 7), and **capacity spent before the job slot** (the
+  slot is taken before any download or upload copy; one input budget per call).
+  (`integration/test_fix_money_gate.py`, `integration/test_fix_money_upload_check.py`,
+  `unit/test_fix_money_form_peek.py`, `unit/test_fix_money_service.py`)
+- **Host paths readable from SQL** through DuckDB settings. (`unit/test_fix_money_duck.py`)
+- **Numbers in the wrong convention** ('1.5' as 15 in an EU column, '1.234' as 1.234 in a
+  semicolon file). Casts are gated on the style's own pattern (`_style_fit`; never `TRY_CAST` an
+  unmatched value: DuckDB reads '1_000' as 1000), the convention is decided per column
+  (`TypeInferrer._text_style`), the dialect breaks ties, and every ambiguous choice adds a note.
+  (`unit/test_fix_infer_numbers.py`, `unit/test_roundtrip_property.py`)
+- **Offsets dropped, zones carried over.** DuckDB's TIMESTAMP cast drops offsets; its
+  TIMESTAMPTZ cast carries a zone name ('09:00 EST') to later naive values in the same 2048-row
+  vector. Zoned text is read only as TIMESTAMPTZ, in CASE branches no naive row takes
+  (`_has_zone`, `_zoned_ts`, `_instant`). A time past year 9999 is an unknown range in inspect
+  and a 422 in preview and query. (`unit/test_fix_infer_timestamps.py`, `unit/test_inspect.py`)
+- **`expected_schema` rewriting values.** Scale 0 is not "unset" (check `is None`), a decimal
+  never rounds and a bool is only 0 or 1 (else a counted reject), a column declared string keeps
+  its text, and `strict` counts values inference nulled. (`unit/test_fix_infer_schema.py`)
+- **Readers losing values.** Nested keys that differ only by case (DuckDB matches STRUCT fields
+  ignoring ASCII case and silently dropped every `K`) are renamed (`K_2`) with a warning, only
+  where DuckDB reads a STRUCT: MAP keys and JSON text are data. `read_csv` skips exactly the blank
+  lines the sniffer skipped. (`unit/test_fix_readers_json.py`,
+  `integration/test_fix_readers_json_api.py`, `unit/test_fix_readers_delimited.py`)
+- **Results and inputs outside DuckDB's `memory_limit`.** Rows are built by position, never
+  through `to_pylist()` dicts (joins repeat names); long cells are cut inside DuckDB at any depth;
+  results are read 256 rows at a time and refused over 64 MiB; preview batches are sized from the
+  footer. Query inputs are `read_parquet` views checked against the Arrow scan's names and types
+  (`_native_view`, `_widens`). The Arrow scan decodes whole row groups (3.3 GB for `count(*)` on
+  a 260-byte dictionary bomb) and is kept only for INT96, decimals over 38 digits (DuckDB reads
+  them as a wrong DOUBLE), UUID, INTERVAL and column chunks over 64 MiB. A non-Parquet table is a
+  422. (`unit/test_fix_readers_tabular.py`, `unit/test_fix_readers_preview.py`,
+  `integration/test_fix_readers_query.py`)
+- **Hostile PDFs.** Glyphs and shapes are budgeted (100k a page, 2M a document), and so is the
+  table search (it grows with the square of a page's line crossings); reference chains stop at
+  32 hops (`PDFObjRef.resolve`, patched at import); metadata and page labels are never resolved;
+  `pdf_pages` is clamped to the page count before iterating. (`unit/test_fix_pdf_reader.py`)
+- **PDF tables read wrong.** The header is the row naming the most typed columns (the topmost of
+  equals: "widest row" and "narrower than the body" both shipped bugs); lines above it are
+  dropped and reported; continuations are merged before the usable-table filter; a BOM or junk
+  before `%PDF-` is still a PDF. (`unit/test_fix_pdf_reader.py`, `unit/test_fix_pdf_detect.py`)
+- **One job taking the instance down** (a 1.6 KB PDF reached 2 GB in 15 s): the RSS watchdog,
+  the per-job temp directory (it holds a query's linked inputs: RAM on Cloud Run), and crash text
+  kept out of responses. (`integration/test_isolate.py`)
+
+Known gaps: ISO date formats accept 1-digit years ('1/2/3' becomes 0001-02-03); JSON timestamps
+that all carry offsets become naive UTC with no note; DuckDB's `memory_limit` (1 GB) is above the
+700 MB job cap, so the watchdog can stop a job before DuckDB would spill. The 422 for a time past
+9999 in `tabular.py` and the 413 for `read_csv` running out of memory lack their own tests.
 
 ## Agent tooling
 

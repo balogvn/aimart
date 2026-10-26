@@ -62,15 +62,43 @@ conversion understood the file:
 - `estimated_tokens_raw` against `estimated_tokens_schema`: a rough guide to what you saved by
   not reading the raw text.
 
+Notes and warnings name what the service had to assume. Look for these in particular:
+
+- **Numbers.** The convention is decided for the whole column, and the file's delimiter breaks
+  a tie. A value written in the other convention is a counted reject, never a wrong number.
+  When a value reads both ways, the column says which way it was read, with an example:
+  `ambiguous thousands/decimal separator; assumed a decimal comma, so '1.234' is 1234 (infer_types=false keeps the original text)`
+  (or `a decimal point`).
+- **Times with offsets.** An offset is never silently dropped. In a column where most values
+  carry one, the column is `timestamptz` and the rest are noted:
+  `values without a UTC offset were read as UTC (k of n)`. Where most values carry none, the
+  offset values are rejects: `values with a UTC offset were rejected (k of n): most values have none, and dropping the offset would shift the time`.
+  An `expected_schema` cast to a naive `date` or `timestamp` notes
+  `values with a UTC offset were converted to UTC (k of n)`.
+- **JSON.** Nested keys that differ only by letter case (`k` and `K`) are kept apart by
+  renaming, with a warning such as
+  `renamed 1 nested key whose values would otherwise have been lost (...): a.K is now a.K_2`.
+- **PDF.** Lines above a table's header are dropped and listed:
+  `dropped 1 line(s) above the header: 'Sales by region'`. Tables merged across pages, and the
+  table chosen when there are several, are reported too.
+
 If something looks wrong, convert again with options: `sheet`, `delimiter`, `header`,
 `encoding`, `date_order`, `json_records_path`, `flatten_nested`, `null_values`, or
 `infer_types: false`. To validate instead of infer, pass `expected_schema`, with `strict: true`
-to fail on any value that does not fit.
+to fail (422 `schema_violation`, unpaid) on any value that does not fit, including values
+inference had to set to null. A column declared `string` keeps its original text. A `decimal`
+(default precision 18, scale 2) never rounds: a value that would round to fit is a counted
+reject. A number becomes a `bool` only if it is 0 or 1. A scale larger than the precision is
+an invalid request, refused before any price is quoted (section 6).
 
 **PDFs.** Tables in digital (not scanned) PDFs convert too. `pdf_pages` picks the pages to read
 (`"1-3,7"`; by default every page, up to the first 300), and `pdf_table` picks one table by its
 0-based index in the report's `available_sheets` (by default the largest). Scanned PDFs (no text
-layer) and password-protected PDFs are rejected with an error, so you are not charged for them.
+layer) are rejected with 422 `invalid_input`, and so are password-protected ones ("The PDF is
+password-protected.") and other encrypted ones; you are not charged for them. A page that
+draws more than 100,000 characters and shapes, more than 2,000,000 across the pages read, or a
+ruled grid too large to search is refused with 413 `input_too_large`: pass `pdf_pages` to skip
+it.
 
 ## 4. Look, then ask
 
@@ -116,17 +144,55 @@ Errors look like `{"error": {"code", "message", "hint", "details"?}}`, with HTTP
 an MCP `isError` result. **A failed call is never charged.** Follow the `hint`, which is
 written to be acted on.
 
+**A call that can only fail is refused before the quote.** A REST body that fails the
+operation's schema gets 400 `invalid_request` ("The request body is invalid.", with the fields
+in `details.problems`) instead of a 402, so you never sign for it. Over MCP, invalid tool
+arguments get an `isError` result before any PaymentRequired, and a tool this deployment does
+not serve is a free "Unknown tool" error. An unpaid empty body (or `{}`), an unpaid upload form
+without its file, and an unpaid MCP call with no arguments still get the price quote. For
+`/v1/convert/upload`, put the `options` part before the `file` part: only the first 1 MiB of
+the form is checked before the quote.
+
 | code | HTTP | what to do |
 |---|---:|---|
 | `invalid_request` | 400 | fix the listed fields; send exactly one input |
 | `query_rejected` | 400 | send one read-only `SELECT` |
 | `artifact_not_found` | 404 | the artifact expired: convert again |
-| `input_too_large` | 413 | split the file, or pass a `url` instead of base64 |
+| `input_too_large` | 413 | something is over a limit, and the message says which (list below) |
 | `unsupported_format` | 415 | pass `options.format`, or convert to a supported format |
 | `invalid_input`, `schema_violation`, `fetch_failed`, `url_not_allowed`, `query_failed` | 422 | read `message` and `hint`. `url_not_allowed` means a private or non-web-port URL |
-| `busy` | 503 | retry after a few seconds |
+| `busy` | 503 | "The server is at capacity.": retry after a few seconds. "The server's output storage is full right now: ...": retry in a few minutes, or send a smaller extract |
+| `storage_unavailable` | 503 | the output could not be stored, read back or linked ("Could not store the output file."): retry in a minute |
 | `payments_unavailable` | 503 | the facilitator is unreachable: retry shortly |
 | `timeout` | 504 | send a smaller file or a simpler query |
+| `internal_error` | 500 | an unexpected failure; the message names only its type, as in `Internal error (KeyError).` Retry, and report it if it persists |
+
+The `input_too_large` messages, and what to change (numbers are the defaults):
+
+- "The file is larger than the 50 MB limit." or "Upload exceeds 50 MB.": split the file.
+- "The inputs of this call together exceed the 50 MB limit per call.": every `url` and
+  `content_base64` input of one call, a query's joined tables included, shares one budget.
+  Convert each file first and pass the `artifact_id`s, which do not count.
+- "Decompressed input exceeds the 512 MB limit.", or a zip that expands past it.
+- "The job exceeded its memory budget (700 MB) and was stopped.": each job's memory is
+  capped. Large CSVs, roughly over 180 MB uncompressed, can reach it on the default hosted
+  instance: split them. For a PDF, read fewer pages with `pdf_pages`; for a query, return less.
+- "The file needs more memory to read than this server allows." (a delimited file) or "The PDF
+  needs more memory than this server allows.": send a smaller file, or fewer pages.
+- "The output exceeds the artifact budget: ...": the converted file is larger than everything
+  this server keeps. Send fewer rows or columns.
+- "The result is over 64 MB after long cells were cut to 2000 characters." (preview or query):
+  select fewer columns or shorter lists, or lower `limit`.
+- "Previewing N rows into row group I would decode over 1 GB of text.": lower `offset`, or
+  select fewer text columns.
+- A PDF page, or the pages read, drawing too much or ruling too large a grid (see section 3):
+  pass `pdf_pages`.
+
+Preview and query also refuse, with 422 `invalid_input`: "Column 'x' of type ... cannot be
+shown." for a value with no JSON form, such as a time past year 9999 (cast it in SQL,
+`CAST(x AS VARCHAR)`, or leave it out); "Table 't' is not a readable Parquet file." for a joined
+table or `url` that is not Parquet (convert it first and pass its `artifact_id`); and "Table 't'
+has columns of a type SQL queries cannot read: ..." (cast them as the hint says).
 
 On REST, a paid retry that still returns **402** means the payment was rejected. The body is
 `{}`, and the reason is in the `PAYMENT-REQUIRED` header's `error` field.

@@ -2,7 +2,8 @@
 
 Layering, outermost first:
 
-    AccessLog -> RateLimit -> BodyLimit -> x402 payment middleware (REST /v1 routes only)
+    AccessLog -> RateLimit -> BodyLimit -> FormPeek (upload form fields, read and replayed)
+      -> x402 payment middleware (REST /v1 routes only)
       -> FastAPI routes | MCP app mounted at "/" (endpoint /mcp, paid per tool via extension)
 
 The x402 HTTP middleware is deliberately NOT in front of /mcp: initialize and tools/list must
