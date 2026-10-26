@@ -163,6 +163,28 @@ async def test_convert_counts_its_decompressed_input(isolated: Service, files_on
 
 
 @pytest.mark.anyio
+async def test_the_incident_on_the_wire_is_an_unpaid_413(
+    make_settings: Callable[..., Settings], files_only: None
+) -> None:
+    settings = make_settings(isolate_jobs=True, job_memory_limit_mb=16)
+    facilitator = kit.FakeFacilitator()
+    row = b"alpha,beta,gamma,delta,epsilon,zeta,eta,theta\n"
+    data = gzip.compress(b"c1,c2,c3,c4,c5,c6,c7,c8\n" + row * (64 * _MB // len(row)), 9)
+    body = {"content_base64": base64.b64encode(data).decode(), "filename": "big.csv.gz"}
+    async with kit.running_app(settings, facilitator=facilitator) as h:
+        r = await h.paying.post("/v1/convert", json=body)
+    assert r.status_code == 413, r.text
+    error = r.json()["error"]
+    assert error["code"] == "input_too_large"
+    assert "MB of temporary files" in error["message"]
+    assert error["details"]["temp_file_bytes"] > 16 * _MB
+    assert "not charged" in error["hint"]
+    assert "payment-response" not in r.headers
+    assert len(facilitator.verified) == 1
+    assert facilitator.settled == []
+
+
+@pytest.mark.anyio
 async def test_convert_counts_an_upload(isolated: Service, files_only: None) -> None:
     # convert_upload copies the upload into its own work directory, outside _convert's.
     body = kit.csv_text(["n", "s"], [[i, "x" * 200] for i in range(120_000)]).encode()
