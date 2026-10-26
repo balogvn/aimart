@@ -471,8 +471,9 @@ class Service:
                     fmt=fmt,
                     query_timeout=self.settings.query_timeout_s,
                     max_chars=self.settings.max_cell_chars,
-                    memory_limit=self.settings.duckdb_memory_limit,
-                    threads=self.settings.duckdb_threads,
+                    memory_limit=self.limits.duckdb_memory_limit,
+                    threads=self.limits.duckdb_threads,
+                    max_temp_size=self.limits.duckdb_max_temp_size,
                     timeout_s=self.settings.query_timeout_s + 5,
                     isolate=self.settings.isolate_jobs,
                 )

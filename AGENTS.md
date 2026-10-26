@@ -66,7 +66,8 @@ Module docstrings explain the why; read the one you are about to change.
   report), `writer.py` (DuckDB `COPY` by default, pyarrow when labels exist), `inspect.py`
   (footer-only stats), `tabular.py` (preview and SELECT-only query; rows are positional, so
   duplicate column names survive), `isolate.py` (forkserver child per heavy job, with a deadline
-  and a per-job memory cap, `AIMART_JOB_MEMORY_LIMIT_MB`), `models.py` (the pydantic contract
+  and a per-job memory cap, `AIMART_JOB_MEMORY_LIMIT_MB`), `limits.py` (per-job limits; DuckDB's
+  memory limit and spill cap are derived from that cap), `models.py` (the pydantic contract
   agents read).
 - `quantum/`: premium tools (`kernel_pca.py`, `portfolio.py`, `data.py`, `models.py`). Served only
   when the `quantum` extra is installed AND `AIMART_ENABLE_QUANTUM=true` (off by default; a buyer
@@ -267,6 +268,19 @@ Found by the engine unit suite (commit 0fea70d), each with a regression test:
   without one set `temp_directory = ''` (`engine/duck.py`, `engine/tabular.py`).
 - **Short cp1252/Latin-1 files were misdetected as cp437/cp1250**, giving silent mojibake.
   cp1252 is preferred when its decoding reads as Latin text (`engine/text.py`).
+
+Found by profiling CSV memory (a 200 MB CSV peaked at the 700 MB job cap; all of it DuckDB),
+each pinned in `tests/unit/test_fix_csv_memory.py`:
+
+- **The whole CSV as a VARCHAR table**, read through 256 MB of buffers (DuckDB's default is
+  16 x `max_line_size`). Delimited text is now staged as zstd Parquet and `raw` is a view.
+- **`IN (...)` with 5+ constants is a hash join** in DuckDB, one per occurrence: ~600 MB for a
+  40-column file's null-token lists. Use `list_contains` (`infer._one_of`).
+- **An ordered COPY on 2 threads holds every batch a faster thread finished early** (400-650 MB
+  for 40 columns). CSV jobs run DuckDB on one thread; production has one vCPU anyway.
+- **DuckDB's 1 GB limit sat above the 700 MB cap**, so a sort was killed before it could spill.
+  `Limits.from_settings` holds DuckDB under the cap and caps spill files, which are RAM on
+  Cloud Run.
 
 ## Agent tooling
 

@@ -90,8 +90,10 @@ class Settings(BaseSettings):
             "(~250 MB) and the forkserver (~250 MB) plus max_concurrent_jobs=2 jobs at 700 MB, "
             "since a 1.6 KB PDF or a query of huge strings once took one job to 2 GB. On Linux "
             "it includes the ~160 MB of preloaded engine each child shares with the forkserver. "
-            "Ordinary inputs peak at 250-500 MB; about 200 MB of decompressed CSV reaches the "
-            "limit. 0 disables it. Needs isolate_jobs (the parent polls the child's RSS)."
+            "Ordinary inputs peak at 250-500 MB; a CSV conversion at 210-370 MB whatever its "
+            "size. Inside a job DuckDB is held at this minus 300 MB and may spill as much as "
+            "this to the job's directory (RAM on Cloud Run). 0 disables it. Needs isolate_jobs "
+            "(the parent polls the child's RSS)."
         ),
     )
     queue_wait_s: float = 10.0

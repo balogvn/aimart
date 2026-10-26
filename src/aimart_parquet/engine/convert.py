@@ -15,6 +15,8 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import duckdb
+
 from aimart_parquet import __version__
 from aimart_parquet.engine import safety
 from aimart_parquet.engine.detect import _zip_office_format, detect_format
@@ -43,12 +45,10 @@ from aimart_parquet.engine.readers.jsonish import read_json
 from aimart_parquet.engine.readers.pdf import read_pdf
 from aimart_parquet.engine.readers.statistical import labels_json, read_statistical
 from aimart_parquet.engine.writer import copy_to_parquet, write_parquet
-from aimart_parquet.errors import InvalidRequest, SchemaViolation
+from aimart_parquet.errors import InputTooLarge, InvalidRequest, SchemaViolation
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import duckdb
 
     from aimart_parquet.engine.limits import Limits
     from aimart_parquet.engine.readers import RawColumn, RawTable, Reader
@@ -72,6 +72,13 @@ READERS: dict[InputFormat, Reader] = {
 }
 
 _MAX_COLUMNS_META = 256 * 1024  # file-level label map; huge survey files keep field metadata only
+
+# Delimited text is staged and then written by COPYs that keep input order, and DuckDB keeps
+# that order by holding every batch a faster thread finished early. With 2 threads that held
+# 400-650 MB for a 40-column CSV (spilled to the RAM disk, or out of memory, under a lower
+# limit); with one it held about 100 MB. Production runs on 1 vCPU, where a second thread buys
+# no CPU anyway. Other formats are read into memory before the write and keep the setting.
+_ONE_THREAD = frozenset({InputFormat.CSV, InputFormat.TSV})
 
 SQL_TYPES = {
     "string": "VARCHAR",
@@ -321,13 +328,21 @@ def convert_file(
     tmp.mkdir(exist_ok=True)
     con = connect(
         memory_limit=limits.duckdb_memory_limit,
-        threads=limits.duckdb_threads,
+        threads=1 if fmt in _ONE_THREAD else limits.duckdb_threads,
         allowed_dirs=[workdir],
         temp_dir=tmp,
+        max_temp_size=limits.duckdb_max_temp_size,
     )
     try:
         raw = READERS[fmt](con, path, workdir, options, fmt, limits)
         report = _finish(con, raw, out_path, name, options, fmt)
+    except duckdb.OutOfMemoryException as exc:
+        # A sort or a write past DuckDB's memory limit (and its spill cap) is the input's size,
+        # not a bug: a 413 says so, where it used to surface as a 500.
+        raise InputTooLarge(
+            "The file needs more memory to convert than this server allows.",
+            hint="Send a smaller file, drop sort_by, or split it into parts; you were not charged.",
+        ) from exc
     finally:
         con.close()
     report.source_bytes = source_bytes

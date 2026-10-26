@@ -5,6 +5,9 @@ pay to have cleaned: one ragged row or a blank header cell can make it skip line
 header entirely. So we sniff the dialect ourselves from a sample with the stdlib csv parser
 (scoring each candidate delimiter by how consistent row widths are), then hand DuckDB an
 explicit dialect, every column as VARCHAR, and let the type ladder decide types afterwards.
+
+The text is staged once as compressed Parquet and ``raw`` is a view over it, never a table:
+memory then stays flat as files grow, where a loaded table grew with them.
 """
 
 from __future__ import annotations
@@ -34,6 +37,10 @@ _SAMPLE_BYTES = 2 * 1024 * 1024
 _SAMPLE_ROWS = 2000
 _CANDIDATES = (",", ";", "\t", "|")
 _MAX_LINE = 16 * 1024 * 1024
+_STAGE_FILE = "raw_text.parquet"
+# Rows per row group of the staged text. The writer buffers one row group of every column:
+# 122,880 rows of a 40-column file took 210 MB, 30,720 took 100 MB, for a 4% larger file.
+_STAGE_ROWS = 30_720
 
 _NUMERIC = re.compile(
     r"[+-]?[$€£¥₦]?\s*(\d+([.,]\d+)*|\.\d+)([eE][+-]?\d+)?%?|[+-]?\d{1,3}([ .,]\d{3})+([.,]\d+)?"
@@ -178,18 +185,27 @@ def read_delimited(
         names = [f"column_{i + 1}" for i in range(width)]
     sources = [f"c{i}" for i in range(width)]
     columns_sql = "{" + ", ".join(f"{literal(s)}: 'VARCHAR'" for s in sources) + "}"
+    # buffer_size defaults to 16 x max_line_size: at our line cap DuckDB read a 200 MB file
+    # through 256 MB of buffers. One line cap's worth still parses a 16 MB line.
     csv_args = (
         f"{literal(str(info.path))}, delim={literal(dialect.delimiter)}, quote='\"', "
         f"escape='\"', header={str(header).lower()}, skip={dialect.skip}, auto_detect=false, "
-        f"columns={columns_sql}, null_padding=true, max_line_size={_MAX_LINE}"
+        f"columns={columns_sql}, null_padding=true, max_line_size={_MAX_LINE}, "
+        f"buffer_size={_MAX_LINE}"
     )
+    stage = workdir / _STAGE_FILE
     try:
+        # Staged, not loaded. CREATE TABLE raw held every cell as an uncompressed VARCHAR (1.6x
+        # the file, more for short cells), and a 200 MB CSV peaked at 700 MB of the job's 700 MB
+        # cap. A COPY streams in bounded memory; its zstd file was 9-11x smaller than that table
+        # (and on Cloud Run's RAM disk, smaller is what counts); inference scans it faster.
         con.execute(
-            f"CREATE TABLE {ident(RAW_TABLE)} AS SELECT * FROM read_csv({csv_args}, strict_mode=false)"
+            f"COPY (SELECT * FROM read_csv({csv_args}, strict_mode=false)) TO {literal(str(stage))} "
+            f"(FORMAT parquet, COMPRESSION zstd, COMPRESSION_LEVEL 1, ROW_GROUP_SIZE {_STAGE_ROWS})"
         )
     except duckdb.OutOfMemoryException as exc:
-        # The whole file is loaded into a table: past DuckDB's memory limit this is a size
-        # problem, not a parsing one, and the old message sent callers to the delimiter.
+        # Past DuckDB's memory limit this is a size problem, not a parsing one, and the old
+        # message sent callers to the delimiter.
         raise InputTooLarge(
             "The file needs more memory to read than this server allows.",
             hint="Send a smaller file, or split it into parts; you were not charged.",
@@ -199,6 +215,9 @@ def read_delimited(
             f"Could not parse the file as delimited text: {str(exc).splitlines()[0]}",
             hint="Check options.delimiter, options.encoding and options.header.",
         ) from exc
+    con.execute(
+        f"CREATE VIEW {ident(RAW_TABLE)} AS SELECT * FROM read_parquet({literal(str(stage))})"
+    )
     warnings.extend(_malformed_row_warnings(con, csv_args))
     return RawTable(
         table=RAW_TABLE,

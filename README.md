@@ -238,6 +238,24 @@ examples, and notes such as "assumed day-first". `expected_schema` with `strict`
 conversion into a validation step. The full option list is in the `ConvertOptions` schema
 (`/openapi.json`, or the tool's input schema).
 
+### Limits
+
+| limit | default | setting |
+|---|---|---|
+| input (upload, download or base64), before decompression | 50 MB | `AIMART_MAX_INPUT_BYTES` |
+| after gzip, bz2 or zip | 512 MB | `AIMART_MAX_DECOMPRESSED_BYTES` |
+| time per conversion | 120 s | `AIMART_CONVERT_TIMEOUT_S` |
+| memory per job | 700 MB | `AIMART_JOB_MEMORY_LIMIT_MB` |
+| jobs at once (then up to 4 per slot wait, then 503 `busy`) | 2 | `AIMART_MAX_CONCURRENT_JOBS` |
+
+Over a limit the call fails (413 for size and memory, 504 for time), unpaid. CSV memory no
+longer grows with the file: the text is staged as compressed Parquet instead of loaded into a
+table, so a 446 MiB CSV peaks at about 220 MB (it took 1.2 GB, and CSVs above ~200 MB were
+refused). `sort_by` sorts the whole file and spills to disk past 400 MiB. On the hosted
+service those files live in RAM as well, so file size and concurrency share one 2 GiB budget;
+[deploy/README.md](deploy/README.md#memory-capacity-what-one-2-gib-instance-converts) has the
+numbers.
+
 ## Premium quantum tier
 
 **Off by default.** A deployment serves these tools only with `AIMART_ENABLE_QUANTUM=true` (and
