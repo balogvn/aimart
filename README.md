@@ -263,8 +263,9 @@ an operator can change:
 
 **Large CSVs, roughly over 180 MB uncompressed, may be refused on the default hosted
 instance** (413, unpaid). Converting a CSV takes about 3.5 times its uncompressed size in
-memory, and each job may use 700 MB, so split such files or convert them with the free local
-server.
+memory, and each job may use 700 MB. Split such files, or convert them with the free local
+server and `AIMART_JOB_MEMORY_LIMIT_MB` raised to suit your machine (the local server applies
+the same 700 MB cap by default).
 
 Password-protected and scanned PDFs (422 `invalid_input`), a column preview or query cannot show,
 such as a time past year 9999 (422; cast it to text), and a storage failure (503

@@ -148,9 +148,10 @@ written to be acted on.
 operation's schema gets 400 `invalid_request` ("The request body is invalid.", with the fields
 in `details.problems`) instead of a 402, so you never sign for it. Over MCP, invalid tool
 arguments get an `isError` result before any PaymentRequired, and a tool this deployment does
-not serve is a free "Unknown tool" error. An unpaid empty body (or `{}`), and an unpaid MCP
-call with no arguments, still get the price quote. For `/v1/convert/upload`, put the `options`
-part before the `file` part: only the first 1 MiB of the form is checked before the quote.
+not serve is a free "Unknown tool" error. An unpaid empty body (or `{}`), an unpaid upload form
+without its file, and an unpaid MCP call with no arguments still get the price quote. For
+`/v1/convert/upload`, put the `options` part before the `file` part: only the first 1 MiB of
+the form is checked before the quote.
 
 | code | HTTP | what to do |
 |---|---:|---|
