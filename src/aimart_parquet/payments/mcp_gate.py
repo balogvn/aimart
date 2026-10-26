@@ -63,8 +63,8 @@ class X402McpGate(Extension):
         self._store = store  # commits a settled call's outputs, deletes a withheld call's
         # Set once the server's tools exist (mcp.server.argument_checker): the SDK validates
         # arguments only after this gate has quoted and verified, so a call that could never
-        # run was asked to pay first.
-        self.check_arguments: Callable[[str, dict[str, Any]], str | None] | None = None
+        # run was asked to pay first. Returns the error result to send, or None to go on.
+        self.check_arguments: Callable[[str, dict[str, Any]], CallToolResult | None] | None = None
 
     def _withhold(self, produced: list[str], reason: str) -> None:
         if self._store is not None and produced:
@@ -96,11 +96,9 @@ class X402McpGate(Extension):
         # A call with no arguments and no payment is a price probe: it gets the quote, as the
         # REST API quotes an empty body. Anything else is validated before it is quoted.
         if self.check_arguments is not None and (raw is not None or params.arguments):
-            problem = self.check_arguments(params.name, params.arguments or {})
-            if problem is not None:
-                return CallToolResult(
-                    content=[TextContent(type="text", text=problem)], is_error=True
-                )
+            refused = self.check_arguments(params.name, params.arguments or {})
+            if refused is not None:
+                return refused
         reqs, resource = await self.payments.mcp_requirements(op)
         if raw is None:
             return await self._payment_required(reqs, resource, "Payment required")

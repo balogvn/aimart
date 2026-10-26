@@ -51,18 +51,27 @@ ColumnType = Literal[
 ]
 
 
-def _no_nul(value: str) -> str:
+def _duck_text(value: str) -> str:
     # DuckDB reads the SQL it is given as a C string: a NUL ends it. In a name or a null token
     # that cut the statement short inside a quote (a bare 500 after payment); in a query it
     # silently dropped everything after it ("SELECT * FROM data\0 WHERE ..." ran unfiltered).
     if "\x00" in value:
         msg = "must not contain a NUL character (\\x00)"
         raise ValueError(msg)
+    # A lone surrogate ('\ud800' is a valid JSON escape) has no UTF-8 form, so DuckDB cannot be
+    # given it: as a null token it raised UnicodeEncodeError, a 500 after payment, and in SQL
+    # the parser's TypeError.
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        msg = "must be valid Unicode text; it holds a lone surrogate (such as \\ud800)"
+        raise ValueError(msg) from None
     return value
 
 
-NoNul = AfterValidator(_no_nul)
-"""For text that reaches DuckDB: refused when it holds a NUL, which DuckDB reads as its end."""
+DuckText = AfterValidator(_duck_text)
+"""For text that reaches DuckDB: refused when it holds a NUL (DuckDB reads it as the end of the
+text) or a lone surrogate (it has no UTF-8 form)."""
 
 # Values ``delimiter`` can never take: csv.reader refuses the quote character and line breaks
 # (a ValueError, a bare 500 after payment), and a NUL ends the SQL literal DuckDB is given.
@@ -102,7 +111,7 @@ def pdf_page_ranges(spec: str) -> list[tuple[int, int]]:
 class ExpectedColumn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    name: Annotated[str, NoNul] = Field(
+    name: Annotated[str, DuckText] = Field(
         min_length=1, description="Column name after normalization (snake_case by default)."
     )
     type: ColumnType
@@ -159,7 +168,7 @@ class ConvertOptions(BaseModel):
             "Omit to auto-detect."
         ),
     )
-    null_values: list[Annotated[str, NoNul]] = Field(
+    null_values: list[Annotated[str, DuckText]] = Field(
         default_factory=list,
         max_length=50,
         description="Extra tokens to treat as null, in addition to '', NA, N/A, null, None, -.",
@@ -211,7 +220,7 @@ class ConvertOptions(BaseModel):
         default=False,
         description="With expected_schema: fail on any value that does not fit, or extra columns.",
     )
-    sort_by: list[str] | None = Field(
+    sort_by: list[Annotated[str, DuckText]] | None = Field(
         default=None,
         max_length=8,
         description="Sort rows by these columns so Parquet min/max stats prune well.",

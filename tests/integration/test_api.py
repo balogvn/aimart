@@ -550,7 +550,7 @@ async def test_validation_errors_are_400_with_a_field_list(free_app: kit.AppHarn
     assert error["code"] == "invalid_request"
     assert error["hint"] == "Fix the listed fields."
     fields = {p["field"] for p in error["details"]["problems"]}
-    assert fields == {"sql", "limit", "bogus"}
+    assert fields == {"artifact_id", "sql", "limit", "bogus"}  # "x" is no artifact_id
     assert all(p["problem"] for p in error["details"]["problems"])
 
     r = await free_app.http.post(

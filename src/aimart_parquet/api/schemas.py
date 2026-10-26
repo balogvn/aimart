@@ -1,4 +1,8 @@
-"""REST request bodies. Field text doubles as OpenAPI documentation agents read."""
+"""REST request bodies. Field text doubles as OpenAPI documentation agents read.
+
+A paid body's ``precheck(service)`` is what ``_body_check`` runs after the schema and before the
+price is quoted: what the service would refuse about the body from the body alone.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +10,8 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-from aimart_parquet.engine.models import ConvertOptions
+from aimart_parquet.artifacts import _ID as _ARTIFACT_ID
+from aimart_parquet.engine.models import ConvertOptions, DuckText
 from aimart_parquet.errors import InvalidRequest
 from aimart_parquet.quantum.models import PortfolioOptions, QuantumCompressOptions
 from aimart_parquet.service import MAX_QUERY_TABLES, TABLE_NAME, SourceRef
@@ -16,8 +21,13 @@ if TYPE_CHECKING:
     from pydantic.json_schema import JsonSchemaValue
     from pydantic_core import CoreSchema
 
+    from aimart_parquet.service import Service
+
 # `tables` holds the joins; `data` is the top-level input and counts toward the service's cap.
 MAX_EXTRA_TABLES = MAX_QUERY_TABLES - 1
+# The ids the artifact store issues, in the schema: a malformed id used to be quoted and, paid,
+# verified before the store's 404 "Malformed artifact_id.".
+ARTIFACT_ID_PATTERN = _ARTIFACT_ID.pattern
 
 
 class _NamedKeys:
@@ -41,6 +51,7 @@ class _NamedKeys:
 
 
 TableName = Annotated[str, StringConstraints(pattern=TABLE_NAME.pattern)]
+ArtifactId = Annotated[str, StringConstraints(pattern=ARTIFACT_ID_PATTERN)]
 NamedKeys = _NamedKeys()
 
 
@@ -57,7 +68,10 @@ class SourceBody(BaseModel):
         default=None, max_length=255, description="Original filename; helps detection."
     )
     artifact_id: str | None = Field(
-        default=None, max_length=64, description="artifact_id from /v1/convert."
+        default=None,
+        max_length=64,
+        pattern=ARTIFACT_ID_PATTERN,
+        description="artifact_id from /v1/convert.",
     )
 
     def source(self) -> SourceRef:
@@ -67,6 +81,9 @@ class SourceBody(BaseModel):
             filename=self.filename,
             artifact_id=self.artifact_id,
         )
+
+    def precheck(self, service: Service) -> None:
+        service.check_input(self.source())
 
 
 class ConvertBody(SourceBody):
@@ -83,7 +100,7 @@ class PreviewBody(SourceBody):
 class TableRef(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    artifact_id: str | None = Field(default=None, max_length=64)
+    artifact_id: str | None = Field(default=None, max_length=64, pattern=ARTIFACT_ID_PATTERN)
     url: str | None = Field(default=None, max_length=4096)
 
     def source(self) -> SourceRef:
@@ -91,7 +108,7 @@ class TableRef(BaseModel):
 
 
 class QueryBody(SourceBody):
-    sql: str = Field(
+    sql: Annotated[str, DuckText] = Field(
         min_length=1,
         max_length=20_000,
         description="One DuckDB SELECT. The top-level input is table `data`; `tables` adds more.",
@@ -120,6 +137,9 @@ class QueryBody(SourceBody):
             refs[name] = ref.source()
         return refs
 
+    def precheck(self, service: Service) -> None:
+        service.check_query(self.table_sources(), self.sql)
+
     limit: int = Field(default=100, ge=1, le=1000)
     format: Literal["json", "markdown", "csv"] = "json"
 
@@ -130,7 +150,10 @@ class ParquetSourceBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     artifact_id: str | None = Field(
-        default=None, max_length=64, description="artifact_id from /v1/convert."
+        default=None,
+        max_length=64,
+        pattern=ARTIFACT_ID_PATTERN,
+        description="artifact_id from /v1/convert.",
     )
     url: str | None = Field(
         default=None, max_length=4096, description="Public http(s) URL of a Parquet file."
@@ -138,6 +161,9 @@ class ParquetSourceBody(BaseModel):
 
     def source(self) -> SourceRef:
         return SourceRef(artifact_id=self.artifact_id, url=self.url)
+
+    def precheck(self, service: Service) -> None:
+        service.check_input(self.source())
 
 
 class QuantumCompressBody(ParquetSourceBody):

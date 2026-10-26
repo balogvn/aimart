@@ -11,9 +11,11 @@ stay free so directories and agents can discover the tools. MCP charges per tool
 
 A paid request's body is validated before the x402 middleware quotes a price (``_body_check``):
 FastAPI only validates inside the route, after the 402, so an agent signed a payment for a
-request that could only fail. MCP does the same through ``argument_checker``. The upload
-form's small fields are read for the same check by ``FormPeekMiddleware`` (``_form_check``),
-which sits outside the payment middleware so the file itself still streams to the route.
+request that could only fail. After the schema, the body's ``precheck`` asks the service what
+it would refuse from the body alone (``Service.check_input`` / ``check_query``). MCP does the
+same through ``argument_checker``. The upload form's small fields are read for the same check
+by ``FormPeekMiddleware`` (``_form_check``), which sits outside the payment middleware so the
+file itself still streams to the route.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ import email.message
 import hmac
 import json
 import logging
-from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, cast, runtime_checkable
 from urllib.parse import urlsplit
 
 import anyio
@@ -188,7 +190,9 @@ def _form_check(
     return tuple(sorted({path for method, path in forms if method == "POST"})), check
 
 
-def _body_check(app: FastAPI) -> Callable[[Request, bool], Awaitable[JSONResponse | None]]:
+def _body_check(
+    app: FastAPI, service: Service
+) -> Callable[[Request, bool], Awaitable[JSONResponse | None]]:
     """Validate a request body against its route's own model, before the payment middleware.
 
     The models come from the routes as declared, so this cannot drift from what the route will
@@ -196,6 +200,8 @@ def _body_check(app: FastAPI) -> Callable[[Request, bool], Awaitable[JSONRespons
     would reject anyway. Mirrors FastAPI's reading of the body (JSON only for a JSON or absent
     content type; an empty body is a missing one). An unpaid price probe is let through to its
     402. A form body is not read here: ``_form_check`` saw it already, before this middleware.
+    A body that passes its schema is then ``precheck``-ed: what the service would refuse from
+    the body alone (one input, a fetchable URL, a SELECT), as the same typed error.
     """
     models: dict[tuple[str, str], type[BaseModel]] = {}
     forms = {key: [name for name, _ in parts] for key, parts in _form_routes(app).items()}
@@ -247,15 +253,30 @@ def _body_check(app: FastAPI) -> Callable[[Request, bool], Awaitable[JSONRespons
                 value = json.loads(raw)
             except json.JSONDecodeError as exc:
                 return _invalid_body([{"loc": (exc.pos,), "msg": "JSON decode error"}])
+            except RecursionError:
+                # 200,000 '[' (400 KB, under the body limit) escaped as a bare 500.
+                return _invalid_body([{"loc": (), "msg": "JSON nested too deeply"}])
             except ValueError:
                 return None  # not UTF-8: FastAPI words this one itself
         try:
-            model.model_validate(value, from_attributes=True)
+            body = model.model_validate(value, from_attributes=True)
         except ValidationError as exc:
             return _invalid_body(cast("list[Mapping[str, Any]]", exc.errors(include_url=False)))
+        if isinstance(body, Prechecked):
+            try:
+                body.precheck(service)
+            except AimartError as exc:
+                return JSONResponse(exc.to_dict(), status_code=exc.http_status)
         return None
 
     return check
+
+
+@runtime_checkable
+class Prechecked(Protocol):
+    """A paid body that can say, from itself alone, what the service would refuse."""
+
+    def precheck(self, service: Service) -> None: ...
 
 
 def create_app(
@@ -297,7 +318,7 @@ def create_app(
     gate = pay.mcp_extension(store=store) if pay else None
     mcp = build_mcp(service, settings, local_mode=False, extensions=[gate] if gate else [])
     if gate is not None:
-        gate.check_arguments = argument_checker(mcp)
+        gate.check_arguments = argument_checker(mcp, service)
     mcp_app = mcp.streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,
@@ -506,7 +527,9 @@ def create_app(
     if pay is not None:
         from aimart_parquet.payments import carries_payment  # noqa: PLC0415 - loaded with pay
 
-        app.middleware("http")(pay.http_middleware(prevalidate=_body_check(app), store=store))
+        app.middleware("http")(
+            pay.http_middleware(prevalidate=_body_check(app, service), store=store)
+        )
         form_paths, form_check = _form_check(app, lambda scope: carries_payment(Request(scope)))
         # Added after the payment middleware, so it runs before it (and inside BodyLimit).
         app.add_middleware(FormPeekMiddleware, paths=form_paths, check=form_check)

@@ -7,6 +7,10 @@ and both map ``AimartError`` to a >= 400 response that cancels payment.
 Capacity: every operation holds one job slot (``_job``) from before its inputs are fetched
 until its result is built. URL inputs land on the artifact disk, which on Cloud Run is RAM, so
 downloads must count toward capacity and share one byte budget per call.
+
+Before a price is quoted, REST and MCP ask ``check_input`` / ``check_query`` what the service
+would refuse about a request from the request alone, so an agent never signs for a call that
+can only fail.
 """
 
 from __future__ import annotations
@@ -37,7 +41,7 @@ from aimart_parquet.engine.models import (
     Provenance,
     TabularResult,
 )
-from aimart_parquet.engine.tabular import OutputFormat, preview, query
+from aimart_parquet.engine.tabular import OutputFormat, preview, query, validate_select
 from aimart_parquet.errors import (
     AimartError,
     Busy,
@@ -48,10 +52,10 @@ from aimart_parquet.errors import (
 )
 from aimart_parquet.provenance import ALGORITHM, build_manifest
 from aimart_parquet.provenance import verify as verify_signature
-from aimart_parquet.sources import decode_base64, fetch_url, safe_filename
+from aimart_parquet.sources import decode_base64, fetch_url, safe_filename, validate_url
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 
     from aimart_parquet.artifacts import ArtifactStore
     from aimart_parquet.config import Settings
@@ -67,6 +71,12 @@ T = TypeVar("T")
 _QUEUE_FACTOR = 4  # callers allowed to wait per worker slot before we answer "busy"
 MAX_QUERY_TABLES = 8
 TABLE_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+# SQL longer than this is not parsed before the quote, only where the query runs (in the job's
+# child process, with a deadline). DuckDB's parser holds the GIL and is cubic on runs of '+'
+# and '-': 1,600 characters took 1.3 s, and the 20,000 the schema allows would stall the API
+# process for most of an hour. At 256 the worst found is ~7 ms, under what parsing the JSON
+# body of a large request already costs.
+PRECHECK_SQL_CHARS = 256
 
 
 class QuantumUnavailable(AimartError):
@@ -193,6 +203,54 @@ class Service:
 
     def _budget(self) -> _InputBudget:
         return _InputBudget(self.settings.max_input_bytes)
+
+    # ------------------------------------------------------------------ before the quote
+    # What the operations below would refuse about a request, decided from the request alone
+    # (no download, no file, no DuckDB run), with the same error. REST's _body_check and MCP's
+    # argument checker call these before a price is quoted: without them an agent signed for,
+    # and the facilitator verified, calls that could only fail. The operations check again.
+    def check_input(self, src: SourceRef, *, table: str | None = None) -> None:
+        """Exactly one input, of a kind this mode serves; a URL the fetcher could fetch."""
+        kinds = src.kinds()
+        if len(kinds) != 1:
+            got = f"got {len(kinds)} ({', '.join(kinds) or 'none'})"
+            if table is not None:
+                raise InvalidRequest(
+                    f"Table {table!r}: provide exactly one input; {got}.",
+                    hint="Give every entry of `tables` one artifact_id (or url).",
+                )
+            allowed = "url, content_base64, artifact_id" + (", path" if self.local_mode else "")
+            raise InvalidRequest(
+                f"Provide exactly one input; {got}.", hint=f"Set one of: {allowed}."
+            )
+        if src.path is not None and not self.local_mode:
+            raise InvalidRequest(
+                "path inputs are only available in local mode.", hint="Pass url or content_base64."
+            )
+        if src.url is not None:
+            validate_url(src.url, allow_private=self.settings.allow_private_urls)
+
+    def check_query(self, tables: Mapping[str, SourceRef], sql: str) -> None:
+        """The table map ``query`` takes, each table's input, and the SQL (when short)."""
+        if not tables:
+            raise InvalidRequest(
+                "No tables to query.", hint="Pass an input; it is available as table `data`."
+            )
+        if len(tables) > MAX_QUERY_TABLES:
+            raise InvalidRequest(
+                f"{len(tables)} tables requested; the limit is {MAX_QUERY_TABLES}.",
+                hint="Join fewer files per query, or pre-aggregate them.",
+            )
+        bad = [name for name in tables if not TABLE_NAME.match(name)]
+        if bad:
+            raise InvalidRequest(
+                f"Invalid table names: {bad}.",
+                hint="Use lowercase names of letters, digits and underscores, e.g. 'gl' or 'bank_2025'.",
+            )
+        for name, ref in tables.items():
+            self.check_input(ref, table=None if name == "data" else name)
+        if len(sql) <= PRECHECK_SQL_CHARS:
+            validate_select(sql)  # the engine's own rule: one read-only SELECT
 
     async def _materialize(
         self, src: SourceRef, workdir: Path, budget: _InputBudget

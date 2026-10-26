@@ -14,7 +14,7 @@ the x402 extension (``payments.mcp_gate``). Local stdio mode adds ``path`` input
 # and the parameter types below are local to build_mcp (they embed per-deployment limits).
 
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import Extension, MCPServer
@@ -22,10 +22,22 @@ from mcp_types import CallToolResult, ResourceLink, TextContent, ToolAnnotations
 from pydantic import BaseModel, Field, ValidationError
 
 from aimart_parquet import __version__
-from aimart_parquet.api.schemas import MAX_EXTRA_TABLES, NamedKeys, TableName
+from aimart_parquet.api.schemas import (
+    ARTIFACT_ID_PATTERN,
+    MAX_EXTRA_TABLES,
+    ArtifactId,
+    NamedKeys,
+    TableName,
+)
 from aimart_parquet.config import Settings
 from aimart_parquet.demand import CapabilityAck, CapabilityRequest
-from aimart_parquet.engine.models import ConvertOptions, ConvertResult, InspectResult, TabularResult
+from aimart_parquet.engine.models import (
+    ConvertOptions,
+    ConvertResult,
+    DuckText,
+    InspectResult,
+    TabularResult,
+)
 from aimart_parquet.errors import AimartError, InvalidRequest
 from aimart_parquet.payments.pricing import quantum_enabled
 from aimart_parquet.quantum.models import (
@@ -71,7 +83,11 @@ NameArg = Annotated[
 ]
 ArtifactArg = Annotated[
     str | None,
-    Field(description="artifact_id returned by an earlier convert_to_parquet call.", max_length=64),
+    Field(
+        description="artifact_id returned by an earlier convert_to_parquet call.",
+        max_length=64,
+        pattern=ARTIFACT_ID_PATTERN,
+    ),
 ]
 PathArg = Annotated[
     str | None, Field(description="Local filesystem path of the input file.", max_length=4096)
@@ -117,22 +133,64 @@ async def _guard(fn: Callable[[], Awaitable[CallToolResult]]) -> CallToolResult:
         return _err(exc)
 
 
-def argument_checker(server: MCPServer) -> Callable[[str, dict[str, Any]], str | None]:
-    """The SDK's own argument validation for a tool, callable before the tool runs.
+def _tables(
+    src: SourceRef, extra: Mapping[str, str] | None, *, local: bool
+) -> dict[str, SourceRef]:
+    """query_parquet's tables: the main input as `data`, plus the joins by name."""
+    refs: dict[str, SourceRef] = {"data": src} if src.kinds() else {}
+    for name, value in (extra or {}).items():
+        if name in refs:
+            raise InvalidRequest(
+                f"Table name {name!r} is used twice.", hint="`data` is the main input."
+            )
+        refs[name] = SourceRef(path=value) if local else SourceRef(artifact_id=value)
+    return refs
+
+
+def _precheck(service: Service, args: Mapping[str, Any]) -> None:
+    """What a paid tool would refuse about its validated arguments, from the arguments alone.
+
+    Every paid tool names its input as url / content_base64 / artifact_id (path, locally), and
+    query_parquet alone takes `sql` and `tables`: the tools build their SourceRefs the same way.
+    """
+    src = SourceRef(
+        url=args.get("url"),
+        content_base64=args.get("content_base64"),
+        artifact_id=args.get("artifact_id"),
+        path=args.get("path"),
+    )
+    if "sql" in args:
+        tables = _tables(src, args.get("tables"), local=service.local_mode)
+        service.check_query(tables, args["sql"])
+    else:
+        service.check_input(src)
+
+
+def argument_checker(
+    server: MCPServer, service: Service
+) -> Callable[[str, dict[str, Any]], CallToolResult | None]:
+    """A paid tool call's refusal, decided before the gate quotes a price, or None to go on.
 
     The x402 gate wraps tools/call outside the SDK's validation, so without this a call with
-    invalid arguments was quoted, and when paid also verified, before it was rejected. Returns
-    the SDK's error text, or None when the arguments are valid or the tool is unknown.
+    invalid arguments was quoted, and when paid also verified, before it was rejected. First the
+    SDK's own validation (its text, as the SDK words it), then what the service would refuse
+    from the arguments alone (exactly one input, a fetchable URL, a SELECT; ``Service.check_*``),
+    as the typed error the tool would return. None for a valid call or an unknown tool.
     """
 
-    def check(name: str, arguments: dict[str, Any]) -> str | None:
+    def check(name: str, arguments: dict[str, Any]) -> CallToolResult | None:
         tool = server._tool_manager.get_tool(name)  # private: mcp 2.x has no public lookup
         if tool is None:
             return None
         try:
-            tool.fn_metadata.validate_arguments(arguments)
+            validated = tool.fn_metadata.validate_arguments(arguments)
         except ValidationError as exc:
-            return f"Error executing tool {name}: {exc}"  # the SDK's wording for the same error
+            text = f"Error executing tool {name}: {exc}"  # the SDK's wording for the same error
+            return CallToolResult(content=[TextContent(type="text", text=text)], is_error=True)
+        try:
+            _precheck(service, validated)
+        except AimartError as exc:
+            return _err(exc)
         return None
 
     return check
@@ -278,6 +336,7 @@ rejected. Example: SELECT region, sum(units) FROM data GROUP BY 1 ORDER BY 2 DES
     ]
     Sql = Annotated[
         str,
+        DuckText,
         Field(
             description="One DuckDB SELECT statement over table `data`.",
             min_length=1,
@@ -296,18 +355,6 @@ rejected. Example: SELECT region, sum(units) FROM data GROUP BY 1 ORDER BY 2 DES
                 service.preview(src, columns=columns, offset=offset, limit=limit, fmt=fmt)
             )
         )
-
-    def _tables(
-        src: SourceRef, extra: dict[str, str] | None, *, local: bool
-    ) -> dict[str, SourceRef]:
-        refs: dict[str, SourceRef] = {"data": src} if src.kinds() else {}
-        for name, value in (extra or {}).items():
-            if name in refs:
-                raise InvalidRequest(
-                    f"Table name {name!r} is used twice.", hint="`data` is the main input."
-                )
-            refs[name] = SourceRef(path=value) if local else SourceRef(artifact_id=value)
-        return refs
 
     async def _query(
         src: SourceRef, sql: str, limit: int, fmt: Any, extra: dict[str, str] | None = None
@@ -414,7 +461,7 @@ rejected. Example: SELECT region, sum(units) FROM data GROUP BY 1 ORDER BY 2 DES
             artifact_id: ArtifactArg = None,
             url: UrlArg = None,
             tables: Annotated[
-                Annotated[dict[TableName, str], NamedKeys] | None,
+                Annotated[dict[TableName, ArtifactId], NamedKeys] | None,
                 Field(
                     description=(
                         f"Extra tables for joins: {{name: artifact_id}}, up to {MAX_EXTRA_TABLES} "
