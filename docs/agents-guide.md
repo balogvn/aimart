@@ -169,8 +169,8 @@ decided from the request alone:
   query.", "Table name 'data' is used twice." (`data` is the top-level input) and "Table 't':
   provide exactly one input; got 0 (none).".
 - `content_base64` that holds no file: 400 `invalid_request`, "content_base64 is not valid
-  base64." or "content_base64 is empty.". Over the input size limit it is 413
-  `input_too_large`, "The file is larger than the 50 MB limit.".
+  base64." or "content_base64 is empty.". Too large to send inline it is 413
+  `input_too_large` (the request body may be 16 MB): pass a `url` instead.
 - A URL the server can never fetch: 422 `url_not_allowed`, with "Only http and https URLs are
   supported.", "The URL is malformed.", "The URL has no host.", "Port 22 is not allowed." (ports
   80, 443, 8080 and 8443 are), "The URL's host is not ASCII." (use its `xn--` form), or, for an

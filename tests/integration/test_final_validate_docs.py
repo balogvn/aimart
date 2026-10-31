@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 import aimart_testkit as kit
+from aimart_parquet.api.app import JSON_BODY_LIMIT
 from aimart_parquet.config import Settings
 from aimart_parquet.engine.models import ConvertOptions
 from aimart_parquet.service import PRECHECK_SQL_CHARS
@@ -232,6 +233,7 @@ def test_the_docs_state_the_limits_the_code_applies() -> None:
     assert f"for the {wait} a call waits for one" in GUIDE
     assert f"a call waits up to {wait} for a free one" in README
     assert f"{sys.get_int_max_str_digits()} digits" in GUIDE
+    assert f"the request body may be {JSON_BODY_LIMIT // 2**20} MB" in GUIDE
     longest = ConvertOptions.model_json_schema()["properties"]["encoding"]["anyOf"][0]["maxLength"]
     assert f"longer than {longest} characters" in GUIDE
     fetch = f"{Settings().fetch_timeout_s:g} s for all of a call's `url` inputs together"
