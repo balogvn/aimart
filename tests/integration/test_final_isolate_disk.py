@@ -186,7 +186,8 @@ async def test_the_incident_on_the_wire_is_an_unpaid_413(
 
 @pytest.mark.anyio
 async def test_convert_counts_an_upload(isolated: Service, files_only: None) -> None:
-    # convert_upload copies the upload into its own work directory, outside _convert's.
+    # convert_upload writes the upload into the work directory the convert uses: it counts once
+    # (integration/test_final_isolate_upload.py), and once is over this 16 MB cap.
     body = kit.csv_text(["n", "s"], [[i, "x" * 200] for i in range(120_000)]).encode()
     chunks = [body[i : i + _MB] for i in range(0, len(body), _MB)]
 

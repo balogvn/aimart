@@ -91,23 +91,38 @@ OOM-kill the instance and every other caller's request, and both ended in 413, u
 
 - **The watchdog adds the bytes of the job's files to its RSS** and compares the sum with
   `job_memory_limit_mb`. The job's files are those under its own temp directory and under the
-  work directories `Service` passes to `run_isolated` (`job_dirs`): the call's work directory for
-  every operation, and an upload's for `convert_upload`. The 413 says both figures ("... 554 MB
-  in memory plus 150 MB of temporary files, which count toward the budget.") and its details
-  carry `memory_bytes` and `temp_file_bytes`.
+  work directories `Service` passes to `run_isolated` (`job_dirs`): the call's work directory,
+  for every operation. The 413 says both figures ("... 554 MB in memory plus 150 MB of
+  temporary files, which count toward the budget.") and its details carry `memory_bytes` and
+  `temp_file_bytes`.
 - **Measured cheaply on every poll**: an `os.scandir` walk that never follows symlinks and stops
   after 10,000 entries, counting allocated blocks. A file hard-linked from outside those
   directories does not count (a query's input linked from the artifact store takes no new space
   and is in the artifact budget already); a file all of whose links are the job's counts once.
-- **`max_decompressed_bytes` dropped from 512 MB to 256 MB.** Measured on macOS through
-  `Service.convert` with the 700 MB default (Linux counts about 160 MB more per child): the
-  largest inputs that converted were 120 MB of decompressed CSV (8 short text columns; 100 MB
-  for a mixed and a one-integer-column shape) and an xlsx of 144 MB of XML; every CSV of 150 MB,
-  of all three shapes, and the xlsx of 254 MB of XML failed at the cap. 256 MB therefore refuses
-  nothing that could convert, while an input that can only fail now stops at the existing
-  "Decompressed input exceeds the 256 MB limit." with half the RAM written, and a zip or xlsx
-  over it is refused from its central directory before anything is inflated. Raise the two
-  settings together.
+- **A convert's input is on the job's disk once.** The engine copies an input that is outside
+  its work directory into it (DuckDB reads nothing else), so `convert_upload` writes the upload
+  into the work directory the convert then uses (it had a directory of its own, and a 50 MB
+  upload counted 100 MB), and a stored artifact given as a convert's input is hard-linked in
+  rather than copied, falling back to the copy where a link fails.
+- **`max_decompressed_bytes` stays 512 MB: a bomb cap, not a memory budget.** This amendment
+  first lowered it to 256 MB, sized to the job cap from single-sheet measurements (with the
+  700 MB default the largest inputs that converted were 120 MB of decompressed CSV and an xlsx
+  of 144 MB of XML). That was wrong for workbooks: the excel reader checks the sum of every part
+  against it, though calamine parses only the sheet asked for and writes none of them to disk,
+  and a 27.5 MB workbook of a 200-row `summary` sheet beside two raw sheets of 129.6 MB of XML
+  each, whose `summary` converted at 07fa450, became 413 from the zip's directory for every
+  sheet, before any was parsed. The job cap above is what bounds a stream: its decompressed
+  file is in the work directory and counts. Measured on macOS with the defaults, two of the
+  incident's calls at once: each 500 MiB stream and the child's 60-80 MiB resident stayed under
+  the cap together (under 600 MiB), and the watchdog stopped each job when parsing began, at
+  about 720-900 MiB in all, the overshoot between two polls that any job allocating fast gets
+  (see above). At e8d228e the same pair held about 2.5 GB. An unpaid input of a few KB, such as a
+  PDF drawing glyphs, reaches the cap anyway, so the instance has to hold two jobs at the cap
+  whatever this limit is. The cost: a stream between about 250 and 500 MB, which cannot
+  convert, now spends a job's whole budget before its 413 instead of stopping at 256 MB.
+  Splitting the setting (a stream limit sized to the job cap beside a workbook limit, or
+  counting only the parts calamine reads) would win that back, and belongs to
+  `engine/limits.py` and the readers.
 - **A crash's log carries no exception text.** The published retention policy says logs never
   hold file contents, and since e8d228e the child's unexpected exception was logged in full,
   which can quote a column name or a cell. The log now has its type and traceback frames only.

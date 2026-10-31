@@ -298,16 +298,30 @@ class Service:
                                 hint="Split the file or pass a url.",
                             )
                         out.write(chunk)
-                return await self._convert(SourceRef(upload=dest, filename=filename), options, None)
+                # Into the directory the convert works in, so the upload is on the job's disk
+                # once. In a directory of its own it was outside the engine's, which copies such
+                # an input in (DuckDB reads nothing else), and the job cap counted both copies:
+                # a 50 MB upload took 100 MB of the 700 MB before parsing began.
+                return await self._convert(
+                    SourceRef(upload=dest, filename=filename), options, None, workdir=workdir
+                )
             finally:
                 shutil.rmtree(workdir, ignore_errors=True)
 
     async def _convert(
-        self, src: SourceRef, options: ConvertOptions, output_path: str | None
+        self,
+        src: SourceRef,
+        options: ConvertOptions,
+        output_path: str | None,
+        *,
+        workdir: Path | None = None,
     ) -> ConvertResult:
-        workdir = self._workdir()
+        if workdir is None:
+            workdir = self._workdir()
         try:
             in_path, name = await self._materialize(src, workdir, self._budget())
+            if src.artifact_id is not None:
+                in_path = self._linked_in(in_path, workdir)
             out = workdir / "out.parquet"
             try:
                 report = await self._execute(
@@ -320,8 +334,7 @@ class Service:
                     limits=self.limits,
                     timeout_s=self.settings.convert_timeout_s,
                     isolate=self.settings.isolate_jobs,
-                    # An upload sits in convert_upload's own work directory.
-                    job_dirs=(workdir, *([src.upload.parent] if src.upload else [])),
+                    job_dirs=(workdir,),
                 )
             except UnsupportedFormat:
                 self.demand.unsupported_format(name)  # roadmap signal: what agents tried to send
@@ -337,6 +350,25 @@ class Service:
             return ConvertResult(artifact=ref, report=report, hint=hint)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    @staticmethod
+    def _linked_in(stored: Path, workdir: Path) -> Path:
+        """A stored artifact's file, hard-linked into ``workdir`` for the engine to read.
+
+        The engine copies an input from outside its work directory in, because DuckDB may read
+        nothing else, and the job cap counts the copy: converting a stored 100 MB artifact spent
+        100 MB of it on bytes already in the artifact budget. A link takes no space, and the
+        watchdog does not count a file linked from outside the job's directories. The engine
+        only reads its input, and the link goes with the work directory. Where the link fails
+        (another filesystem, a refused link), the engine's copy is the fallback. Only for the
+        store's files: a local caller's own file is never linked.
+        """
+        link = workdir / ("input" + "".join(stored.suffixes[-2:]))
+        try:
+            link.hardlink_to(stored)
+        except OSError:
+            return stored
+        return link
 
     def _publish(
         self, src: SourceRef, out: Path, filename: str, operation: str, output_path: str | None
