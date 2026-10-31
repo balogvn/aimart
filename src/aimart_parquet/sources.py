@@ -305,7 +305,13 @@ def _too_large(max_bytes: int) -> InputTooLarge:
     )
 
 
-def decode_base64(data: str, dest: Path, *, max_bytes: int) -> int:
+def check_base64(data: str, *, max_bytes: int) -> bytes:
+    """The bytes ``content_base64`` holds, or the error it can only ever get. Writes nothing.
+
+    Also run before the price is quoted (``Service.check_input``): a value that does not decode
+    ("abc") or decodes to nothing ("") was quoted and, paid, verified, and only then refused.
+    Decoding the 16 MiB a JSON body may hold takes about 20 ms.
+    """
     # base64 inflates by 4/3; refuse before decoding rather than after allocating.
     if len(data) > max_bytes * 4 // 3 + 4:
         raise _too_large(max_bytes)
@@ -318,5 +324,14 @@ def decode_base64(data: str, dest: Path, *, max_bytes: int) -> int:
         ) from exc
     if len(raw) > max_bytes:
         raise _too_large(max_bytes)
+    if not raw:  # an empty file has nothing to convert or read: it was a 422 after payment
+        raise InvalidRequest(
+            "content_base64 is empty.", hint="Base64-encode the raw bytes of a non-empty file."
+        )
+    return raw
+
+
+def decode_base64(data: str, dest: Path, *, max_bytes: int) -> int:
+    raw = check_base64(data, max_bytes=max_bytes)
     dest.write_bytes(raw)
     return len(raw)

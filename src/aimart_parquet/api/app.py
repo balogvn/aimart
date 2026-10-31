@@ -26,6 +26,7 @@ import email.message
 import hmac
 import json
 import logging
+import sys
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol, cast, runtime_checkable
 from urllib.parse import urlsplit
 
@@ -148,8 +149,11 @@ def _convert_options(options: str | None) -> ConvertOptions:
     try:
         return ConvertOptions.model_validate_json(options) if options else ConvertOptions()
     except ValidationError as exc:
+        # Without the input: a field's whole value used to come back in the hint (100 KB of an
+        # encoding name), and it can be the caller's data.
+        problems = exc.errors(include_url=False, include_input=False)[:3]
         raise InvalidRequest(
-            "options is not valid ConvertOptions JSON.", hint=str(exc.errors()[:3])
+            "options is not valid ConvertOptions JSON.", hint=str(problems)
         ) from exc
 
 
@@ -258,8 +262,15 @@ def _body_check(
             except RecursionError:
                 # 200,000 '[' (400 KB, under the body limit) escaped as a bare 500.
                 return _invalid_body([{"loc": (), "msg": "JSON nested too deeply"}])
-            except ValueError:
-                return None  # not UTF-8: FastAPI words this one itself
+            # Both used to be let through to the quote; paid, they were verified and then got
+            # FastAPI's untyped 400 {"detail": "There was an error parsing the body"}.
+            except UnicodeDecodeError:  # a latin-1 'café', say
+                return _invalid_body([{"loc": (), "msg": "JSON body is not valid UTF-8"}])
+            except ValueError:  # the one other: an integer past Python's digit limit
+                digits = sys.get_int_max_str_digits()
+                return _invalid_body(
+                    [{"loc": (), "msg": f"JSON integer longer than {digits} digits"}]
+                )
         try:
             body = model.model_validate(value, from_attributes=True)
         except ValidationError as exc:

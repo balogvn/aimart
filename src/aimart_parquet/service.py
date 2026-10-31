@@ -55,7 +55,13 @@ from aimart_parquet.errors import (
 )
 from aimart_parquet.provenance import ALGORITHM, build_manifest
 from aimart_parquet.provenance import verify as verify_signature
-from aimart_parquet.sources import decode_base64, fetch_url, safe_filename, validate_url
+from aimart_parquet.sources import (
+    check_base64,
+    decode_base64,
+    fetch_url,
+    safe_filename,
+    validate_url,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -251,7 +257,8 @@ class Service:
     # argument checker call these before a price is quoted: without them an agent signed for,
     # and the facilitator verified, calls that could only fail. The operations check again.
     def check_input(self, src: SourceRef, *, table: str | None = None) -> None:
-        """Exactly one input, of a kind this mode serves; a URL the fetcher could fetch."""
+        """Exactly one input, of a kind this mode serves; a URL the fetcher could fetch; base64
+        that decodes to a file."""
         kinds = src.kinds()
         if len(kinds) != 1:
             got = f"got {len(kinds)} ({', '.join(kinds) or 'none'})"
@@ -270,6 +277,10 @@ class Service:
             )
         if src.url is not None:
             validate_url(src.url, allow_private=self.settings.allow_private_urls)
+        if src.content_base64 is not None:
+            # The one base64 input a call can have, so the whole budget is its limit, as when
+            # _materialize decodes it.
+            check_base64(src.content_base64, max_bytes=self.settings.max_input_bytes)
 
     def check_query(self, tables: Mapping[str, SourceRef], sql: str) -> None:
         """The table map ``query`` takes, each table's input, and the SQL (when short)."""

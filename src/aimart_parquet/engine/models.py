@@ -161,8 +161,12 @@ class ConvertOptions(BaseModel):
     header: bool | None = Field(
         default=None, description="Whether the first row is a header. Omit to auto-detect."
     )
+    # max_length is checked before _text_encoding: codecs.lookup caches every unknown name for
+    # good, so unpaid requests with megabyte-long names grew the API process by their size (and
+    # each took ~1 s of the event loop). The longest stdlib codec name has 24 characters.
     encoding: str | None = Field(
         default=None,
+        max_length=64,
         description=(
             "Text encoding as a Python codec name, e.g. 'latin-1', 'cp1252' or 'utf-16-le'. "
             "Omit to auto-detect."

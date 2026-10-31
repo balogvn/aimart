@@ -9,6 +9,7 @@ numbers the docs state (the SQL length parsed before the quote, the queue wait) 
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +17,7 @@ import pytest
 
 import aimart_testkit as kit
 from aimart_parquet.config import Settings
+from aimart_parquet.engine.models import ConvertOptions
 from aimart_parquet.service import PRECHECK_SQL_CHARS
 from aimart_parquet.sources import ALLOWED_PORTS
 
@@ -121,6 +123,21 @@ MESSAGES: list[tuple[str, dict[str, Any], int, str, str]] = [
         "query_rejected",
         "Send exactly one statement; got 2.",
     ),
+    (
+        "/v1/convert",
+        {"content_base64": "abc"},
+        400,
+        "invalid_request",
+        "content_base64 is not valid base64.",
+    ),
+    ("/v1/convert", {"content_base64": ""}, 400, "invalid_request", "content_base64 is empty."),
+]
+# Bodies JSON cannot be read from, and the one problem the guide quotes for each.
+UNREADABLE: list[tuple[bytes, str]] = [
+    (b'{"artifact_id": ', "JSON decode error"),
+    (b"[" * 100_000 + b"]" * 100_000, "JSON nested too deeply"),
+    ('{"artifact_id": "caf\xe9"}'.encode("latin-1"), "JSON body is not valid UTF-8"),
+    (b'{"limit": ' + b"1" * 5000 + b"}", "JSON integer longer than 4300 digits"),
 ]
 # (path, body, the field-level problem the guide quotes, after pydantic's "Value error, ")
 PROBLEMS: list[tuple[str, dict[str, Any], str]] = [
@@ -186,6 +203,18 @@ async def test_the_guide_quotes_each_schema_problem_the_server_sends(
     assert got["problem"].removeprefix("Value error, ") == problem
 
 
+@pytest.mark.parametrize(("raw", "problem"), UNREADABLE, ids=[p for _, p in UNREADABLE])
+async def test_the_guide_quotes_each_unreadable_body_problem(
+    raw: bytes, problem: str, paid_app: kit.AppHarness
+) -> None:
+    assert f'"{problem}"' in GUIDE
+    r = await paid_app.http.post(
+        "/v1/query", content=raw, headers={"content-type": "application/json"}
+    )
+    [got] = _refused(r, 400, "invalid_request")["details"]["problems"]
+    assert got["problem"] == problem
+
+
 async def test_the_guide_quotes_the_upload_form_refusal(paid_app: kit.AppHarness) -> None:
     r = await paid_app.http.post(
         "/v1/convert/upload",
@@ -202,6 +231,9 @@ def test_the_docs_state_the_limits_the_code_applies() -> None:
     wait = f"{Settings().queue_wait_s:g} s"
     assert f"for the {wait} a call waits for one" in GUIDE
     assert f"a call waits up to {wait} for a free one" in README
+    assert f"{sys.get_int_max_str_digits()} digits" in GUIDE
+    longest = ConvertOptions.model_json_schema()["properties"]["encoding"]["anyOf"][0]["maxLength"]
+    assert f"longer than {longest} characters" in GUIDE
     ports = sorted(ALLOWED_PORTS)
     listed = ", ".join(map(str, ports[:-1])) + f" and {ports[-1]}"
     assert f"(ports {listed} are)" in GUIDE

@@ -249,10 +249,10 @@ in the [agents guide](docs/agents-guide.md#3-convert).
 A failed call is never charged: every refusal is HTTP ≥ 400 (or an MCP `isError` result) with
 a `code`, a `message` and a `hint`. A call that can only fail, decided from the request alone,
 is refused before any price is quoted: a body or arguments that fail the schema, not exactly one
-input, a URL that can never be fetched, or SQL of up to 256 characters that is not one `SELECT`
-(400 `invalid_request`, 422 `url_not_allowed` or 400 `query_rejected`, or an MCP error result;
-the full list is in the [agents guide](docs/agents-guide.md#6-handle-errors)). The defaults,
-which an operator can change:
+input, `content_base64` that decodes to no file, a URL that can never be fetched, or SQL of up
+to 256 characters that is not one `SELECT` (400 `invalid_request`, 422 `url_not_allowed` or 400
+`query_rejected`, or an MCP error result; the full list is in the
+[agents guide](docs/agents-guide.md#6-handle-errors)). The defaults, which an operator can change:
 
 | limit | default | over it |
 |---|---|---|

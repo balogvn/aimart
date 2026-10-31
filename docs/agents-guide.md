@@ -148,24 +148,29 @@ written to be acted on.
 instead of the 402, over MCP as an `isError` result before any PaymentRequired. These are
 decided from the request alone:
 
-- A body that fails the operation's schema: 400 `invalid_request`, "The request body is
-  invalid.", with each field in `details.problems`. Besides types and ranges, that covers an
-  `artifact_id` that is not one `convert` issues ("String should match pattern
+- A body that is not JSON, or fails the operation's schema: 400 `invalid_request`, "The
+  request body is invalid.", with each field in `details.problems`. A body JSON cannot be read
+  from has one problem: "JSON decode error", "JSON nested too deeply", "JSON body is not valid
+  UTF-8" or "JSON integer longer than 4300 digits". Besides types and ranges, the schema covers
+  an `artifact_id` that is not one `convert` issues ("String should match pattern
   '^[A-Za-z0-9_-]{22,64}$'") and these `options`: `pdf_pages` that no PDF has ("pdf_pages range
   '5-2' is invalid: pages start at 1, and a range runs low to high."), an `encoding` that is
   unknown or not a text codec ("Unknown encoding 'utf-9'.", "'rot13' is not a text
-  encoding."), a `delimiter` of `"`, a line break or NUL ("delimiter '"' cannot separate
-  fields: it is the quote character. Omit delimiter to detect it."), and an `expected_schema`
-  that names one column twice ("expected_schema names column 'a' twice."). Names are
-  case-insensitive, so `a` and `A` are one column. Text that DuckDB reads (`sql`,
-  `null_values`, `sort_by`, `expected_schema` names) must not hold a NUL ("must not contain a
-  NUL character (\x00)") or a lone surrogate such as `\ud800`. Over MCP the same arguments get
-  the SDK's "Error executing tool <name>: ..." text, and on `/v1/convert/upload` invalid
-  `options` get "options is not valid ConvertOptions JSON.".
+  encoding.") or longer than 64 characters, a `delimiter` of `"`, a line break or NUL
+  ("delimiter '"' cannot separate fields: it is the quote character. Omit delimiter to detect
+  it."), and an `expected_schema` that names one column twice ("expected_schema names column
+  'a' twice."). Names are case-insensitive, so `a` and `A` are one column. Text that DuckDB
+  reads (`sql`, `null_values`, `sort_by`, `expected_schema` names) must not hold a NUL ("must
+  not contain a NUL character (\x00)") or a lone surrogate such as `\ud800`. Over MCP the same
+  arguments get the SDK's "Error executing tool <name>: ..." text, and on `/v1/convert/upload`
+  invalid `options` get "options is not valid ConvertOptions JSON.".
 - Not exactly one input: 400 `invalid_request`, "Provide exactly one input; got 0 (none)." or
   "Provide exactly one input; got 2 (url, artifact_id).". For a query, also "No tables to
   query.", "Table name 'data' is used twice." (`data` is the top-level input) and "Table 't':
   provide exactly one input; got 0 (none).".
+- `content_base64` that holds no file: 400 `invalid_request`, "content_base64 is not valid
+  base64." or "content_base64 is empty.". Over the input size limit it is 413
+  `input_too_large`, "The file is larger than the 50 MB limit.".
 - A URL the server can never fetch: 422 `url_not_allowed`, with "Only http and https URLs are
   supported.", "The URL is malformed.", "The URL has no host.", "Port 22 is not allowed." (ports
   80, 443, 8080 and 8443 are), "The URL's host is not ASCII." (use its `xn--` form), or, for an
