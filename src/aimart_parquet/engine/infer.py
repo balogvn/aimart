@@ -93,10 +93,11 @@ _RE_TZ_SUFFIX = r".*\d:\d{2}(:\d{2}([.,]\d+)?)?\s*(Z|[+-]\d{2}(:?\d{2}){0,2}|UTC
 # BST was Asia/Dhaka (+6, not British Summer Time), AST Alaska (not Atlantic), ART Cairo, NST
 # Auckland, ECT Paris, SST Guadalcanal, PST Los Angeles (-7 in July), MST Phoenix (-6 in July
 # 1967): a UK log came back with every summer instant five hours early, a 200 with no note.
-# Listed are only names with one meaning in data. CST is also China (Java prints it for
-# Asia/Shanghai), IST is India, Ireland and Israel, and the standard name of a zone that keeps
-# summer time (PST, CET) is written in July for either offset. Any other name is not a zone:
-# the value is a counted reject, or the column stays text, and the report names it.
+# Listed are only names with one meaning in data that ICU also reads as that one offset all
+# year (a test checks). CST is also China (Java prints it for Asia/Shanghai), IST is India,
+# Ireland and Israel, and ICU reads PST and CET with summer time: 'PST' in July is -7 to ICU
+# and -8 by its name, and data is written both ways. Any other name is not a zone: the value
+# is a counted reject, or the column stays text, and the report names it.
 ZONE_ABBREVIATIONS = {
     "GMT": "+00:00",
     "EST": "-05:00",
@@ -106,11 +107,12 @@ ZONE_ABBREVIATIONS = {
 }
 # The zones a value may name after its time: an attached offset or 'Z' (DuckDB's own parser),
 # a listed abbreviation, UTC with whole hours (ICU cut 'UTC+05:30' to +05:00), or an IANA
-# Area/City name, which ICU reads with that zone's rules, as the name means.
+# name ICU reads with that zone's rules, as the name means: Area/City, or one of the US zones
+# in POSIX form (EST5EDT is America/New_York's rules, summer time included).
 _RE_KNOWN_ZONE = (
     r".*\d(Z|[+-]\d{2}(:?\d{2}){0,2}|\s+(?i:UTC([+-]\d{1,2}(:?00)?)?|"
     + "|".join(ZONE_ABBREVIATIONS)
-    + r"|[a-z_]+(/[a-z0-9_+-]+)+))"
+    + r"|EST5EDT|CST6CDT|MST7MDT|PST8PDT|[a-z_]+(/[a-z0-9_+-]+)+))"
 )
 
 _ISO = ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"]

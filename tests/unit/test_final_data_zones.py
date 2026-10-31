@@ -164,6 +164,11 @@ class TestReadZones:
             ("2025-07-15 12:00:00 America/Argentina/Buenos_Aires", utc(2025, 7, 15, 15)),
             ("2025-07-15 12:00:00 America/St_Johns", utc(2025, 7, 15, 14, 30)),
             ("2025-07-15 12:00:00 Etc/GMT+5", utc(2025, 7, 15, 17)),
+            # The IANA names of the US zones in POSIX form, with the summer time they name.
+            ("2025-07-15 12:00:00 EST5EDT", utc(2025, 7, 15, 16)),
+            ("2025-01-15 12:00:00 cst6cdt", utc(2025, 1, 15, 18)),
+            ("2025-07-15 12:00:00 MST7MDT", utc(2025, 7, 15, 18)),
+            ("2025-01-15 12:00:00 PST8PDT", utc(2025, 1, 15, 20)),
             ("2025-07-15 12:00:00+05:30", utc(2025, 7, 15, 6, 30)),
             ("2025-07-15 12:00:00Z", utc(2025, 7, 15, 12)),
         ],
