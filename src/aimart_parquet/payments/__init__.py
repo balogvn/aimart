@@ -124,7 +124,10 @@ class Payments:
         """Refuse to start when a paid call could outlast its own payment authorization.
 
         ``queue_wait_s`` was never read, and a call queued behind 4 x 180 s of jobs ran its work
-        after the authorization expired: unsettleable, so served for free.
+        after the authorization expired: unsettleable, so served for free. ``fetch_timeout_s``
+        counts once because it bounds all of a call's downloads together
+        (``sources.downloads_deadline``, opened by ``Service._job``): a query over `data` and 7
+        URL tables used to get one each, 480 s at the defaults.
         """
         s = self.settings
         longest = max(

@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import ipaddress
 import re
 import socket
 import ssl
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
@@ -32,7 +34,7 @@ from aimart_parquet import __version__
 from aimart_parquet.errors import FetchFailed, InputTooLarge, InvalidRequest, UrlNotAllowed
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
 
 MAX_REDIRECTS = 5
 _CHUNK = 256 * 1024
@@ -122,6 +124,31 @@ class Fetched:
     filename: str | None
     content_type: str | None
     size: int
+
+
+@dataclass(frozen=True)
+class _CallDownloads:
+    deadline: float  # on anyio's clock
+    seconds: float
+
+
+_CALL_DOWNLOADS: ContextVar[_CallDownloads | None] = ContextVar("call_downloads", default=None)
+
+
+@contextlib.contextmanager
+def downloads_deadline(seconds: float) -> Iterator[None]:
+    """Every ``fetch_url`` inside shares one deadline, ``seconds`` from now.
+
+    ``Service._job`` opens one per call, so ``fetch_timeout_s`` bounds all of a call's downloads
+    together, as the payment-window check at startup counts it. Each fetch used to get its own:
+    a query over `data` and 7 URL tables could download for 8 x 60 s, holding a job slot past
+    the 300 s the caller's payment authorization is valid for, so its work could not settle.
+    """
+    token = _CALL_DOWNLOADS.set(_CallDownloads(anyio.current_time() + seconds, seconds))
+    try:
+        yield
+    finally:
+        _CALL_DOWNLOADS.reset(token)
 
 
 def _filename_from(url: str, disposition: str | None) -> str | None:
@@ -215,9 +242,11 @@ async def fetch_url(
         (b"Accept", b"*/*"),
         (b"Accept-Encoding", b"identity"),
     ]
+    call = _CALL_DOWNLOADS.get()
+    limit = deadline_s if call is None else min(deadline_s, call.deadline - anyio.current_time())
     current = url
     try:
-        with anyio.fail_after(deadline_s):
+        with anyio.fail_after(max(0.0, limit)):
             async with httpcore.AsyncConnectionPool(
                 ssl_context=ssl_context,
                 network_backend=GuardedBackend(allow_private=allow_private),
@@ -265,6 +294,12 @@ async def fetch_url(
                     f"More than {MAX_REDIRECTS} redirects.", hint="Pass the final URL."
                 )
     except TimeoutError as exc:
+        if call is not None:
+            raise FetchFailed(
+                f"Downloading this call's URL inputs took longer than {call.seconds:g} s in all.",
+                hint="Use a faster host or smaller files. To join several files, convert each "
+                "first and pass the artifact_ids: stored artifacts are not downloaded.",
+            ) from exc
         raise FetchFailed(
             f"Downloading the URL took longer than {deadline_s:g} s.",
             hint="Use a faster host or a smaller file.",

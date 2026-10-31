@@ -58,6 +58,7 @@ from aimart_parquet.provenance import verify as verify_signature
 from aimart_parquet.sources import (
     check_base64,
     decode_base64,
+    downloads_deadline,
     fetch_url,
     safe_filename,
     validate_url,
@@ -217,7 +218,9 @@ class Service:
         if not acquired:
             raise busy
         try:
-            with self.store.hold():
+            # One download deadline for all of the call's URL inputs, from here: the payment-window
+            # check at startup counts queue_wait_s, then one fetch_timeout_s, per call.
+            with self.store.hold(), downloads_deadline(self.settings.fetch_timeout_s):
                 yield
         finally:
             self._limiter.release()

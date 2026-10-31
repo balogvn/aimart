@@ -234,6 +234,8 @@ def test_the_docs_state_the_limits_the_code_applies() -> None:
     assert f"{sys.get_int_max_str_digits()} digits" in GUIDE
     longest = ConvertOptions.model_json_schema()["properties"]["encoding"]["anyOf"][0]["maxLength"]
     assert f"longer than {longest} characters" in GUIDE
+    fetch = f"{Settings().fetch_timeout_s:g} s for all of a call's `url` inputs together"
+    assert fetch in README
     ports = sorted(ALLOWED_PORTS)
     listed = ", ".join(map(str, ports[:-1])) + f" and {ports[-1]}"
     assert f"(ports {listed} are)" in GUIDE
