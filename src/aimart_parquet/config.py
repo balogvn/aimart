@@ -69,15 +69,17 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------- limits
     max_input_bytes: int = 50 * 1024 * 1024
     max_decompressed_bytes: int = Field(
-        default=256 * 1024 * 1024,
+        default=512 * 1024 * 1024,
         description=(
-            "Bytes a gzip/bz2/zip input, or the XML of an xlsx/ods, may expand to; past it the "
-            "call fails with 413 input_too_large, unpaid. Sized to the job memory cap, which "
-            "counts the expanded file: measured with the 700 MB default, the largest inputs "
-            "that converted were 120 MB of decompressed CSV and an xlsx of 144 MB of XML, and "
-            "every CSV of 150 MB and the xlsx of 254 MB failed, so 256 MB refuses nothing that "
-            "can convert. A zip or xlsx over it is refused from its directory before anything "
-            "is inflated. Was 512 MB. Raise it together with job_memory_limit_mb."
+            "Bytes a gzip/bz2/zip input, or all the XML parts of an xlsx/ods together, may "
+            "expand to; past it the call fails with 413 input_too_large, unpaid (a zip or xlsx "
+            "from its directory, before anything is inflated). A bomb cap, not a memory "
+            "budget: job_memory_limit_mb counts a decompressed stream's file in the work "
+            "directory, so that cap bounds the RAM a stream takes, while a workbook's parts "
+            "are summed over every sheet though one is parsed and none is written to disk. "
+            "Lowered to 256 MB in the final review, it refused a 27.5 MB workbook (a 200-row "
+            "sheet beside two raw sheets, 259 MB of XML in all) whose small sheet converted "
+            "before, so it is 512 MB again."
         ),
     )
     max_json_repair_bytes: int = 5 * 1024 * 1024

@@ -31,10 +31,11 @@ fails with 413 `input_too_large`, unpaid ([ADR 0005](../docs/adr/0005-job-isolat
 The files count because `/tmp` is RAM here: a 1.5 MB gzip CSV once decompressed to 500 MB there
 while the job's resident memory alone stayed under the cap. The cost of that cap: CSV conversion
 peaks at about 3.5 times the decompressed CSV size in memory, plus the decompressed file, so CSVs
-above roughly 120-150 MB decompressed are refused on this instance, and an input that expands
-past the decompression limit (`max_decompressed_bytes`, 256 MB: nothing larger converted under
-the default cap) is refused as soon as it does. Raising the cap without more memory per instance
-trades those refusals for an out-of-memory restart that fails every in-flight call.
+above roughly 120-150 MB decompressed are refused on this instance; the job cap, not the
+decompression limit (`AIMART_MAX_DECOMPRESSED_BYTES`, 512 MB, a bomb cap that also sums every
+sheet of a workbook), is what stops a large compressed stream. Raising the cap without more
+memory per instance trades those refusals for an out-of-memory restart that fails every
+in-flight call.
 
 ---
 

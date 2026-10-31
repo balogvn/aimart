@@ -218,14 +218,17 @@ async def test_query_counts_inputs_it_downloaded_but_not_stored_artifacts(
         await isolated.query({"data": inline}, _SLOW_SQL, limit=5, fmt="json")
 
 
-def test_the_decompression_limit_is_sized_to_the_cap() -> None:
-    # Measured with the 700 MB default (see max_decompressed_bytes and ADR 0005): the largest
-    # inputs that converted were 120 MB of CSV and 144 MB of xlsx XML, and every CSV of 150 MB
-    # failed at the cap. 512 MB let an input that can only fail write twice as much RAM first.
+def test_the_decompression_limit_is_a_bomb_cap_not_the_job_budget() -> None:
+    # Round 1 lowered it to 256 MB, sized to the 700 MB job cap from single-sheet measurements.
+    # The excel reader sums every part of a workbook against it, though one sheet is parsed and
+    # none is written to disk, so 256 MB refused a workbook whose small sheet converted before
+    # (integration/test_final_isolate_workbook.py). A stream's decompressed file counts toward
+    # the job cap, which bounds it (test_convert_counts_its_decompressed_input above).
     from aimart_parquet.config import Settings
     from aimart_parquet.engine.limits import Limits
 
     settings = Settings(_env_file=None)
     assert settings.job_memory_limit_mb == 700
-    assert settings.max_decompressed_bytes == 256 * _MB
-    assert Limits.from_settings(settings).max_decompressed_bytes == 256 * _MB
+    assert settings.max_decompressed_bytes == 512 * _MB
+    assert Limits.from_settings(settings).max_decompressed_bytes == 512 * _MB
+    assert Limits().max_decompressed_bytes == settings.max_decompressed_bytes  # one default
