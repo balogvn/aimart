@@ -30,7 +30,13 @@ import anyio
 import httpcore
 
 from aimart_parquet import __version__
-from aimart_parquet.errors import FetchFailed, InputTooLarge, InvalidRequest, UrlNotAllowed
+from aimart_parquet.errors import (
+    FetchFailed,
+    InputTooLarge,
+    InvalidRequest,
+    UrlNotAllowed,
+    without_paths,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -317,7 +323,8 @@ async def fetch_url(
         ssl.SSLError,
     ) as exc:
         raise FetchFailed(
-            f"Could not download the URL: {exc}", hint="Check the URL and its TLS certificate."
+            f"Could not download the URL: {without_paths(exc)}",
+            hint="Check the URL and its TLS certificate.",
         ) from exc
     finally:
         if call is not None:  # a call's fetches run one after another: none is counted twice

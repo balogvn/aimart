@@ -15,7 +15,7 @@ import zipfile
 from pathlib import Path
 from typing import IO, Literal, Protocol
 
-from aimart_parquet.errors import InputTooLarge, InvalidInput
+from aimart_parquet.errors import InputTooLarge, InvalidInput, without_paths
 
 Compression = Literal["gzip", "bz2", "zip"]
 
@@ -70,7 +70,7 @@ def decompress_stream(
             return copy_capped(src, dst, cap)
     except (OSError, EOFError) as exc:
         raise InvalidInput(
-            f"The {kind} stream is corrupt or truncated: {exc}",
+            f"The {kind} stream is corrupt or truncated: {without_paths(exc)}",
             hint="Re-compress the file, or send it uncompressed.",
         ) from exc
 
@@ -82,7 +82,8 @@ def check_zip(path: Path, cap: int) -> list[zipfile.ZipInfo]:
             infos = zf.infolist()
     except zipfile.BadZipFile as exc:
         raise InvalidInput(
-            f"Not a readable zip archive: {exc}", hint="Re-create the archive or send the file."
+            f"Not a readable zip archive: {without_paths(exc)}",
+            hint="Re-create the archive or send the file.",
         ) from exc
     if len(infos) > MAX_ZIP_MEMBERS:
         raise InvalidInput(

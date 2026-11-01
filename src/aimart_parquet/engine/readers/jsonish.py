@@ -31,7 +31,13 @@ from aimart_parquet.engine.duck import ident, literal
 from aimart_parquet.engine.models import InputFormat
 from aimart_parquet.engine.readers import RAW_TABLE, RawColumn, RawTable
 from aimart_parquet.engine.text import to_utf8
-from aimart_parquet.errors import AimartError, InputTooLarge, InvalidInput, InvalidRequest
+from aimart_parquet.errors import (
+    AimartError,
+    InputTooLarge,
+    InvalidInput,
+    InvalidRequest,
+    without_paths,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -289,7 +295,7 @@ def _load(con: duckdb.DuckDBPyConnection, path: Path, fmt: str, workdir: Path) -
         con.execute(f"CREATE TABLE {table} AS SELECT * FROM {sql}")
     except duckdb.Error as exc:  # DuckDB folded a key we did not: refuse rather than drop data
         raise InvalidInput(
-            f"Nested keys in this JSON could not be kept apart: {str(exc).splitlines()[0]}",
+            f"Nested keys in this JSON could not be kept apart: {without_paths(exc)}",
             hint="Rename nested keys so that none is empty and no two in one object differ "
             "only by letter case.",
         ) from exc

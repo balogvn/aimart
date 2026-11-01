@@ -21,7 +21,7 @@ import pyreadstat
 from aimart_parquet.engine.duck import ident
 from aimart_parquet.engine.models import InputFormat, ValueLabelMode
 from aimart_parquet.engine.readers import RAW_TABLE, RawColumn, RawTable
-from aimart_parquet.errors import InvalidInput
+from aimart_parquet.errors import InvalidInput, without_paths
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -126,7 +126,7 @@ def read_statistical(
                 break
     except (pyreadstat.ReadstatError, pyreadstat.PyreadstatError, ValueError, OverflowError) as exc:
         raise InvalidInput(
-            f"Could not read the {fmt.value} file: {exc}",
+            f"Could not read the {fmt.value} file: {without_paths(exc)}",
             hint="Check the file is not truncated; pass options.encoding for garbled text.",
         ) from exc
     names: list[str] = list(meta.column_names) if meta is not None else []

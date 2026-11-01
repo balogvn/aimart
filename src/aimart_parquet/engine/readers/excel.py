@@ -20,7 +20,7 @@ from aimart_parquet.engine.duck import ident
 from aimart_parquet.engine.models import InputFormat
 from aimart_parquet.engine.readers import RAW_TABLE, RawColumn, RawTable
 from aimart_parquet.engine.safety import check_zip
-from aimart_parquet.errors import InputTooLarge, InvalidInput, InvalidRequest
+from aimart_parquet.errors import InputTooLarge, InvalidInput, InvalidRequest, without_paths
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -166,7 +166,7 @@ def read_excel(
         names = list(wb.sheet_names)
     except CalamineError as exc:
         raise InvalidInput(
-            f"Could not read the spreadsheet: {exc}",
+            f"Could not read the spreadsheet: {without_paths(exc)}",
             hint="Check it opens in a spreadsheet app; password-protected files are not supported.",
         ) from exc
     finally:
