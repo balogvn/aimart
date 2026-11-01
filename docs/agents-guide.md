@@ -112,8 +112,9 @@ it.
 ## 4. Look, then ask
 
 Keep using the `artifact_id`. Artifacts live for `AIMART_ARTIFACT_TTL_S`, one hour by default.
-`artifact.expires_at` is the exact time it becomes unreachable, download link included; after
-that, convert again. Deletion follows (`data_retention` in `GET /pricing` says when).
+`artifact.expires_at` is the exact time it becomes unreachable, download link included, on every
+server: an output is never evicted before then to make room (the server answers 503 `busy`
+instead). After that, convert again. Deletion follows (`data_retention` in `GET /pricing` says when).
 
 | need | call | price (defaults) |
 |---|---|---:|
@@ -187,7 +188,13 @@ decided from the request alone:
   base64." (a character outside the base64 alphabets, or a length no padding completes),
   "content_base64 is a data: URL that is not base64-encoded." (a `data:` URL without
   `;base64`) or "content_base64 is empty.". Too large to send inline it is 413
-  `input_too_large` (the request body may be 16 MB): pass a `url` instead.
+  `input_too_large` (the request body may be 16 MB): pass a `url` instead. An upload whose
+  `file` part is empty is refused the same way: 400 `invalid_request`, "The uploaded file is
+  empty.".
+- Over MCP, an argument the tool does not take: 400 `invalid_request`, such as
+  "inspect_parquet does not take content_base64.", with the hint "Its parameters are: ..."
+  listing the tool's own (a `null` value is ignored). Only `convert_to_parquet` takes
+  `content_base64`; the other tools take `url` or `artifact_id`.
 - `content_base64` sent to inspect, preview or query that cannot be a Parquet file (it does not
   end in the Parquet footer, as a CSV not converted yet): 422 `invalid_input`, "Not a readable
   Parquet file: Parquet magic bytes not found in footer. Either the file is corrupted or this
@@ -217,7 +224,7 @@ the fields that start in the first 1 MiB of the form are checked before the quot
 | `input_too_large` | 413 | something is over a limit, and the message says which (list below) |
 | `unsupported_format` | 415 | pass `options.format`, or convert to a supported format |
 | `invalid_input`, `schema_violation`, `fetch_failed`, `url_not_allowed`, `query_failed` | 422 | read `message` and `hint`. `url_not_allowed` means a URL that is not http(s), is malformed, uses a port other than 80, 443, 8080 or 8443, or reaches a private address |
-| `busy` | 503 | "The server is at capacity.": every job slot was taken for the 10 s a call waits for one, or too many calls were already waiting; retry after a few seconds. "The server's output storage is full right now: ...": retry in a few minutes, or send a smaller extract |
+| `busy` | 503 | "The server is at capacity.": every job slot was taken for the 10 s a call waits for one, or too many calls were already waiting; retry after a few seconds. "The server's output storage is full right now: stored outputs are kept until they expire, and outputs of calls still settling until they settle.": retry when the hint says, "Retry in about N minutes, when enough stored outputs have expired, ..." with `details.retry_after_s` (up to the artifact TTL on a server without a bucket), or "Retry in a minute" when outputs still settling hold the space; or send a smaller extract |
 | `storage_unavailable` | 503 | the output could not be stored, read back or linked ("Could not store the output file."): retry in a minute |
 | `payments_unavailable` | 503 | "The payment facilitator is unreachable.", on REST and MCP alike: retry shortly |
 | `timeout` | 504 | send a smaller file or a simpler query |
@@ -230,14 +237,20 @@ The `input_too_large` messages, and what to change (numbers are the defaults):
   `content_base64` input of one call, a query's joined tables included, shares one budget.
   Convert each file first and pass the `artifact_id`s, which do not count.
 - "Decompressed input exceeds the 256 MB limit." (a gzip or bz2 file), or "Zip archive expands
-  to N bytes, over the 268435456 byte limit.": send the file uncompressed, or a smaller
-  extract. "The workbook's XML parts expand to N bytes, over the 536870912 byte limit for a
-  workbook.": every sheet counts, so save the sheet you need as its own workbook or as CSV.
-- "The job exceeded its memory budget (700 MB) and was stopped.": each job's memory is
-  capped. Large CSVs, roughly over 180 MB uncompressed, can reach it on the default hosted
-  instance: split them. For a PDF, read fewer pages with `pdf_pages`; for a query, return less.
+  to N bytes, over the 268435456 byte limit.": split the file, or send a smaller extract. "The
+  workbook's XML parts expand to N bytes, over the 536870912 byte limit for a workbook.": every
+  sheet counts, so save the sheet you need as its own workbook or as CSV.
+- "The job exceeded its memory budget (700 MB) and was stopped: N MB in memory plus M MB of
+  temporary files, which count toward the budget.", with `details.memory_bytes` and
+  `details.temp_file_bytes`: each job's memory is capped, and its temporary files count (on the
+  hosted instance they are in RAM). Large CSVs, roughly over 120 MB uncompressed (a compressed
+  file counts at its decompressed size), can reach it on the default hosted instance: split
+  them. For a PDF, read fewer pages with `pdf_pages`; for a query, return less.
 - "The file needs more memory to read than this server allows." (a delimited file) or "The PDF
   needs more memory than this server allows.": send a smaller file, or fewer pages.
+- "The file needs more memory to convert than this server allows.": typing every column took
+  more memory than DuckDB has. Split the file into parts with fewer columns or rows, or pass
+  `options.infer_types=false` to keep text columns as text.
 - "The output exceeds the artifact budget: ...": the converted file is larger than everything
   this server keeps. Send fewer rows or columns.
 - "The result is over 64 MB after long cells were cut to 2000 characters." (preview or query):

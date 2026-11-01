@@ -252,25 +252,27 @@ A failed call is never charged: every refusal is HTTP ≥ 400 (or an MCP `isErro
 a `code`, a `message` and a `hint`. A call that can only fail, decided from the request alone,
 is refused before any price is quoted: a body or arguments that fail the schema, not exactly one
 input, `content_base64` that decodes to no file (or, for inspect, preview and query, to no
-Parquet file), a URL that can never be fetched, or SQL of up to 256 characters that is not one
-`SELECT` (400 `invalid_request`, 422 `invalid_input`, 422 `url_not_allowed` or 400
-`query_rejected`, or an MCP error result; the full list is in the
+Parquet file), an upload whose file part is empty, an MCP argument the tool does not take, a
+URL that can never be fetched, or SQL of up to 256 characters that is not one `SELECT` (400
+`invalid_request`, 422 `invalid_input`, 422 `url_not_allowed` or 400 `query_rejected`, or an
+MCP error result; the full list is in the
 [agents guide](docs/agents-guide.md#6-handle-errors)). The defaults, which an operator can change:
 
 | limit | default | over it |
 |---|---|---|
 | input size (`url`, `content_base64` or upload) | 50 MB per call, all inputs of the call together; stored `artifact_id`s do not count | 413 `input_too_large` |
 | decompressed size | 256 MB for a gzip, bz2 or zip stream; 512 MB for the XML of all the sheets of an xlsx or ods | 413 `input_too_large` |
-| memory per job | 700 MB | 413 `input_too_large` ("The job exceeded its memory budget") |
-| stored outputs | 512 MiB for all outputs together (256 MiB on the Cloud Run deploy without a bucket) | 413 for one output larger than the whole budget; 503 `busy` while the space is held by recent outputs or outputs still settling |
+| memory per job | 700 MB, counting its resident memory plus its temporary files | 413 `input_too_large` ("The job exceeded its memory budget") |
+| stored outputs | 512 MiB for all outputs together (256 MiB on the Cloud Run deploy without a bucket) | 413 for one output larger than the whole budget; 503 `busy` while the space is held by outputs that have not expired (kept until their `expires_at`) or outputs still settling; the hint says when to retry |
 | preview and query results | 500 preview rows, 1,000 query rows, cells cut to 2,000 characters, 64 MB in all | more rows: `truncated: true`; over 64 MB: 413 |
 | time | 120 s to convert, 15 s to inspect, preview or query | 504 `timeout` |
 | downloads | 60 s of downloading for all of a call's `url` inputs together | 422 `fetch_failed` |
 | concurrency | 2 jobs; a call waits up to 10 s for a free one | 503 `busy` |
 
-**Large CSVs, roughly over 180 MB uncompressed, may be refused on the default hosted
+**Large CSVs, roughly over 120 MB uncompressed, may be refused on the default hosted
 instance** (413, unpaid). Converting a CSV takes about 3.5 times its uncompressed size in
-memory, and each job may use 700 MB. Split such files, or convert them with the free local
+memory, plus the decompressed file itself, which counts toward the 700 MB a job may use because
+`/tmp` is RAM on Cloud Run. Split such files, or convert them with the free local
 server and `AIMART_JOB_MEMORY_LIMIT_MB` raised to suit your machine (the local server applies
 the same 700 MB cap by default).
 

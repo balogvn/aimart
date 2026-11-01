@@ -81,11 +81,15 @@ exists only for tests.
   `read_json` segfaults on JSON nested about 21,600 levels deep. In the child, that becomes
   one failed and unpaid call, and the server keeps running. The child is killed at its
   deadline (120 s for convert, 15 s for inspect, preview and query) or when its resident
-  memory passes `AIMART_JOB_MEMORY_LIMIT_MB` (700 MB; a 1.6 KB PDF once reached 2 GB in 15 s),
-  and its memory goes back to the OS. The cap is a watchdog in the parent, not `RLIMIT_AS`: a
-  Linux child starts at about 2 GB of virtual memory. Each job's temporary files are in a
+  memory plus its temporary files (its temp directory and the call's work directory, RAM on
+  Cloud Run) pass `AIMART_JOB_MEMORY_LIMIT_MB` (700 MB; a 1.6 KB PDF once reached 2 GB in 15 s,
+  and a 1.5 MB gzip CSV wrote 500 MB of temporary files), and its memory goes back to the OS.
+  The cap is a watchdog in the parent, not `RLIMIT_AS`: a Linux child starts at about 2 GB of
+  virtual memory. Each job's temporary files are in a
   directory the parent deletes, even after a kill. An unexpected exception reaches the caller
-  as its type only, since its text can carry server paths.
+  as its type only, since its text can carry server paths, and is logged by its type and
+  traceback frames, never its text. Every other message built from a library's error text has
+  server paths removed first (`errors.without_paths`).
 - **Hostile PDFs.** The PDF reader budgets drawn characters and shapes (100,000 a page,
   2,000,000 a document) and its table search, stops reference chains after 32 hops, never
   resolves metadata or page labels, and clamps `pdf_pages` to the page count.
@@ -134,7 +138,7 @@ Artifacts have random 144-bit IDs (`secrets.token_urlsafe(18)`) and become unrea
 `AIMART_ARTIFACT_TTL_S` (1 hour). A sweep that runs at most once a minute while the service has
 traffic then deletes them, normally within minutes. A size budget makes room before each
 output is stored, but never evicts an output whose payment is still settling, a local one
-delivered less than 10 minutes ago, or one a running call reads; an output that cannot fit is
+that has not expired, or one a running call reads; an output that cannot fit is
 refused (413, or 503 `busy`), unpaid. Outputs of a paid call that does not settle are deleted
 at once. Local
 downloads need an HMAC-SHA256-signed, expiring link (`exp` and `sig`). Set

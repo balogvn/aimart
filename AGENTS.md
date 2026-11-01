@@ -57,8 +57,15 @@ Module docstrings explain the why; read the one you are about to change.
 
 - `config.py`: `Settings` from `AIMART_*` env vars: network mode, payTo addresses, facilitators,
   prices, limits, artifact storage, signing keys. There is no private-key setting, on purpose.
+  Two decompression caps: `max_decompressed_bytes` (256 MB, a gzip/bz2/zip stream, counted as
+  it inflates) and `max_workbook_xml_bytes` (512 MB, all the XML parts of an xlsx/ods, every
+  sheet counted though one is parsed); `engine/limits.py`'s `Limits` defaults equal them.
 - `errors.py`: `AimartError` subclasses, each with `code`, `http_status` (always >= 400) and a
-  concrete `hint`. Raising one is what guarantees the caller is not charged.
+  concrete `hint`. Raising one is what guarantees the caller is not charged. `InternalError.of()`
+  is the one 500 for an unexpected exception (the isolated child, REST's
+  `InternalErrorMiddleware` and MCP's `_guard`): its type only, hint "Retry; if it persists,
+  report it. You were not charged.". `without_paths()` strips server paths from any message
+  built from a library's exception text.
 - `engine/`: the pure conversion engine. `detect.py` (magic bytes over extensions; a `%PDF-`
   header anywhere in the first 1 KB), `safety.py` (gzip/zip bomb caps), `text.py` (UTF-8
   transcoding), `duck.py` (sandboxed DuckDB; `NOWHERE` for every `$HOME`-derived setting),
@@ -69,8 +76,11 @@ Module docstrings explain the why; read the one you are about to change.
   `inspect.py` (footer-only stats), `tabular.py` (preview and SELECT-only query: inputs are views
   over DuckDB's own Parquet reader (`_native_view`), long cells are cut inside DuckDB, rows are
   built by position, results over `MAX_RESULT_BYTES` are refused), `isolate.py` (forkserver
-  child per job: deadline, RSS watchdog for `job_memory_limit_mb`, a per-job temp directory the
-  parent deletes), `models.py` (the pydantic contract agents read).
+  child per job: deadline, a watchdog on RSS plus the job's temporary files (its temp directory
+  and the `job_dirs` the service passes) for `job_memory_limit_mb`, a per-job temp directory
+  the parent deletes; a crash is logged by type and frames, never its text), `models.py` (the
+  pydantic contract agents read). DuckDB running out of memory is a 413 (`read_csv` in
+  `delimited.py`, inference and the final COPY in `convert.py`), never a 500 that says retry.
 - `quantum/`: premium tools (`kernel_pca.py`, `portfolio.py`, `data.py`, `models.py`). Served only
   when the `quantum` extra is installed AND `AIMART_ENABLE_QUANTUM=true` (off by default; a buyer
   panel valued them at $0). `pricing.active_operations(settings)` decides. Spec:
@@ -80,7 +90,10 @@ Module docstrings explain the why; read the one you are about to change.
   `demand_signal`; `GET /v1/demand` behind `AIMART_ADMIN_TOKEN`. This decides the roadmap.
 - `provenance.py`: ML-DSA-65 manifests and signatures for every hosted artifact.
 - `sources.py`: SSRF-safe URL fetch (validated IPs at connect time, re-checked redirects, port
-  allow-list, size cap, deadline), base64 decode, `safe_filename`.
+  allow-list, size cap; `downloads_deadline`, opened by `Service._job`, gives all of a call's
+  URL downloads one `fetch_timeout_s`), `check_base64` (exact: the standard or URL-safe alphabet,
+  whitespace ignored, padding completed, a `data:` URL only with `;base64`, every other
+  character, or an empty file, refused before the quote), `safe_filename`.
 - `artifacts.py`: `LocalArtifactStore` (TTL disk, HMAC-signed links, `delete()`, and a
   request-path sweep at most once a minute) and `GcsArtifactStore` (also deletes expired blobs;
   a bucket-listing sweep at most every 6 h catches blobs a restart orphaned, and the bucket's
@@ -89,24 +102,37 @@ Module docstrings explain the why; read the one you are about to change.
   The budget: `put()` makes room before storing and refuses instead (413 over the whole budget,
   503 `busy` when room needs a protected artifact); `track_puts`/`outputs_of` keep a paid call's
   outputs provisional until `commit()` or `discard_withheld()`; `hold()` pins what a running
-  call reads; `MIN_RESIDENCY_S` (10 min) protects a freshly delivered local output.
+  call reads. A local output lives until its `expires_at`: capacity evicts only expired ones,
+  and a `busy` refusal's hint (and `details.retry_after_s`) says when enough will have expired
+  (`MIN_RESIDENCY_S` is gone). On GCS eviction drops only the cache.
 - `service.py`: `Service`, the **one** implementation of every operation, used by REST and MCP.
   `_job()` holds a job slot and `store.hold()` from before any input is fetched; all URL and
-  base64 inputs of a call share one `max_input_bytes` budget; `convert_upload` copies an upload
-  inside the slot; `_execute` runs every engine call (inspect and preview too) in the child.
-  `query` takes a map of table names (`data` + up to 7 joined artifacts) for one query price.
+  base64 inputs of a call share one `max_input_bytes` budget; a queued call gives up after
+  `queue_wait_s`; `convert_upload` copies an upload into the convert's own work directory, inside
+  the slot (an empty one is refused); `_execute` runs every engine call (inspect and preview
+  too) in the child, its work directory counted toward the cap. `query` takes a map of table
+  names (`data` + up to 7 joined artifacts) for one query price. Before the quote:
+  `check_input`, `check_parquet_input` (inline bytes that cannot be Parquet, for inspect and
+  preview), `check_query` (with `check_tables`, which `query` runs too).
 - `payments/`: `pricing.py` (`OPERATIONS`, the single source of prices, routes and tool names;
   `usd_to_atomic`), `__init__.py` (`Payments`: x402 resource server, REST route configs with the
   Bazaar extension, lazy facilitator init, price-floor check; `http_middleware(prevalidate=,
   store=)` commits or deletes a paid call's outputs from its final status), `mcp_gate.py` (x402
   for MCP tool calls, same commit or delete), `bazaar.py` (catalog examples).
 - `mcp/server.py`: `build_mcp(...)`, the tools and their descriptions (the whole interface an
-  agent sees). Remote mode takes `url`/`content_base64`/`artifact_id`; local mode adds `path`.
-  `argument_checker` validates tool arguments before the gate quotes a price.
+  agent sees). Remote: `convert_to_parquet` takes `url`/`content_base64`/`artifact_id`, every
+  other tool `url`/`artifact_id`. Local: convert takes `path`/`url`/`content_base64`, the others
+  `path`/`url`. A refusal's hint names only the calling tool's inputs (`SourceRef.takes`).
+  `argument_checker` validates tool arguments before the gate quotes a price, and refuses an
+  argument the tool does not declare (the SDK would drop it silently).
 - `api/`: `app.py` (`create_app`; routes, OpenAPI `x-payment-info`, middleware order;
-  `_body_check` and `_form_check` refuse a request that can only fail before the 402),
-  `middleware.py` (access log, rate limit, body limit, `FormPeekMiddleware`: reads up to 1 MiB of
-  an upload form before the payment middleware, then replays it unchanged), `discovery.py`
+  `_body_check` and `_form_check` refuse a request that can only fail before the 402;
+  `InternalErrorMiddleware`, inside the body limit and outside the x402 middleware, makes any
+  other exception the typed 500, never settled), `middleware.py` (access log, rate limit, body
+  limit, `FormPeekMiddleware`: reads up to 1 MiB of an upload form before the payment
+  middleware, and a field still open there to its end, applying Starlette's form limits (1 MiB a
+  field, 1000 fields, 1000 files) and noting empty file parts, then replays it unchanged),
+  `discovery.py`
   (`/llms.txt`, server card, pricing, `retention_policy()`: the one data-retention statement),
   `schemas.py`.
 - `cli.py`: `serve`, `mcp`, `convert`, `inspect`.
@@ -213,8 +239,12 @@ more; "tamper-proof via quantum kernels" is not a real technique and must not be
 - **Decompression is streamed against caps**; zips are checked from the central directory
   before inflating. Every parse of a caller's file, caller Parquet included (inspect, preview,
   query), runs in the forkserver child with a deadline and a memory cap. The cap is the parent's
-  RSS watchdog: never `RLIMIT_AS`/`RLIMIT_DATA`, as a Linux child starts at about 2 GB virtual.
-  A child's unexpected exception is logged; the caller sees only its type.
+  watchdog on RSS plus the job's files (on Cloud Run `/tmp` is RAM): never
+  `RLIMIT_AS`/`RLIMIT_DATA`, as a Linux child starts at about 2 GB virtual. A child's unexpected
+  exception is logged by type and frames only (never its text: `retention_policy()` says logs
+  hold no file contents); the caller sees only its type.
+- **No server path in a reply.** Every caller-visible message built from exception text goes
+  through `errors.without_paths`.
 - **Secrets**: never read, print or commit `.env*` (except `.env.example`), `.wallets/`,
   `.local/`, `*.pem`, `*.key`. Check a secret by length (`${#NAME}`), never by value. The server
   holds no private keys; a paying test wallet's key stays on the client side with the user.
@@ -305,16 +335,20 @@ Each was a 200 for wrong data, a charge for nothing, or a bare 500. Paths are un
 each test's docstring has the incident.
 
 - **Charged for a link that dies, or for nothing.** An output over the whole artifact budget is
-  a 413 before it is stored; eviction spares unsettled outputs, fresh local ones
-  (`MIN_RESIDENCY_S`) and what a running call reads (`hold`; on GCS a join's second table
-  evicted its first), and when room needs one of those, `put()` is a 503 `busy` that evicts
-  nothing. Never add an eviction path that ignores `_provisional` or `_pins`. Withheld results
+  a 413 before it is stored; eviction spares unsettled outputs, unexpired local ones and what a
+  running call reads (`hold`; on GCS a join's second table evicted its first), and when room
+  needs one of those, `put()` is a 503 `busy` that evicts nothing. Never add an eviction path that ignores `_provisional` or `_pins`. Withheld results
   delete their outputs (invariant 8). (`unit/test_fix_money_artifacts.py`,
   `{unit,integration}/test_fix_money_capacity.py`, `integration/test_fix_money_withheld.py`)
 - **Quoting what cannot succeed** (invariant 7), and **capacity spent before the job slot** (the
-  slot is taken before any download or upload copy; one input budget per call).
-  (`integration/test_fix_money_gate.py`, `integration/test_fix_money_upload_check.py`,
-  `unit/test_fix_money_form_peek.py`, `unit/test_fix_money_service.py`)
+  slot is taken before any download or upload copy; one input budget per call). Refused before
+  the quote: undecodable or empty `content_base64`, inline bytes that cannot be Parquet sent to
+  inspect, preview or query, URLs that can never be fetched, short SQL that is not one SELECT,
+  forms past Starlette's limits or with an empty file part, MCP arguments a tool does not
+  declare. (`integration/test_fix_money_gate.py`, `integration/test_fix_money_upload_check.py`,
+  `unit/test_fix_money_form_peek.py`, `unit/test_fix_money_service.py`,
+  `integration/test_final_validate_*.py`, `integration/test_final_integrate_empty_upload.py`,
+  `integration/test_final_integrate_mcp_unknown_args.py`)
 - **Host paths readable from SQL** through DuckDB settings. (`unit/test_fix_money_duck.py`)
 - **Numbers in the wrong convention** ('1.5' as 15 in an EU column, '1.234' as 1.234 in a
   semicolon file). Casts are gated on the style's own pattern (`_style_fit`; never `TRY_CAST` an
@@ -353,7 +387,9 @@ each test's docstring has the incident.
   before `%PDF-` is still a PDF. (`unit/test_fix_pdf_reader.py`, `unit/test_fix_pdf_detect.py`)
 - **One job taking the instance down** (a 1.6 KB PDF reached 2 GB in 15 s): the RSS watchdog,
   the per-job temp directory (it holds a query's linked inputs: RAM on Cloud Run), and crash text
-  kept out of responses. (`integration/test_isolate.py`)
+  kept out of responses. (`integration/test_isolate.py`) The cap counts the job's temporary
+  files: a 1.5 MB gzip CSV wrote 500 MB into the work directory while RSS alone stayed under it.
+  (`integration/test_final_isolate_disk.py`, `integration/test_final_integrate_stream_cap.py`)
 
 Known gaps: ISO date formats accept 1-digit years ('1/2/3' becomes 0001-02-03); JSON timestamps
 that all carry offsets become naive UTC with no note; DuckDB's `memory_limit` (1 GB) is above the
