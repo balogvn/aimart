@@ -69,6 +69,25 @@ class AimartError(Exception):
         return {"error": body}
 
 
+class InternalError(AimartError):
+    """An unexpected failure, a bug rather than the caller's input: the one 500 every path gives.
+
+    Only the exception's type goes out (its text can quote server paths or the caller's data).
+    The hint came in two versions: an isolated job's crash said "Retry; if it persists, report
+    it." without the "You were not charged." that the REST and MCP backstops said, for the same
+    unsettled call.
+    """
+
+    code = "internal_error"
+    http_status = 500
+    HINT: ClassVar[str] = "Retry; if it persists, report it. You were not charged."
+
+    @classmethod
+    def of(cls, type_name: str) -> InternalError:
+        """The error for an unexpected exception of type ``type_name``."""
+        return cls(f"Internal error ({type_name}).", hint=cls.HINT)
+
+
 class InvalidRequest(AimartError):
     code = "invalid_request"
     http_status = 400

@@ -42,7 +42,7 @@ def test_child_error_keeps_type_code_hint_and_details() -> None:
 def test_unexpected_exception_is_an_internal_error(caplog: pytest.LogCaptureFixture) -> None:
     with pytest.raises(errors.AimartError) as info:
         run_isolated(helpers.raise_value_error, timeout_s=30)
-    assert type(info.value) is errors.AimartError
+    assert type(info.value) is errors.InternalError
     assert info.value.http_status == 500
     # The exception's text can carry server paths and caller data: the caller sees its type,
     # and the log its type and frames (test_final_isolate_logs.py), never its text.

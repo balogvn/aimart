@@ -49,6 +49,7 @@ from aimart_parquet.errors import (
     AimartError,
     Busy,
     InputTooLarge,
+    InternalError,
     InvalidInput,
     InvalidRequest,
     Timeout,
@@ -183,7 +184,7 @@ class _InputBudget:
         )
 
 
-def internal_error(exc: BaseException, **context: Any) -> AimartError:
+def internal_error(exc: BaseException, **context: Any) -> InternalError:
     """The typed 500 for an exception that is not an ``AimartError``, logged without its text.
 
     The text can quote server paths or the caller's data, so the caller gets only the type and
@@ -198,10 +199,7 @@ def internal_error(exc: BaseException, **context: Any) -> AimartError:
         "internal error",
         extra={"error_type": type(exc).__name__, "frames": frames[-30:], **context},
     )
-    return AimartError(
-        f"Internal error ({type(exc).__name__}).",
-        hint="Retry; if it persists, report it. You were not charged.",
-    )
+    return InternalError.of(type(exc).__name__)
 
 
 class Service:

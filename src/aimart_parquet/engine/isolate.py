@@ -334,6 +334,4 @@ def run_isolated[T](
     # Neither the caller nor the log gets an unexpected exception's text: it can carry server
     # paths (the caller) and a column name or cell value (the log; see _where).
     log.error("isolated job crashed: %s", message[2])
-    raise errors.AimartError(
-        f"Internal error ({message[1]}).", hint="Retry; if it persists, report it."
-    )
+    raise errors.InternalError.of(message[1])
