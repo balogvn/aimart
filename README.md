@@ -238,10 +238,15 @@ must be switched on explicitly by the operator. See [docs/payments.md](docs/paym
 Any of these can also arrive gzip-, bz2- or zip-compressed. Detection uses magic bytes before
 extensions. Every column in the report carries its type, null count, rejected values with
 examples, and notes on anything the service assumed: "assumed day-first", "ambiguous
-thousands/decimal separator; assumed a decimal comma, so '1.234' is 1234", "values without a
+thousands/decimal separator; assumed a decimal comma, so '1.234' is 1234" (the column's own
+values decide, then the file's other number columns, then the delimiter), "values without a
 UTC offset were read as UTC (k of n)", "values with a UTC offset were rejected (k of n)" or
-"converted to UTC". Report warnings say when nested JSON keys that differ only by case were
-renamed (`a.K is now a.K_2`) or title lines above a PDF table were dropped. `expected_schema`
+"converted to UTC", and "zone 'BST' was not read as a zone (k of n)" for a zone abbreviation
+with several meanings (BST, IST, CST, ...; only offsets, UTC, IANA names and GMT, EST, MST,
+HST and JST are read). Report warnings say when nested JSON keys that differ only by case were
+renamed (`a.K is now a.K_2`), title lines above a PDF table (or atop each of its pages) were
+dropped, or a PDF table has no header row (its columns are then `column_1`, `column_2`, ...;
+`header=true` reads its first row as names). `expected_schema`
 with `strict` turns the conversion into a validation step. The full option list is in the
 `ConvertOptions` schema (`/openapi.json`, or the tool's input schema), and the notes are listed
 in the [agents guide](docs/agents-guide.md#3-convert).

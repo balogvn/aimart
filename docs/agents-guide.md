@@ -73,8 +73,10 @@ conversion understood the file:
 
 Notes and warnings name what the service had to assume. Look for these in particular:
 
-- **Numbers.** The convention is decided for the whole column, and the file's delimiter breaks
-  a tie. A value written in the other convention is a counted reject, never a wrong number.
+- **Numbers.** The convention is decided for the whole column; the file's other number
+  columns, then its delimiter, break a tie (`398.53` elsewhere in a semicolon file makes
+  `1.234` 1.234; with no such evidence a semicolon file reads it as 1234). A value written in
+  the other convention is a counted reject, never a wrong number.
   When a value reads both ways, the column says which way it was read, with an example:
   `ambiguous thousands/decimal separator; assumed a decimal comma, so '1.234' is 1234 (infer_types=false keeps the original text)`
   (or `a decimal point`).
@@ -83,13 +85,26 @@ Notes and warnings name what the service had to assume. Look for these in partic
   `values without a UTC offset were read as UTC (k of n)`. Where most values carry none, the
   offset values are rejects: `values with a UTC offset were rejected (k of n): most values have none, and dropping the offset would shift the time`.
   An `expected_schema` cast to a naive `date` or `timestamp` notes
-  `values with a UTC offset were converted to UTC (k of n)`.
+  `values with a UTC offset were converted to UTC (k of n)`. A zone is read only when it has
+  one meaning: an offset (`+01:00`) or `Z`, `UTC` with whole hours, an IANA name
+  (`Europe/London`, `EST5EDT`), or GMT, EST, MST, HST and JST, read as their fixed offsets.
+  Any other name is not read; its values are rejects (or the column stays text) with
+  `zone 'BST' was not read as a zone (k of n): abbreviations such as BST, IST or CST name several zones, and DuckDB reads BST as Asia/Dhaka; write a UTC offset (+01:00) or a zone name (Europe/London)`.
 - **JSON.** Nested keys that differ only by letter case (`k` and `K`) are kept apart by
   renaming, with a warning such as
   `renamed 1 nested key whose values would otherwise have been lost (...): a.K is now a.K_2`.
 - **PDF.** Lines above a table's header are dropped and listed:
-  `dropped 1 line(s) above the header: 'Sales by region'`. Tables merged across pages, and the
-  table chosen when there are several, are reported too.
+  `dropped 1 line(s) above the header: 'Sales by region'`. So is a running line atop each
+  continuation page ('Ledger p2', 'Table 1 (continued)'), counted once a page and shown once:
+  `dropped 3 line(s) above the header: 'Ledger p1'; 'Ledger p2'; 'Ledger p3'`. A line atop a
+  later page that may be another table's header or title is not dropped: that page is a table
+  of its own, reported as `found 2 tables; ...`. Tables merged across pages
+  (`merged a table that continues across 3 pages`), and the table chosen when there are
+  several, are reported too, and the last one or two rows of a table alone on its last page
+  are read too. `header` applies to PDFs. A table with no header row keeps its first row:
+  `no header row: the first row is data, so the columns are named column_1 to column_N; pass header=true if it holds the column names`.
+  A header of numbers or dates is kept as names, with
+  `the header row ('Account', '4000', '5000') holds numbers or dates as the data does; pass header=false if it is the first data row`.
 
 If something looks wrong, convert again with options: `sheet`, `delimiter`, `header`,
 `encoding`, `date_order`, `json_records_path`, `flatten_nested`, `null_values`, or

@@ -71,7 +71,8 @@ Module docstrings explain the why; read the one you are about to change.
   transcoding), `duck.py` (sandboxed DuckDB; `NOWHERE` for every `$HOME`-derived setting),
   `readers/` (delimited, jsonish, excel, statistical, columnar, pdf; the `READERS` map is in
   `convert.py`), `infer.py` (type ladder in SQL; the number convention is decided per column,
-  and text with a zone only ever becomes TIMESTAMPTZ), `names.py`, `convert.py` (pipeline,
+  then by the file's other number columns, then by the dialect; text with a zone only ever
+  becomes TIMESTAMPTZ; constant lists go through `_one_of`, never `IN`), `names.py`, `convert.py` (pipeline,
   `expected_schema`, report), `writer.py` (DuckDB `COPY` by default, pyarrow when labels exist),
   `inspect.py` (footer-only stats), `tabular.py` (preview and SELECT-only query: inputs are views
   over DuckDB's own Parquet reader (`_native_view`), long cells are cut inside DuckDB, rows are
@@ -353,13 +354,27 @@ each test's docstring has the incident.
 - **Numbers in the wrong convention** ('1.5' as 15 in an EU column, '1.234' as 1.234 in a
   semicolon file). Casts are gated on the style's own pattern (`_style_fit`; never `TRY_CAST` an
   unmatched value: DuckDB reads '1_000' as 1000), the convention is decided per column
-  (`TypeInferrer._text_style`), the dialect breaks ties, and every ambiguous choice adds a note.
-  (`unit/test_fix_infer_numbers.py`, `unit/test_roundtrip_property.py`)
+  (`TypeInferrer._text_style`), then by the file's other number columns
+  (`TypeInferrer._decimal_comma`: '398.53' in a semicolon file is a decimal point, not 398,530),
+  then by the dialect, and every ambiguous choice adds a note. (`unit/test_fix_infer_numbers.py`,
+  `unit/test_roundtrip_property.py`, `unit/test_final_data_decimals.py`)
 - **Offsets dropped, zones carried over.** DuckDB's TIMESTAMP cast drops offsets; its
   TIMESTAMPTZ cast carries a zone name ('09:00 EST') to later naive values in the same 2048-row
   vector. Zoned text is read only as TIMESTAMPTZ, in CASE branches no naive row takes
   (`_has_zone`, `_zoned_ts`, `_instant`). A time past year 9999 is an unknown range in inspect
   and a 422 in preview and query. (`unit/test_fix_infer_timestamps.py`, `unit/test_inspect.py`)
+- **Zones misread by ICU.** ICU resolves an abbreviation through legacy Java IDs: 'BST' is
+  Asia/Dhaka, 'MST' Phoenix (summer time in 1967), and a UK log came back with every summer
+  instant five hours early, a 200 with no note. A zone is only an
+  offset or `Z`, UTC with whole hours, an IANA name (US POSIX forms such as `EST5EDT`
+  included), or a `ZONE_ABBREVIATIONS` entry (GMT, EST, MST, HST, JST), rewritten to its offset
+  before the cast. BST, IST, CST, PST, CET and the like are counted rejects, or the column stays
+  text, with the `unread_zone_note`. (`unit/test_final_data_zones.py`)
+- **No `IN (...)` over constants in generated SQL.** DuckDB plans `IN` over five or more
+  constants as a MARK hash join: 6-12 MB each, so a 100-row CSV with 30 date columns ran out of
+  memory (a 500), and past one 122,880-row group rows were written out of source order. Use
+  `infer._one_of` (`list_contains`). (`unit/test_final_data_wide_and_order.py`, whose EXPLAIN
+  test fails on any join in a column expression)
 - **`expected_schema` rewriting values.** Scale 0 is not "unset" (check `is None`), a decimal
   never rounds and a bool is only 0 or 1 (else a counted reject), a column declared string keeps
   its text, and `strict` counts values inference nulled. (`unit/test_fix_infer_schema.py`)
@@ -382,9 +397,23 @@ each test's docstring has the incident.
   32 hops (`PDFObjRef.resolve`, patched at import); metadata and page labels are never resolved;
   `pdf_pages` is clamped to the page count before iterating. (`unit/test_fix_pdf_reader.py`)
 - **PDF tables read wrong.** The header is the row naming the most typed columns (the topmost of
-  equals: "widest row" and "narrower than the body" both shipped bugs); lines above it are
-  dropped and reported; continuations are merged before the usable-table filter; a BOM or junk
-  before `%PDF-` is still a PDF. (`unit/test_fix_pdf_reader.py`, `unit/test_fix_pdf_detect.py`)
+  equals: "widest row" and "narrower than the body" both shipped bugs), and never a data row: a
+  first row written like the body is data, the columns are `column_1`.. and a warning says to
+  pass `header=true`. Lines above it are dropped and reported (a running title once a page,
+  each line shown once); continuations are merged before the usable-table filter; a BOM or junk
+  before `%PDF-` is still a PDF. A line atop a continuation page is dropped as a running title
+  only on evidence that it is this table's: it says 'continued', it repeats the line dropped
+  above page 1, or it names its page under a header row. It is body when it is a pending row or
+  a section row (text in at most half the cells; see `_continuation`). A line that may be a new
+  table's header (it names every typed column or fills more than half the cells) is a running
+  title only when it repeats the line dropped above page 1: page labels ('P02', 'P5') and
+  'Cont.' inside a header are column names. Anything else splits the page off ('found N
+  tables'): a split is a reported partial result, a different table merged in is silent wrong
+  data. The last one or two rows of a borderless table, alone on its last page, are read at the
+  previous page's column edges and kept only when they look like body.
+  (`unit/test_fix_pdf_reader.py`, `unit/test_fix_pdf_detect.py`, `unit/test_final_data_pdf.py`,
+  `unit/test_final_data_pdf_next_page.py`, `unit/test_final_data_pdf_page_tops.py`,
+  `unit/test_final_data_pdf_header_lines.py`)
 - **One job taking the instance down** (a 1.6 KB PDF reached 2 GB in 15 s): the RSS watchdog,
   the per-job temp directory (it holds a query's linked inputs: RAM on Cloud Run), and crash text
   kept out of responses. (`integration/test_isolate.py`) The cap counts the job's temporary
@@ -393,7 +422,13 @@ each test's docstring has the incident.
 
 Known gaps: ISO date formats accept 1-digit years ('1/2/3' becomes 0001-02-03); JSON timestamps
 that all carry offsets become naive UTC with no note; DuckDB's `memory_limit` (1 GB) is above the
-700 MB job cap, so the watchdog can stop a job before DuckDB would spill. (The 422 for a time past
+700 MB job cap, so the watchdog can stop a job before DuckDB would spill. In PDFs, a different
+table after a table's last row on a continuation page is appended to it (strict xfail
+`unit/test_final_data_pdf_next_page.py::test_a_different_table_after_the_last_row_is_not_appended`:
+its only sign, a row naming every typed column, is also what a first suppressed row such as
+'Area5', 'x', 'x' looks like), and a short one-cell title above a numeric header printed atop
+every page is taken as the header, the numeric header then a data row on each page (123 rows
+for 120; at 07fa450 too). (The 422 for a time past
 9999 in preview and query and the 413 for `read_csv` running out of memory are now tested, in
 `integration/test_final_isolate_gaps.py`.)
 
