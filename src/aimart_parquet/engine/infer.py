@@ -17,19 +17,23 @@ Correctness beats cleverness on purpose:
   ``NA`` may be Namibia, so text keeps it unless the caller lists it in ``null_values``.
 * When ``03/04/2025`` parses both ways and no value disambiguates, ``date_order`` decides and
   the report says so. Likewise ``1,234`` and ``1.234`` (thousands or decimals?): when no value
-  in the column settles it, the file's dialect decides (decimal comma in semicolon files) and
-  the report says so. The expected_schema cast of a text column decides the same way, for the
-  whole column, so a value never depends on whether inference left its column as text.
+  in the column settles it, the file's other number columns decide, then its dialect (decimal
+  comma in semicolon files), and the report says so. The expected_schema cast of a text
+  column decides the same way, for the whole column, so a value never depends on whether
+  inference left its column as text.
 * A decimal cast never rounds: a digit beyond the requested scale makes the value a reject.
 * A UTC offset is never dropped. DuckDB's ``TIMESTAMP`` cast silently discards it, so text
   with an offset or zone is only ever read as ``TIMESTAMPTZ``. And only such text: that cast
   reads a naive value in the zone named by an earlier row ('10:00' after '09:00 EST' is EST).
+* A zone is an offset, UTC, an IANA name or one of a few abbreviations with one meaning
+  (``ZONE_ABBREVIATIONS``), never what ICU makes of a name: it reads 'BST' as Asia/Dhaka.
+  Any other name makes the value a counted reject, or keeps the column text, with a note.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from aimart_parquet.engine.duck import ident, literal
 from aimart_parquet.engine.models import DateOrder
@@ -84,6 +88,32 @@ _RE_DATE_LIKE = (
 # A time followed by an explicit offset. Zero offsets ('Z', '+00:00', 'UTC') are why this exists:
 # _has_zone catches every other offset and zone name by comparing casts.
 _RE_TZ_SUFFIX = r".*\d:\d{2}(:\d{2}([.,]\d+)?)?\s*(Z|[+-]\d{2}(:?\d{2}){0,2}|UTC)"
+# Zone abbreviations read as times, each as the one offset it names, all year. ICU never reads
+# an abbreviation: it resolves them through legacy Java IDs and the rules of the zone it picks.
+# BST was Asia/Dhaka (+6, not British Summer Time), AST Alaska (not Atlantic), ART Cairo, NST
+# Auckland, ECT Paris, SST Guadalcanal, PST Los Angeles (-7 in July), MST Phoenix (-6 in July
+# 1967): a UK log came back with every summer instant five hours early, a 200 with no note.
+# Listed are only names with one meaning in data that ICU also reads as that one offset all
+# year (a test checks). CST is also China (Java prints it for Asia/Shanghai), IST is India,
+# Ireland and Israel, and ICU reads PST and CET with summer time: 'PST' in July is -7 to ICU
+# and -8 by its name, and data is written both ways. Any other name is not a zone: the value
+# is a counted reject, or the column stays text, and the report names it.
+ZONE_ABBREVIATIONS = {
+    "GMT": "+00:00",
+    "EST": "-05:00",
+    "MST": "-07:00",
+    "HST": "-10:00",
+    "JST": "+09:00",
+}
+# The zones a value may name after its time: an attached offset or 'Z' (DuckDB's own parser),
+# a listed abbreviation, UTC with whole hours (ICU cut 'UTC+05:30' to +05:00), or an IANA
+# name ICU reads with that zone's rules, as the name means: Area/City, or one of the US zones
+# in POSIX form (EST5EDT is America/New_York's rules, summer time included).
+_RE_KNOWN_ZONE = (
+    r".*\d(Z|[+-]\d{2}(:?\d{2}){0,2}|\s+(?i:UTC([+-]\d{1,2}(:?00)?)?|"
+    + "|".join(ZONE_ABBREVIATIONS)
+    + r"|EST5EDT|CST6CDT|MST7MDT|PST8PDT|[a-z_]+(/[a-z0-9_+-]+)+))"
+)
 
 _ISO = ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"]
 _DMY = ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%b-%Y", "%d %b %Y", "%d %B %Y"]
@@ -97,6 +127,19 @@ def _with_times(formats: list[str]) -> list[str]:
 
 def _fmt_list(formats: list[str]) -> str:
     return "[" + ", ".join(literal(f) for f in formats) + "]"
+
+
+def _one_of(expr: str, values: tuple[str, ...]) -> str:
+    """expr is one of the constants: never ``expr IN (...)`` in generated SQL.
+
+    DuckDB 1.5.6 plans ``IN`` over five or more constants as a MARK hash join against the list.
+    Each join held 6-12 MB however small the input, and the ladder repeats the null-token test
+    several times per column, so a 100-row CSV with 30 date columns ran out of memory in the
+    final COPY (a 500). The join also broke insertion order: once a file had more than one
+    122,880-row group, its rows were written out of source order, and preview offset 0 showed
+    row 122,881. ``list_contains`` is a plain function: no join, no reordering.
+    """
+    return f"list_contains({_fmt_list(list(values))}, {expr})"
 
 
 @dataclass
@@ -119,13 +162,29 @@ class _Exprs:
 
     @classmethod
     def build(cls, col: str, tokens: tuple[str, ...]) -> _Exprs:
-        token_list = ", ".join(literal(t) for t in tokens)
-        v = f"(CASE WHEN lower(trim({col})) IN ({token_list}) THEN NULL ELSE trim({col}) END)"
+        v = f"(CASE WHEN {_one_of(f'lower(trim({col}))', tokens)} THEN NULL ELSE trim({col}) END)"
         n = (
             f"regexp_replace(regexp_replace({v}, '^([+-]?)\\s*{_CURRENCY}\\s*', '\\1'), "
             f"'\\s*{_CURRENCY}$', '')"
         )
         return cls(v, n)
+
+    @classmethod
+    def projected(
+        cls, cols: list[str], tokens: tuple[str, ...], table: str
+    ) -> tuple[str, list[_Exprs]]:
+        """A FROM clause computing each column's v and n once, and the fragments naming them.
+
+        For the statistics queries only (a plan's expression runs over the raw table). Inlined,
+        v is planned again at every use, and the date rungs use it about 60 times a column:
+        planning alone took seconds for 30 date columns of 100 rows.
+        """
+        exprs = [cls.build(col, tokens) for col in cols]
+        select = ", ".join(
+            f"{e.v} AS {ident(f'v{i}')}, {e.n} AS {ident(f'n{i}')}" for i, e in enumerate(exprs)
+        )
+        names = [cls(ident(f"v{i}"), ident(f"n{i}")) for i in range(len(cols))]
+        return f"(SELECT {select} FROM {table})", names
 
 
 def _match(expr: str, pattern: str) -> str:
@@ -178,16 +237,25 @@ def _date_formats(order: DateOrder) -> tuple[list[str], list[str]]:
     return iso + _with_times(_DMY), iso + _with_times(_MDY)
 
 
+def _tz(v: str) -> str:
+    """Zoned text as an instant, with a listed abbreviation read as its offset, never by ICU."""
+    for name, offset in ZONE_ABBREVIATIONS.items():
+        v = f"regexp_replace({v}, {literal(rf'(\d)\s+(?i:{name})$')}, {literal(rf'\1{offset}')})"
+    return f"TRY_CAST({v} AS TIMESTAMPTZ)"
+
+
 def _has_zone(v: str) -> str:
-    """True for text carrying a UTC offset or zone name.
+    """True for text carrying a UTC offset or a zone name this module reads (_RE_KNOWN_ZONE).
 
     DuckDB's TIMESTAMP cast drops an offset without applying it ('10:00+05:00' and
     '10:00-08:00' both become 10:00, 13 hours apart made equal), and returns NULL for zone
-    names other than UTC; the TIMESTAMPTZ cast applies both.
+    names other than UTC; the TIMESTAMPTZ cast applies both. A zone name it reads but this
+    module does not ('09:30 BST', see ZONE_ABBREVIATIONS) has no zone here, and no naive
+    reading either: the value is NULL in every rung.
 
     The TIMESTAMPTZ cast of text must never see a value without a zone in the same call as
-    one with a zone name: a name such as 'EST' becomes the zone of every later naive value in
-    its 2048-row vector (DuckDB 1.5.6), so '10:00' after '09:00 EST' reads as 15:00 UTC.
+    one with a zone name: a name such as 'Asia/Tokyo' becomes the zone of every later naive
+    value in its 2048-row vector (DuckDB 1.5.6), so '10:00' after it reads as 01:00 UTC.
     Comparing it with the TIMESTAMP cast over the whole column took those naive values for
     zoned ones and shifted them, silently. So each CASE branch below casts a set that cannot
     leak: values the TIMESTAMP cast rejects (zone names, and junk that both casts reject; a
@@ -196,16 +264,32 @@ def _has_zone(v: str) -> str:
     DuckDB runs a CASE branch only on the rows that take it.
     """
     naive = f"TRY_CAST({v} AS TIMESTAMP)"
-    tz = f"TRY_CAST({v} AS TIMESTAMPTZ)"
     return (
-        f"(CASE WHEN {naive} IS NULL THEN {tz} IS NOT NULL "
-        f"ELSE {_match(v, _RE_TZ_SUFFIX)} OR {tz}::TIMESTAMP != {naive} END)"
+        f"(CASE WHEN {naive} IS NULL THEN {_match(v, _RE_KNOWN_ZONE)} AND {_tz(v)} IS NOT NULL "
+        f"ELSE {_match(v, _RE_TZ_SUFFIX)} OR TRY_CAST({v} AS TIMESTAMPTZ)::TIMESTAMP != {naive} END)"
+    )
+
+
+def _unread_zone(v: str) -> str:
+    """The zone name ending text that ICU would read as an instant and this module does not."""
+    return (
+        f"(CASE WHEN TRY_CAST({v} AS TIMESTAMP) IS NULL AND NOT {_match(v, _RE_KNOWN_ZONE)} "
+        f"AND TRY_CAST({v} AS TIMESTAMPTZ) IS NOT NULL THEN regexp_extract({v}, '\\S+$') END)"
     )
 
 
 def _zoned_ts(v: str) -> str:
     """Text with a zone as an instant; NULL for anything else, which the cast would misread."""
-    return f"(CASE WHEN {_has_zone(v)} THEN TRY_CAST({v} AS TIMESTAMPTZ) END)"
+    return f"(CASE WHEN {_has_zone(v)} THEN {_tz(v)} END)"
+
+
+def unread_zone_note(name: str, count: int, total: int) -> str:
+    """Said whenever values name a zone that has another meaning (ZONE_ABBREVIATIONS)."""
+    return (
+        f"zone '{name[:32]}' was not read as a zone ({count} of {total}): abbreviations such as "
+        "BST, IST or CST name several zones, and DuckDB reads BST as Asia/Dhaka; write a UTC "
+        "offset (+01:00) or a zone name (Europe/London)"
+    )
 
 
 def naive_as_utc_note(naive: int, total: int) -> str:
@@ -229,7 +313,7 @@ def _parse_ts(v: str, formats: list[str]) -> str:
 def _instant(v: str, formats: list[str]) -> str:
     """Text as an instant: a zone where it has one, UTC where it has none (say so in a note)."""
     return (
-        f"(CASE WHEN {_has_zone(v)} THEN TRY_CAST({v} AS TIMESTAMPTZ) "
+        f"(CASE WHEN {_has_zone(v)} THEN {_tz(v)} "
         f"ELSE timezone('UTC', {_parse_ts(v, formats)}) END)"
     )
 
@@ -250,15 +334,17 @@ class TypeInferrer:
         self.tokens = tuple(dict.fromkeys(DEFAULT_NULL_TOKENS + self.extra))
         self.date_order = date_order
         self.prefer_decimal_comma = prefer_decimal_comma
+        self._file_decimal_comma: bool | None = None
         self.dmy_formats, self.mdy_formats = _date_formats(date_order)
 
     # ------------------------------------------------------------------ public
     def text_plan(self, source: str) -> ColumnPlan:
         """Keep text, trimming whitespace; only '' and caller-listed tokens become null."""
         col = ident(source)
-        tokens = ("", *self.extra)
-        token_list = ", ".join(literal(t) for t in dict.fromkeys(tokens))
-        expr = f"(CASE WHEN lower(trim({col})) IN ({token_list}) THEN NULL ELSE trim({col}) END)"
+        tokens = tuple(dict.fromkeys(("", *self.extra)))
+        expr = (
+            f"(CASE WHEN {_one_of(f'lower(trim({col}))', tokens)} THEN NULL ELSE trim({col}) END)"
+        )
         return ColumnPlan(source=source, expr=expr, type_name="string")
 
     def plan(self, sources: list[str]) -> dict[str, ColumnPlan]:
@@ -278,12 +364,12 @@ class TypeInferrer:
     # ------------------------------------------------------------------ rungs
     def _plan_numeric_batch(self, sources: list[str]) -> dict[str, ColumnPlan]:
         aggs: list[str] = []
-        for s in sources:
-            e = _Exprs.build(ident(s), self.tokens)
+        table, exprs = _Exprs.projected([ident(s) for s in sources], self.tokens, self.table)
+        for e in exprs:
             m_int = _match(e.n, _RE_INT)
             aggs += [
                 f"count({e.v})",
-                f"count_if(lower({e.v}) IN ({', '.join(map(literal, TRUE_TOKENS + FALSE_TOKENS))}))",
+                f"count_if({_one_of(f'lower({e.v})', TRUE_TOKENS + FALSE_TOKENS)})",
                 f"count_if({_match(e.n, _RE_LEADING_ZERO)})",
                 f"count_if({m_int} AND length(regexp_replace({e.n}, '[^0-9]', '', 'g')) > 15)",
                 f"count_if({m_int})",
@@ -292,7 +378,7 @@ class TypeInferrer:
                 f"count_if({e.v} != {e.n})",
                 f"count_if({_match(f'lower({e.v})', _RE_DATE_LIKE)})",
             ]
-        row = self.con.sql(f"SELECT {', '.join(aggs)} FROM {self.table}").fetchone()
+        row = self.con.sql(f"SELECT {', '.join(aggs)} FROM {table}").fetchone()
         assert row is not None
         width = 12
         return {
@@ -308,11 +394,9 @@ class TypeInferrer:
             text.notes.append("all values empty")
             return text
         if n_bool == n:
-            true_list = ", ".join(map(literal, TRUE_TOKENS))
-            false_list = ", ".join(map(literal, FALSE_TOKENS))
             expr = (
-                f"(CASE WHEN lower({e.v}) IN ({true_list}) THEN true "
-                f"WHEN lower({e.v}) IN ({false_list}) THEN false END)"
+                f"(CASE WHEN {_one_of(f'lower({e.v})', TRUE_TOKENS)} THEN true "
+                f"WHEN {_one_of(f'lower({e.v})', FALSE_TOKENS)} THEN false END)"
             )
             return ColumnPlan(source, expr, "bool")
         if n_lead0 or n_long:
@@ -332,8 +416,8 @@ class TypeInferrer:
             return text
         winners = [style for style, fit in fits.items() if fit == top]
         style = winners[0]  # plain, then us: a decimal point unless the dialect says otherwise
-        if n_ambiguous and "eu" in winners and self.prefer_decimal_comma:
-            # '1,234' and '1.234' fit both conventions; a semicolon file writes decimal commas.
+        if n_ambiguous and "eu" in winners and self._decimal_comma():
+            # '1,234' and '1.234' fit both conventions; the file's other numbers decide.
             # Plain used to win outright, reading thousands '1.234' as 1.234 (1000x too small).
             style = "eu"
         rival = fits["us"] if style == "eu" else fits["eu"]
@@ -430,8 +514,8 @@ class TypeInferrer:
 
     def _plan_temporal_batch(self, sources: list[str]) -> dict[str, ColumnPlan]:
         aggs: list[str] = []
-        for s in sources:
-            v = _Exprs.build(ident(s), self.tokens).v
+        table, exprs = _Exprs.projected([ident(s) for s in sources], self.tokens, self.table)
+        for v in (e.v for e in exprs):
             dmy, mdy = _parse_ts(v, self.dmy_formats), _parse_ts(v, self.mdy_formats)
             aggs += [
                 f"count({v})",
@@ -440,19 +524,25 @@ class TypeInferrer:
                 f"count({mdy})",
                 f"count_if({dmy} IS DISTINCT FROM {mdy} AND {dmy} IS NOT NULL AND {mdy} IS NOT NULL)",
                 f"count_if(coalesce({dmy}, {mdy})::TIME != TIME '00:00:00')",
+                f"count({_unread_zone(v)})",
+                f"min({_unread_zone(v)})",
             ]
-        row = self.con.sql(f"SELECT {', '.join(aggs)} FROM {self.table}").fetchone()
+        row = self.con.sql(f"SELECT {', '.join(aggs)} FROM {table}").fetchone()
         assert row is not None
-        width = 6
+        width = 8
         return {
             s: self._decide_temporal(s, row[i * width : (i + 1) * width])
             for i, s in enumerate(sources)
         }
 
-    def _decide_temporal(self, source: str, stats: tuple[int, ...]) -> ColumnPlan:
-        n, n_tz, n_dmy, n_mdy, n_conflict, n_time = stats
+    def _decide_temporal(self, source: str, stats: tuple[Any, ...]) -> ColumnPlan:
+        n, n_tz, n_dmy, n_mdy, n_conflict, n_time, n_unread = (int(x or 0) for x in stats[:7])
+        unread = str(stats[7])
         v = _Exprs.build(ident(source), self.tokens).v
         text = self.text_plan(source)
+        if n_unread:
+            # Kept as text, or counted rejects: either way the report names the zone.
+            text.notes.append(unread_zone_note(unread, n_unread, n))
         tolerant = n >= MIN_ROWS_FOR_TOLERANCE
         if n and n_tz == n:
             return ColumnPlan(source, _zoned_ts(v), "timestamptz")
@@ -467,7 +557,7 @@ class TypeInferrer:
             total = base + count
             return total == n or (tolerant and total >= MIN_FIT * n)
 
-        notes: list[str] = []
+        notes: list[str] = list(text.notes)
         if self.date_order is DateOrder.MDY:
             order = "mdy" if fits(n_mdy) else None
         elif self.date_order in {DateOrder.DMY, DateOrder.YMD}:
@@ -510,10 +600,11 @@ class TypeInferrer:
         """The number convention of a text column ('us' or 'eu'), decided for the whole column.
 
         Values only one convention reads are the evidence ('1.5' and '1,234.5' have a decimal
-        point, '1,5' and '1.234,5' a decimal comma); the dialect breaks a tie, including the
-        tie of no evidence at all. Reading each value on its own, dialect first, made '1.234'
-        1234 in a semicolon file whose '1.5' and '2.75' prove dot decimals, while inference read
-        the same column as 1.234: the value depended on whether inference left it as text.
+        point, '1,5' and '1.234,5' a decimal comma); the file's convention (``_decimal_comma``)
+        breaks a tie, including the tie of no evidence at all, as it does in inference.
+        Reading each value on its own, dialect first, made '1.234' 1234 in a semicolon file
+        whose '1.5' and '2.75' prove dot decimals, while inference read the same column as
+        1.234: the value depended on whether inference left it as text.
         """
         e = _Exprs.build(ident(source), self.tokens)
         point, comma = _style_fit(e.n, "us"), _style_fit(e.n, "eu")
@@ -524,7 +615,43 @@ class TypeInferrer:
         point_only, comma_only = (int(row[0]), int(row[1])) if row else (0, 0)
         if point_only != comma_only:
             return "us" if point_only > comma_only else "eu"
-        return "eu" if self.prefer_decimal_comma else "us"
+        return "eu" if self._decimal_comma() else "us"
+
+    def _decimal_comma(self) -> bool:
+        """The file's convention for values that either one reads ('1,234', '16.469').
+
+        Decided once per file, before the delimiter: each number column (every value, or 98%,
+        fits a convention) votes for the convention of its values that only one convention
+        reads ('398.53', '0.250' and '1,234.5' have a decimal point, '12,5' and '1.234,5' a
+        decimal comma), and the dialect breaks a tie, including the tie of no evidence at
+        all. The delimiter alone read every '16.469' kg in a semicolon file as 16469, beside
+        a price of '398.53' in the same row that only a decimal point writes.
+        """
+        if self._file_decimal_comma is None:
+            texts = self.con.sql(f"SELECT * FROM {self.table} LIMIT 0")
+            sources = [c for c, t in zip(texts.columns, texts.types, strict=True) if t == "VARCHAR"]
+            votes = 0  # decimal comma minus decimal point
+            for start in range(0, len(sources), _BATCH):
+                aggs: list[str] = []
+                batch = [ident(s) for s in sources[start : start + _BATCH]]
+                table, exprs = _Exprs.projected(batch, self.tokens, self.table)
+                for e in exprs:
+                    point, comma = _style_fit(e.n, "us"), _style_fit(e.n, "eu")
+                    aggs += [
+                        f"count({e.v})",
+                        f"count_if({point} OR {comma})",
+                        f"count_if({point} AND NOT {comma})",
+                        f"count_if({comma} AND NOT {point})",
+                    ]
+                row = self.con.sql(f"SELECT {', '.join(aggs)} FROM {table}").fetchone()
+                assert row is not None
+                for i in range(0, len(aggs), 4):
+                    n, fit, point_only, comma_only = (int(x or 0) for x in row[i : i + 4])
+                    tolerant = n >= MIN_ROWS_FOR_TOLERANCE
+                    if n and (fit == n or (tolerant and fit >= MIN_FIT * n)):
+                        votes += (comma_only > point_only) - (point_only > comma_only)
+            self._file_decimal_comma = votes > 0 if votes else self.prefer_decimal_comma
+        return self._file_decimal_comma
 
     def cast_text(self, source: str, type_name: str, sql_type: str) -> str:
         """Best-effort cast of a text column to a caller-mandated type (expected_schema)."""
@@ -557,18 +684,16 @@ class TypeInferrer:
                 )
             return f"(CASE {whens} END)"
         if type_name == "bool":
-            true_list = ", ".join(map(literal, (*TRUE_TOKENS, "1")))
-            false_list = ", ".join(map(literal, (*FALSE_TOKENS, "0")))
             return (
-                f"(CASE WHEN lower({e.v}) IN ({true_list}) THEN true "
-                f"WHEN lower({e.v}) IN ({false_list}) THEN false END)"
+                f"(CASE WHEN {_one_of(f'lower({e.v})', (*TRUE_TOKENS, '1'))} THEN true "
+                f"WHEN {_one_of(f'lower({e.v})', (*FALSE_TOKENS, '0'))} THEN false END)"
             )
         formats = self.mdy_formats if self.date_order is DateOrder.MDY else self.dmy_formats
         if type_name in {"date", "timestamp"}:
             # An offset is applied (UTC, as a timestamptz column cast to timestamp is), never
             # dropped by the TIMESTAMP cast.
             parsed = (
-                f"(CASE WHEN {_has_zone(e.v)} THEN timezone('UTC', TRY_CAST({e.v} AS TIMESTAMPTZ)) "
+                f"(CASE WHEN {_has_zone(e.v)} THEN timezone('UTC', {_tz(e.v)}) "
                 f"ELSE {_parse_ts(e.v, formats)} END)"
             )
             return f"CAST({parsed} AS DATE)" if type_name == "date" else parsed

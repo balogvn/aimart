@@ -273,11 +273,14 @@ class TestShaping:
         assert pq.read_metadata(result.path).row_group(0).column(0).compression == codec
 
     def test_row_group_size(self, tmp_path) -> None:
-        text = "a\n" + "".join(f"{i}\n" for i in range(2500))
+        # 5000 rows, not 2500: DuckDB treats ROW_GROUP_SIZE as a target rounded to its 2048-row
+        # vectors, and its order-preserving COPY (two threads) writes a final batch under about
+        # 3000 rows as one group. 2500 rows made two groups only while a hash join in the column
+        # expressions disabled that COPY, the join that also wrote rows out of source order.
+        text = "a\n" + "".join(f"{i}\n" for i in range(5000))
         result = kit.convert_bytes(tmp_path, "a.csv", text, row_group_size=1000)
-        # DuckDB treats ROW_GROUP_SIZE as a target rounded to its 2048-row vectors.
         assert pq.read_metadata(result.path).num_row_groups >= 2
-        assert result.report.rows == 2500
+        assert result.report.rows == 5000
 
     def test_names_can_be_kept_verbatim(self, tmp_path) -> None:
         result = kit.convert_bytes(

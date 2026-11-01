@@ -387,8 +387,15 @@ def test_p2_years_are_names_only_where_the_body_is_not_years() -> None:
     title = ["Projects by year", ""]
     rows = [title, ["Start", "End"], ["2019", "2020"], ["2020", "2021"], ["2021", "2023"]]
     assert pdf_reader._split_captions(rows) == (rows[1:], ["Projects by year"])
-    repeated = [["Totals", "", ""], ["Region", "2024", "2024"], *_ROWS[1:5]]  # not distinct
-    assert pdf_reader._split_captions(repeated) == (repeated, [])
+    # Round 4: repeated years are names too (they repeat under a line grouping the columns,
+    # ('', 'Revenue', '', 'Income', '')). This row was data while only distinct years were
+    # names, and a different table under such a header merged into the one before it.
+    repeated = [["Totals", "", ""], ["Region", "2024", "2024"], *_ROWS[1:5]]
+    assert pdf_reader._split_captions(repeated) == (repeated[1:], ["Totals"])
+    # Under a column of years, years are data, repeated or not.
+    years = [["Built", "2019", "2019"], ["Unit1", "2001", "2001"], ["Unit2", "2002", "2003"]]
+    rows = [["Unit", "Started", "Done"], *years]
+    assert pdf_reader._split_captions(rows) == (rows, [])
 
 
 def _table_pdf(path: Path, rows: list[list[str]], *, bordered: bool, title: str = "") -> Path:
@@ -964,9 +971,9 @@ def test_p6_text_pass_stops_once_a_bordered_table_is_found(
     searched: list[int] = []
     aligned = pdf_reader._aligned_tables
 
-    def spy(page: Any, number: int) -> Any:
+    def spy(page: Any, number: int, *rest: Any) -> Any:
         searched.append(number)
-        return aligned(page, number)
+        return aligned(page, number, *rest)
 
     monkeypatch.setattr(pdf_reader, "_aligned_tables", spy)
     pdf = FPDF()
