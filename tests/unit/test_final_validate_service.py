@@ -131,3 +131,27 @@ async def test_check_query_checks_every_table_input(settings: Settings) -> None:
         service.check_query({"data": SourceRef(artifact_id=A), "t": SourceRef()}, "SELECT 1")
     with pytest.raises(AimartError, match="Only http and https"):
         service.check_query({"t": SourceRef(url="ftp://e.example/t")}, "SELECT 1")
+
+
+async def test_query_and_check_query_share_one_check_tables(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Integration review: query's head kept its own copy of check_query's table rules, held
+    # equal only by the test above. Both now call check_tables, the one source of those rules.
+    service = make_service(settings)
+    calls: list[str] = []
+
+    class Refused(Exception):
+        pass
+
+    def check_tables(tables: Any) -> None:
+        calls.append(",".join(tables))
+        raise Refused
+
+    monkeypatch.setattr(service, "check_tables", check_tables)
+    tables = {"data": SourceRef(artifact_id=A)}
+    with pytest.raises(Refused):
+        service.check_query(tables, "SELECT 1")
+    with pytest.raises(Refused):
+        await service.query(tables, "SELECT 1", limit=1, fmt="json")
+    assert calls == ["data", "data"]

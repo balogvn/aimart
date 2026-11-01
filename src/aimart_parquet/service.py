@@ -363,8 +363,12 @@ class Service:
                 f"Not a readable Parquet file: {reason}", hint="Convert the file first."
             )
 
-    def check_query(self, tables: Mapping[str, SourceRef], sql: str) -> None:
-        """The table map ``query`` takes, each table's input, and the SQL (when short)."""
+    def check_tables(self, tables: Mapping[str, SourceRef]) -> None:
+        """The table map itself: at least one table, at most ``MAX_QUERY_TABLES``, valid names.
+
+        ``query`` runs it first and ``check_query`` before the quote: the two held copies of
+        these rules, which a test had to pin to the same messages.
+        """
         if not tables:
             raise InvalidRequest(
                 "No tables to query.", hint="Pass an input; it is available as table `data`."
@@ -380,6 +384,10 @@ class Service:
                 f"Invalid table names: {bad}.",
                 hint="Use lowercase names of letters, digits and underscores, e.g. 'gl' or 'bank_2025'.",
             )
+
+    def check_query(self, tables: Mapping[str, SourceRef], sql: str) -> None:
+        """The table map ``query`` takes, each table's input, and the SQL (when short)."""
+        self.check_tables(tables)
         inline = {
             name: self.check_input(ref, table=None if name == "data" else name)
             for name, ref in tables.items()
@@ -662,21 +670,7 @@ class Service:
     async def query(
         self, tables: dict[str, SourceRef], sql: str, *, limit: int, fmt: OutputFormat
     ) -> TabularResult:
-        if not tables:
-            raise InvalidRequest(
-                "No tables to query.", hint="Pass an input; it is available as table `data`."
-            )
-        if len(tables) > MAX_QUERY_TABLES:
-            raise InvalidRequest(
-                f"{len(tables)} tables requested; the limit is {MAX_QUERY_TABLES}.",
-                hint="Join fewer files per query, or pre-aggregate them.",
-            )
-        bad = [name for name in tables if not TABLE_NAME.match(name)]
-        if bad:
-            raise InvalidRequest(
-                f"Invalid table names: {bad}.",
-                hint="Use lowercase names of letters, digits and underscores, e.g. 'gl' or 'bank_2025'.",
-            )
+        self.check_tables(tables)
         limit = max(1, min(limit, self.settings.max_query_rows))
         async with self._job():
             workdir = self._workdir()
