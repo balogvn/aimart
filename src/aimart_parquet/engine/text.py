@@ -17,7 +17,13 @@ from charset_normalizer import from_bytes
 from aimart_parquet.errors import InvalidRequest
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator
+    from contextlib import AbstractContextManager
     from pathlib import Path
+
+    from aimart_parquet.engine.safety import Readable
+
+    Opener = Callable[[], AbstractContextManager[Readable]]
 
 _CHUNK = 1024 * 1024
 _DETECT_SAMPLE = 2 * 1024 * 1024
@@ -30,20 +36,36 @@ class TextInfo:
     replaced_chars: int
 
 
-def _is_valid_utf8(path: Path) -> bool:
+def utf8_size(chunks: Iterable[bytes]) -> int | None:
+    """How many bytes ``chunks`` hold when they are all UTF-8; else None, read no further."""
     decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+    size = 0
     try:
-        with path.open("rb") as fh:
-            while chunk := fh.read(_CHUNK):
-                decoder.decode(chunk)
-            decoder.decode(b"", final=True)
+        for chunk in chunks:
+            decoder.decode(chunk)
+            size += len(chunk)
+        decoder.decode(b"", final=True)
     except UnicodeDecodeError:
-        return False
-    return True
+        return None
+    return size
 
 
-def _detect(path: Path) -> str:
-    with path.open("rb") as fh:
+def codec_name(encoding: str) -> str | None:
+    """The codec's own name for ``encoding`` ('utf-8' for 'UTF8'); None for one to_utf8 refuses."""
+    try:
+        return codecs.lookup(encoding).name
+    except LookupError:
+        return None
+
+
+def _chunks(read: Opener) -> Iterator[bytes]:
+    with read() as fh:
+        while chunk := fh.read(_CHUNK):
+            yield chunk
+
+
+def _detect(read: Opener) -> str:
+    with read() as fh:
         sample = fh.read(_DETECT_SAMPLE)
     if sample.startswith((b"\xff\xfe", b"\xfe\xff")):
         return "utf-16"
@@ -99,7 +121,7 @@ def _plausible_cp1252(sample: bytes) -> bool:
     return sum(ch in _CP1252_TEXT for ch in non_ascii) / len(non_ascii) >= 0.95
 
 
-def _transcode(src: Path, dst: Path, encoding: str) -> int:
+def _transcode(read: Opener, dst: Path, encoding: str) -> int:
     """Transcode to UTF-8; returns how many undecodable characters became U+FFFD.
 
     Counting U+FFFD in the output is exact for every single-byte source encoding (none of them
@@ -107,7 +129,7 @@ def _transcode(src: Path, dst: Path, encoding: str) -> int:
     """
     replaced = 0
     decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
-    with src.open("rb") as fin, dst.open("w", encoding="utf-8", newline="") as fout:
+    with read() as fin, dst.open("w", encoding="utf-8", newline="") as fout:
         while chunk := fin.read(_CHUNK):
             text = decoder.decode(chunk)
             replaced += text.count("�")
@@ -118,8 +140,22 @@ def _transcode(src: Path, dst: Path, encoding: str) -> int:
     return replaced
 
 
-def to_utf8(path: Path, workdir: Path, forced_encoding: str | None = None) -> TextInfo:
-    """Return a UTF-8 version of ``path`` (the same path when it already is UTF-8)."""
+def to_utf8(
+    path: Path,
+    workdir: Path,
+    forced_encoding: str | None = None,
+    *,
+    replace: bool = False,
+    opener: Opener | None = None,
+) -> TextInfo:
+    """Return a UTF-8 version of ``path`` (the same path when it already is UTF-8).
+
+    With ``replace``, for a caller that owns ``path``, the UTF-8 version takes its place: a
+    cp1252 export unpacked from a gzip upload otherwise sat on Cloud Run's RAM disk twice.
+    ``opener`` reads the text where it is not ``path``'s own bytes: a gzip's
+    (safety.open_gzip), which is then never unpacked, only its UTF-8 version written.
+    """
+    read: Opener = opener or (lambda: path.open("rb"))
     if forced_encoding:
         try:
             codecs.lookup(forced_encoding)
@@ -131,10 +167,12 @@ def to_utf8(path: Path, workdir: Path, forced_encoding: str | None = None) -> Te
         if codecs.lookup(forced_encoding).name == "utf-8":
             return TextInfo(path, "utf-8", 0)
         encoding = forced_encoding
-    elif _is_valid_utf8(path):
+    elif utf8_size(_chunks(read)) is not None:
         return TextInfo(path, "utf-8", 0)
     else:
-        encoding = _detect(path)
+        encoding = _detect(read)
     dst = workdir / "utf8.txt"
-    replaced = _transcode(path, dst, encoding)
+    replaced = _transcode(read, dst, encoding)
+    if replace:
+        dst = dst.replace(path)
     return TextInfo(dst, codecs.lookup(encoding).name, replaced)

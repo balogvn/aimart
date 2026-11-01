@@ -281,6 +281,15 @@ each pinned in `tests/unit/test_fix_csv_memory.py`:
 - **DuckDB's 1 GB limit sat above the 700 MB cap**, so a sort was killed before it could spill.
   `Limits.from_settings` holds DuckDB under the cap and caps spill files, which are RAM on
   Cloud Run.
+- **The input outlived the read on that RAM disk**: the decompressed text, a copy of every
+  upload and a UTF-8 copy stayed to the end of the job (777 MiB of files for a 446 MiB CSV,
+  1.25 GiB with `sort_by`). `unwrap` hands the reader a file of the pipeline's own (a hard link
+  for an uncompressed input), the UTF-8 version replaces it, and `convert_file` deletes it.
+- **A gzip of CSV/TSV is never unpacked**: DuckDB reads it (`keep_gzip`), and other text is
+  transcoded from the stream. DuckDB 1.5 does not check a member's CRC or length (a truncated
+  or corrupt file reads as far as it inflates) and refuses FTEXT, FHCRC, FCOMMENT and the zero
+  padding Python skips, so `safety.gzip_chunks` lets it read only members that both read the
+  same way, and counts them against the bomb cap; anything else is unpacked as before.
 
 ## Agent tooling
 

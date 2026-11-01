@@ -251,8 +251,12 @@ conversion into a validation step. The full option list is in the `ConvertOption
 Over a limit the call fails (413 for size and memory, 504 for time), unpaid. CSV memory no
 longer grows with the file: the text is staged as compressed Parquet instead of loaded into a
 table, so a 446 MiB CSV peaks at about 220 MB (it took 1.2 GB, and CSVs above ~200 MB were
-refused). `sort_by` sorts the whole file and spills to disk past 400 MiB. On the hosted
-service those files live in RAM as well, so file size and concurrency share one 2 GiB budget;
+refused). `sort_by` sorts the whole file and spills to disk past 400 MiB. A gzip CSV or TSV
+is never unpacked, so a job's files stay near the upload plus two thirds of the CSV (the staged
+text and the output), 1.2x if it is not UTF-8. A bz2 or zip CSV is unpacked: its files peak
+while the text is read, at the upload plus about 1.2x the decompressed CSV (2x for one that is
+not UTF-8), and the text is deleted as soon as it is read. On the hosted service those files
+live in RAM as well, so file size and concurrency share one 2 GiB budget;
 [deploy/README.md](deploy/README.md#memory-capacity-what-one-2-gib-instance-converts) has the
 numbers.
 

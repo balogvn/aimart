@@ -332,7 +332,7 @@ on it.
 | API process, forkserver | ~250 MB each |
 | a job's process | ≤ 700 MB. A CSV conversion measured 210-370 MB whatever the file size; with `sort_by`, ~520 MB |
 | DuckDB inside a job | limit = the job cap minus 300 MB (400 MiB), so sorts spill instead of being killed; spill cap = the job cap (700 MiB) |
-| a job's files in `/tmp` | the upload (≤ 50 MB) + the decompressed text (≤ 512 MB) + a second, UTF-8 copy when the input was not UTF-8 + the staged text (18-31% of the CSV) + the output (20-33%) + spill (`sort_by` only: 418 MiB for a 446 MiB CSV) |
+| a job's files in `/tmp` | the upload (≤ 50 MB). A gzip of CSV or TSV is never unpacked: DuckDB reads UTF-8 from it, and other text is transcoded from it, its UTF-8 version (≤ 512 MB) on disk while it is read. A bz2 or zip is unpacked (≤ 512 MB), plus a UTF-8 copy while one that is not UTF-8 is transcoded, which then replaces it. Then the staged text (18-31% of the CSV) and the output (20-33%); the text is deleted once read. Spill: `sort_by` only, about 420 MiB for a 446 MiB CSV |
 | stored artifacts without a bucket | ≤ `AIMART_ARTIFACT_MAX_TOTAL_BYTES` (256 MiB) |
 
 Measured in-process on macOS (Linux, where production runs, was not measured), `main` at e8d228e
@@ -345,17 +345,42 @@ against the staged reader, peak resident memory:
 | 135 MiB, 40 short columns | 901-963 MiB | 353-368 MiB | 53.6 → 7.0 |
 | 446 MiB with `sort_by` | 1.16 GiB | 518 MiB (+ 418 MiB spill) | |
 
+And the files in the job's directory at their peak, sampled every 5 ms the same way (the upload
+lives in a directory of its own and is not counted), 0233294 against now:
+
+| CSV (decompressed), as uploaded | before | now | the peak now |
+|---|---|---|---|
+| 198 MiB, gzip (71 MiB) | 345 MiB | 76 MiB | while it is written (staged text and output) |
+| 198 MiB, bz2 / zip | 325 / 345 MiB | 233 MiB | while the unpacked text is read |
+| 198 MiB cp1252, gzip | 544 MiB | 234 MiB | while its UTF-8 version is read |
+| 446 MiB, gzip (159 MiB) | 777 MiB | 172 MiB | while it is written |
+| 446 MiB, gzip, `sort_by` | 1251 MiB | 640 MiB | while the sort spills |
+| 20 MiB, uncompressed | 27 MiB | 8 MiB | (the input is a hard link to the upload) |
+
+Before, every compressed upload was unpacked, and the decompressed text, a copy of the upload
+and, for a non-UTF-8 file, a second UTF-8 copy all stayed to the end of the job. A gzip is now
+read by DuckDB after one Python pass counts it against the 512 MB cap and checks that DuckDB
+reads it as Python does (a gzip it might not is unpacked as before). CPU time and resident
+memory stayed the same within noise: 38.3 → 39.4 s and 216 → 228 MiB for the 446 MiB gzip.
+
 What that means for the default deploy (1 vCPU, 2 GiB, `AIMART_MAX_CONCURRENT_JOBS=2`); these
 are sums of the numbers above, not measurements of a live instance:
 
 - **The 50 MB upload cap binds first.** A file reaches the 512 MB decompressed cap only if it
   compresses about 10:1; the test files above compressed 2-2.5:1.
-- **One CSV at the 512 MB cap fits:** ~220 MB of process plus ~750 MB of files, next to ~500 MB
-  for the API and forkserver.
-- **Two at once fit up to about 250 MB each.** Two near 512 MB do not (~2.4 GB). Nothing refuses
-  the second one: the instance runs out of memory.
-- **`sort_by` near the cap is the worst case:** a 446 MiB sort peaks near 1.5 GB for its job
-  alone (process, input, staged text and spill), at the edge of the instance even on its own.
+- **One CSV at the 512 MB cap fits:** ~220 MB of process plus, for a gzip, ~250 MB of files
+  (upload, staged text and output; it was ~800 MB), next to ~500 MB for the API and
+  forkserver. A bz2 or zip still holds ~650 MB while its unpacked text is read.
+- **Two gzip CSVs at the cap fit**, just: ~2.0 GB with the largest measured process, staged
+  text and output (370 MB, 31%, 33%), ~1.45 GB for files like the 11-column one. Two bz2 or
+  zip CSVs fit up to about 300 MB each; two near 512 MB do not (~2.25 GB). Nothing refuses the
+  second one: the instance runs out of memory.
+- **A CSV that is not UTF-8 is on disk as its UTF-8 version while it is read:** a gzip like an
+  unpacked bz2 (~650 MB at the cap; two at once up to about 300 MB each). A bz2 or zip needs
+  twice its size while it is transcoded: ~1.1 GB at the cap, two at once up to about 200 MB.
+- **`sort_by` near the cap is the worst case:** a 446 MiB sort peaks near 1.3 GB for its job
+  alone (518 MiB of process while 640 MiB of staged text, spill and output, plus the upload),
+  down from ~1.8 GB. It fits on its own, not next to a second large job.
 - **Time is the next limit.** 39 CPU-seconds for 446 MiB on an Apple M-series core; Cloud Run's
   vCPU was not measured, and conversions stop at `AIMART_CONVERT_TIMEOUT_S` (120 s, unpaid).
 

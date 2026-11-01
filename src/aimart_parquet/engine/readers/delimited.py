@@ -13,18 +13,22 @@ memory then stays flat as files grow, where a loaded table grew with them.
 from __future__ import annotations
 
 import csv
+import gzip
 import io
 import re
 from collections import Counter
+from contextlib import closing
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING
 
 import duckdb
 
+from aimart_parquet.engine import safety
 from aimart_parquet.engine.duck import ident, literal
 from aimart_parquet.engine.models import InputFormat
 from aimart_parquet.engine.readers import RAW_TABLE, RawColumn, RawTable
-from aimart_parquet.engine.text import to_utf8
+from aimart_parquet.engine.text import TextInfo, codec_name, to_utf8, utf8_size
 from aimart_parquet.errors import InputTooLarge, InvalidInput
 
 if TYPE_CHECKING:
@@ -140,14 +144,46 @@ def detect_header(rows: list[list[str]], width: int) -> bool:
     return True
 
 
-def _read_sample(path: Path) -> tuple[str, bool]:
-    with path.open("rb") as fh:
+def _read_sample(path: Path, *, gzipped: bool = False) -> tuple[str, bool]:
+    with gzip.open(path, "rb") if gzipped else path.open("rb") as fh:
         data = fh.read(_SAMPLE_BYTES + 1)
     complete = len(data) <= _SAMPLE_BYTES
     text = data[:_SAMPLE_BYTES].decode("utf-8", errors="replace").removeprefix("\ufeff")
     if not complete and "\n" in text:
         text = text[: text.rfind("\n")]  # never score a half-read final line
     return text, complete
+
+
+def _gzip_text(
+    path: Path, workdir: Path, options: ConvertOptions, limits: Limits
+) -> tuple[TextInfo, int | None]:
+    """The text of the gzip ``path``, and its size where DuckDB is to read it from the gzip.
+
+    UTF-8 stays in the gzip: one pass counts it against the bomb cap (InputTooLarge, as unwrap's
+    copy does) and checks it, unless options.encoding says UTF-8 (to_utf8 would not check
+    either). Other text is transcoded from the stream: only its UTF-8 version is written. A gzip
+    DuckDB could read differently from Python, or an encoding to_utf8 refuses, is unpacked over
+    ``path`` first, as unwrap did, so its errors come in the same order.
+    """
+    encoding, cap = options.encoding, limits.max_decompressed_bytes
+    codec = codec_name(encoding) if encoding else "utf-8"
+    unpack = codec is None
+    if codec == "utf-8":
+        chunks = safety.gzip_chunks(path, cap)
+        try:
+            with closing(chunks):
+                size = sum(map(len, chunks)) if encoding else utf8_size(chunks)
+        except safety.GzipMismatch:
+            size, unpack = None, True
+        if size is not None:
+            return TextInfo(path, "utf-8", 0), size
+    if unpack:
+        unpacked = workdir / "decompressed"
+        safety.decompress_stream(path, unpacked, "gzip", cap)
+        unpacked.replace(path)
+        return to_utf8(path, workdir, encoding, replace=True), None
+    opener = partial(safety.open_gzip, path, cap)
+    return to_utf8(path, workdir, encoding, replace=True, opener=opener), None
 
 
 def read_delimited(
@@ -157,15 +193,23 @@ def read_delimited(
     options: ConvertOptions,
     fmt: InputFormat,
     limits: Limits,
+    *,
+    gzipped: bool = False,
 ) -> RawTable:
-    info = to_utf8(path, workdir, options.encoding)
+    """``gzipped``: ``path`` is still a gzip (convert.keep_gzip), whose text never lands on the
+    RAM disk unpacked: DuckDB reads UTF-8 from the gzip, and other text is transcoded from it.
+    """
+    if gzipped:
+        info, size = _gzip_text(path, workdir, options, limits)
+    else:
+        info, size = to_utf8(path, workdir, options.encoding, replace=True), None
     warnings: list[str] = []
     if info.replaced_chars:
         warnings.append(
             f"{info.replaced_chars} characters could not be decoded as {info.encoding} and were "
             "replaced with U+FFFD; pass options.encoding if the text looks wrong"
         )
-    sample, _ = _read_sample(info.path)
+    sample, _ = _read_sample(info.path, gzipped=size is not None)
     forced = options.delimiter or ("\t" if fmt is InputFormat.TSV else None)
     dialect, rows = sniff_dialect(sample, forced)
     if not rows:
@@ -193,6 +237,8 @@ def read_delimited(
         f"columns={columns_sql}, null_padding=true, max_line_size={_MAX_LINE}, "
         f"buffer_size={_MAX_LINE}"
     )
+    if size is not None:
+        csv_args += ", compression='gzip'"
     stage = workdir / _STAGE_FILE
     try:
         # Staged, not loaded. CREATE TABLE raw held every cell as an uncompressed VARCHAR (1.6x
@@ -229,7 +275,7 @@ def read_delimited(
         encoding=info.encoding,
         delimiter=dialect.delimiter,
         prefer_decimal_comma=dialect.delimiter == ";",
-        text_bytes=info.path.stat().st_size,
+        text_bytes=info.path.stat().st_size if size is None else size,
         warnings=warnings,
     )
 

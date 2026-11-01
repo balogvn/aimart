@@ -470,7 +470,7 @@ def read_json(
     fmt: InputFormat,
     limits: Limits,
 ) -> RawTable:
-    info = to_utf8(path, workdir, options.encoding)
+    info = to_utf8(path, workdir, options.encoding, replace=True)
     warnings: list[str] = []
     first = _first_char(info.path)
     table = ident(RAW_TABLE)

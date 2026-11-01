@@ -7,8 +7,10 @@ import pytest
 import aimart_testkit as kit
 from aimart_parquet.engine.detect import (
     _SAS7BDAT_MAGIC,
+    HEAD_BYTES,
     SUPPORTED_EXTENSIONS,
     detect_format,
+    detect_text,
     format_from_magic,
     format_from_name,
     format_from_text,
@@ -184,3 +186,52 @@ class TestDetectFormat:
         content = b"a\tb\n1\t2\n"
         path = kit.write(tmp_path / "blob", content)
         assert detect_format(path, content, None, None) is F.TSV
+
+
+_CSV = b"id,name\n" + b"".join(b"%d,row %d\n" % (i, i) for i in range(200))
+_PDF = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\nstartxref\n0\n%%EOF\n"
+
+
+@pytest.mark.parametrize(
+    ("name", "content"),
+    [
+        ("a.csv", _CSV),
+        ("a.tsv", _CSV.replace(b",", b"\t")),
+        (None, _CSV.replace(b",", b"\t")),
+        ("a.csv", b"\xef\xbb\xbf" + _CSV),
+        ("a.csv", "a,b\n1,2\n".encode("utf-16")),
+        ("a.json", b'[{"a": 1}]'),
+        ("a.csv", b'{"a": 1}\n{"a": 2}\n'),
+        ("a.csv", b"PAR1" + b"\0" * 100),
+        ("a.csv", b"$FL2@(#) SPSS DATA FILE"),
+        ("a.csv", b"\0" * 64),
+        (None, b"\x89PNG\r\n\x1a\n\0\0"),
+        ("old.dta", b"\x71\x02\x01\x00" + b"\0" * 60),
+        ("a.csv", b"\xef\xbb\xbf" + _PDF),
+        ("a.csv", b"x" * 700 + b"\n" + _PDF),  # a PDF after junk: its header past MAGIC_BYTES
+        ("a.csv", b"note\n%PDF-1.4 in a cell\n" + _CSV),  # a CSV quoting a PDF header
+        ("a.csv", _CSV * 3 + b"%PDF-1.4,later\n"),  # past the head: still a CSV
+        ("a.pdf", _CSV),
+        ("a.csv", b"PK\x03\x04" + b"\0" * 40),
+    ],
+)
+def test_detect_text_agrees_with_detect_format(tmp_path, name, content) -> None:
+    # The head of a gzip's text decides what detect_format would say of the unpacked file,
+    # or it says nothing and the file is unpacked: it never says something else.
+    path = kit.write(tmp_path / "file", content)
+    try:
+        expected = detect_format(path, read_magic(path), name, None)
+    except UnsupportedFormat:
+        expected = None
+    got = detect_text(content[:HEAD_BYTES], name, None)
+    head = content[:HEAD_BYTES]
+    decided = not head.startswith(b"PK\x03\x04") and b"%PDF-" not in head
+    if expected in {F.CSV, F.TSV} and decided:
+        assert got is expected
+    else:
+        assert got is None
+
+
+def test_detect_text_takes_a_forced_format() -> None:
+    assert detect_text(b"PK\x03\x04", "a.xlsx", F.CSV) is F.CSV
+    assert detect_text(_CSV, "a.csv", F.JSON) is None

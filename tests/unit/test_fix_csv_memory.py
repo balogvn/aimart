@@ -5,11 +5,19 @@ of it DuckDB (Arrow and Python held almost nothing): the text loaded into an unc
 VARCHAR table, 256 MB of CSV buffers, batches a 2-thread ordered COPY held back, and one hash
 join per null-token IN list. Each test here pins one of them. Fixed, the 450 MB file peaks at
 ~350 MB, about the same as a 20 MB one.
+
+Files count too: on Cloud Run /tmp is RAM. Measured on 0233294, a 446 MiB CSV gzipped to
+159 MiB left 777 MiB in its job directory (1.25 GiB with sort_by): the decompressed text, a
+copy of the upload, a second UTF-8 copy for a cp1252 file, all kept to the end of the job. The
+last tests pin each of them, and that DuckDB reads a gzip of UTF-8 text itself: the 446 MiB
+of text then never land there at all.
 """
 
 from __future__ import annotations
 
+import bz2
 import datetime as dt
+import gzip
 from typing import TYPE_CHECKING, Any
 
 import duckdb
@@ -19,12 +27,15 @@ import aimart_testkit as kit
 from aimart_parquet import service as service_module
 from aimart_parquet.artifacts import build_store
 from aimart_parquet.engine import convert as convert_module
+from aimart_parquet.engine import safety
+from aimart_parquet.engine import text as text_module
 from aimart_parquet.engine.duck import connect, ident
 from aimart_parquet.engine.infer import TypeInferrer
 from aimart_parquet.engine.limits import Limits, size_bytes
 from aimart_parquet.engine.models import ConvertOptions, DateOrder, InputFormat
+from aimart_parquet.engine.readers import delimited as delimited_module
 from aimart_parquet.engine.readers.delimited import read_delimited
-from aimart_parquet.errors import InputTooLarge
+from aimart_parquet.errors import InputTooLarge, InvalidInput, InvalidRequest
 from aimart_parquet.service import Service, SourceRef
 
 if TYPE_CHECKING:
@@ -259,3 +270,289 @@ async def test_jobs_run_with_the_derived_limits(
         fmt="json",
     )
     assert queried.rows == [["340.0 MiB", "640.0 MiB"]]
+
+
+# ----------------------------------------------------------------- files on the RAM disk
+_CITIES = "id,city\n1,Zürich\n2,Bogotá\n3,Lagos\n"
+
+
+def _names(root: Path) -> set[str]:
+    return {p.name for p in root.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize(
+    ("name", "data", "left"),
+    [
+        ("a.csv", _CITIES.encode(), {"raw_text.parquet"}),
+        ("a.csv.gz", gzip.compress(_CITIES.encode()), {"raw_text.parquet"}),
+        ("a.csv.bz2", bz2.compress(_CITIES.encode()), {"raw_text.parquet"}),
+        ("a.zip", kit.zip_bytes({"a.csv": _CITIES.encode()}), {"raw_text.parquet"}),
+        ("cp1252.csv.gz", gzip.compress(_CITIES.encode("cp1252")), {"raw_text.parquet"}),
+        ("cp1252.csv", _CITIES.encode("cp1252"), {"raw_text.parquet"}),
+        ("a.json.gz", gzip.compress('[{"city": "Zürich"}]'.encode("cp1252")), set()),
+    ],
+    ids=["csv", "gzip", "bz2", "zip", "cp1252-gzip", "cp1252", "json-gzip"],
+)
+def test_no_input_file_outlives_the_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, data: bytes, left: set[str]
+) -> None:
+    # Nothing reads the input once the reader returns (raw is a table, or a view over the
+    # staged text), yet the decompressed text, the upload's copy and the UTF-8 copy stayed
+    # through inference, the write and a sort's spill.
+    at_finish: list[set[str]] = []
+    real_finish = convert_module._finish
+
+    def spy(con: duckdb.DuckDBPyConnection, raw: Any, out_path: Path, *args: Any) -> Any:
+        at_finish.append(_names(out_path.parent))
+        return real_finish(con, raw, out_path, *args)
+
+    monkeypatch.setattr(convert_module, "_finish", spy)
+    src = kit.write(tmp_path / "upload" / name, data)
+    result = kit.convert_path(src)  # in a work directory next to the upload, as the service does
+    assert at_finish == [left]
+    assert src.read_bytes() == data
+    text = '[{"city": "Zürich"}]' if "json" in name else _CITIES
+    assert result.report.estimated_tokens_raw == len(text.encode()) // 4  # the UTF-8 text's size
+
+
+def test_a_workbook_is_gone_once_read_and_still_sized(tmp_path: Path) -> None:
+    # A reader without text_bytes is sized from its input, which must happen before the delete.
+    book = kit.messy_workbook(tmp_path / "upload" / "book.xlsx")
+    result = kit.convert_path(book)
+    assert result.report.estimated_tokens_raw == book.stat().st_size // 4
+    assert _names(result.path.parent) == {"out.parquet"}
+
+
+def test_a_transcoded_csv_is_staged_from_one_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # to_utf8 wrote utf8.txt next to the decompressed cp1252 text, and the stage read it with
+    # both on the RAM disk: twice the CSV plus the staged text. The text is now transcoded
+    # straight from the gzip, and the UTF-8 version takes the input's place.
+    upload = tmp_path / "upload"
+    at_transcode: list[dict[str, int]] = []
+    real = text_module._transcode
+
+    def spy(read: Any, dst: Path, encoding: str) -> int:
+        at_transcode.append({p.name: p.stat().st_ino for p in upload.rglob("*") if p.is_file()})
+        return real(read, dst, encoding)
+
+    monkeypatch.setattr(text_module, "_transcode", spy)
+    during = _inodes_during_read(monkeypatch, upload)
+    src = kit.write(upload / "w.csv.gz", gzip.compress(_CITIES.encode("cp1252")))
+    result = kit.convert_path(src)
+    ino = src.stat().st_ino
+    assert at_transcode == [{"w.csv.gz": ino, "input": ino}]  # the upload, and a link to it
+    assert set(during[0]) == {"w.csv.gz", "input", "raw_text.parquet"}
+    assert during[0]["input"] != ino  # the UTF-8 text
+    assert result.report.encoding == "cp1252"
+    assert result.table.column("city").to_pylist() == ["Zürich", "Bogotá", "Lagos"]
+
+
+def test_an_upload_is_unpacked_where_it_lies(tmp_path: Path) -> None:
+    # Every input outside the work directory was copied in before unpacking: up to 50 MB more
+    # for the whole job. Python reads the archive; only DuckDB is held to the work directory.
+    src = kit.write(tmp_path / "upload" / "a.csv.gz", gzip.compress(b"a\n1\n"))
+    work = tmp_path / "work"
+    work.mkdir()
+    path, _ = convert_module.unwrap(src, "a.csv.gz", work, Limits())
+    assert _names(work) == {path.name} == {"decompressed"}
+
+
+@pytest.mark.parametrize("inside", [False, True])
+def test_a_plain_input_is_linked_not_copied(tmp_path: Path, inside: bool) -> None:
+    # An upload sits in a directory of its own, a download in the work directory: either way
+    # the reader gets a file it may consume, at no cost in space.
+    work = tmp_path / "work"
+    src = kit.write((work if inside else tmp_path / "upload") / "a.csv", b"a\n1\n")
+    work.mkdir(exist_ok=True)
+    path, _ = convert_module.unwrap(src, "a.csv", work, Limits())
+    assert path != src
+    assert path.stat().st_ino == src.stat().st_ino
+
+
+@pytest.mark.parametrize(
+    ("name", "data"),
+    [("input.csv", b"a\n1\n2\n"), ("input", gzip.compress(b"a\n1\n2\n"))],
+    ids=["plain", "gzip"],
+)
+def test_a_source_with_the_links_name_survives(tmp_path: Path, name: str, data: bytes) -> None:
+    work = tmp_path / "work"
+    src = kit.write(work / name, data)
+    report = convert_module.convert_file(
+        src,
+        work / "out.parquet",
+        filename="input.csv",
+        options=ConvertOptions(),
+        workdir=work,
+        limits=Limits(),
+    )
+    assert report.rows == 2
+    assert src.read_bytes() == data
+
+
+# ------------------------------------------------------- a gzip that DuckDB reads as it is
+_TEXT = "id,city\n" + "".join(f"{i},Zürich {i}\n" for i in range(3000))
+
+
+def _inodes_during_read(monkeypatch: pytest.MonkeyPatch, root: Path) -> list[dict[str, int]]:
+    """The files under ``root`` (and their inodes) while the stage's file is still in place."""
+    seen: list[dict[str, int]] = []
+    real = delimited_module._malformed_row_warnings
+
+    def spy(con: duckdb.DuckDBPyConnection, csv_args: str) -> list[str]:
+        seen.append({p.name: p.stat().st_ino for p in root.rglob("*") if p.is_file()})
+        return real(con, csv_args)
+
+    monkeypatch.setattr(delimited_module, "_malformed_row_warnings", spy)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("name", "data", "delimiter"),
+    [
+        ("a.csv.gz", gzip.compress(_TEXT.encode()), ","),
+        ("a.tsv.gz", gzip.compress(_TEXT.replace(",", "\t").encode()), "\t"),
+        (
+            "a.gz",
+            kit.gzip_member(_TEXT[:5000].encode(), 8) + gzip.compress(_TEXT[5000:].encode()),
+            ",",
+        ),
+        ("a.csv.gz", kit.gzip_member(("\ufeff" + _TEXT).encode(), 4), ","),
+    ],
+    ids=["csv", "tsv", "two-members-fname", "bom-fextra"],
+)
+def test_a_gzip_of_utf8_text_is_never_unpacked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, data: bytes, delimiter: str
+) -> None:
+    # unwrap wrote all of it to the RAM disk for DuckDB to read: a 446 MiB CSV gzipped to
+    # 159 MiB held 526 MiB of files at the read, now the upload plus the staged text, 80 MiB.
+    during = _inodes_during_read(monkeypatch, tmp_path / "upload")
+    src = kit.write(tmp_path / "upload" / name, data)
+    result = kit.convert_path(src)
+    assert during == [
+        {
+            name: src.stat().st_ino,
+            "input": src.stat().st_ino,
+            "raw_text.parquet": during[0]["raw_text.parquet"],
+        }
+    ]  # input: the upload itself, hard-linked into the work directory
+    assert result.report.delimiter == delimiter
+    assert result.rows["city"] == [f"Zürich {i}" for i in range(3000)]
+    assert result.report.estimated_tokens_raw == len(gzip.decompress(data)) // 4
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        gzip.compress(_TEXT.encode()) + b"\0" * 8,
+        kit.gzip_member(_TEXT.encode(), 16),
+        kit.gzip_member(_TEXT.encode(), 2),
+        kit.gzip_member(_TEXT.encode(), 1),
+        kit.gzip_member(_TEXT.encode("cp1252"), 16),
+    ],
+    ids=["zero-padding", "comment", "header-crc", "ftext", "comment-cp1252"],
+)
+def test_a_gzip_duckdb_cannot_read_as_python_does_is_unpacked(tmp_path: Path, data: bytes) -> None:
+    # DuckDB 1.5 refuses these headers and the padding Python's gzip module skips: each is
+    # unpacked over the input, as unwrap did, and reads as it did.
+    result = kit.convert_bytes(tmp_path, "a.csv.gz", data)
+    assert result.rows["city"] == [f"Zürich {i}" for i in range(3000)]
+    assert result.report.warnings == []
+
+
+@pytest.mark.parametrize(
+    ("data", "detail"),
+    [
+        (
+            gzip.compress(_TEXT.encode())[:-8] + b"\0\0\0\0" + gzip.compress(_TEXT.encode())[-4:],
+            "CRC",
+        ),
+        (gzip.compress(_TEXT.encode())[:-4] + b"\0\0\0\0", "length"),
+        (gzip.compress(_TEXT.encode())[:-4], "end-of-stream"),
+        (gzip.compress(_TEXT.encode())[:200], "end-of-stream"),
+        (gzip.compress(_TEXT.encode()) + b"garbage", "Not a gzipped file"),
+        (gzip.compress(_TEXT.encode("cp1252"))[:-8] + b"\0" * 8, "CRC"),
+        (gzip.compress(_TEXT.encode("cp1252"))[:-4], "end-of-stream"),
+    ],
+    ids=[
+        "bad-crc",
+        "bad-length",
+        "truncated-trailer",
+        "truncated-body",
+        "trailing-garbage",
+        "bad-crc-cp1252",
+        "truncated-cp1252",
+    ],
+)
+def test_a_corrupt_gzip_is_refused_as_before(tmp_path: Path, data: bytes, detail: str) -> None:
+    # DuckDB reads gzip without checking a member's CRC or length, and a truncated one as far
+    # as it inflates: rows from a corrupt file would have been converted, and charged for.
+    with pytest.raises(InvalidInput, match=f"gzip stream is corrupt or truncated: .*{detail}"):
+        kit.convert_bytes(tmp_path, "a.csv.gz", data)
+
+
+@pytest.mark.parametrize(
+    ("encoding", "row"),
+    [(None, "1,2\n"), ("utf-8", "1,2\n"), (None, "1,ü\n"), ("cp1252", "1,ü\n")],
+    ids=["detected", "named", "detected-cp1252", "named-cp1252"],
+)
+def test_a_gzip_bomb_of_text_stops_at_the_cap(
+    tmp_path: Path, encoding: str | None, row: str
+) -> None:
+    # Unpacking was what held a gzip bomb to max_decompressed_bytes; DuckDB has no cap, and a
+    # transcode from the gzip has only its own.
+    data = gzip.compress(b"a,b\n" + row.encode("cp1252") * (1024 * 1024))
+    with pytest.raises(InputTooLarge, match="exceeds the 1 MB limit"):
+        kit.convert_bytes(
+            tmp_path,
+            "a.csv.gz",
+            data,
+            limits=Limits(max_decompressed_bytes=1024 * 1024),
+            encoding=encoding,
+        )
+
+
+def test_an_unknown_encoding_is_refused_after_a_corrupt_gzip_as_before(tmp_path: Path) -> None:
+    # unwrap unpacked the gzip before to_utf8 looked up the encoding: a corrupt one says so first.
+    good = gzip.compress(_CITIES.encode())
+    with pytest.raises(InvalidRequest, match="Unknown encoding"):
+        kit.convert_bytes(tmp_path, "a.csv.gz", good, encoding="no-such-codec")
+    with pytest.raises(InvalidInput, match="gzip stream is corrupt"):
+        kit.convert_bytes(tmp_path, "a.csv.gz", good[:-4], encoding="no-such-codec")
+
+
+def test_a_gzip_in_a_named_encoding_is_transcoded(tmp_path: Path) -> None:
+    data = gzip.compress(_CITIES.encode("cp1252"))
+    result = kit.convert_bytes(tmp_path, "a.csv.gz", data, encoding="cp1252")
+    assert (result.report.encoding, result.rows["city"]) == (
+        "cp1252",
+        ["Zürich", "Bogotá", "Lagos"],
+    )
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        kit.gzip_member(_TEXT[:7].encode(), 8) + kit.gzip_member(_TEXT[7:].encode(), 4 | 8),
+        gzip.compress(b"") + gzip.compress(_TEXT.encode()) + gzip.compress(b""),
+        gzip.compress("\ufeff".encode()[:2]) + gzip.compress(("\ufeff" + _TEXT).encode()[2:]),
+        b"".join(gzip.compress(_TEXT[i : i + 997].encode()) for i in range(0, len(_TEXT), 997)),
+        gzip.compress(_TEXT.encode(), compresslevel=0),
+    ],
+    ids=["fields-in-every-member", "empty-members", "bom-split", "many-members", "stored"],
+)
+def test_duckdb_reads_a_gzip_the_check_passes_as_python_does(tmp_path: Path, data: bytes) -> None:
+    # What read_delimited relies on, on this DuckDB: an upgrade that reads one differently
+    # fails here, not in a caller's rows.
+    gz = kit.write(tmp_path / "t.gz", data)
+    plain = kit.write(tmp_path / "t.csv", gzip.decompress(data))
+    assert b"".join(safety.gzip_chunks(gz, 10**9)) == plain.read_bytes()
+    con = duckdb.connect()
+    args = "header=true, auto_detect=false, columns={'id': 'VARCHAR', 'city': 'VARCHAR'}"
+    rows = [
+        con.sql(f"SELECT * FROM read_csv('{p}', {args}{c})").fetchall()
+        for p, c in [(gz, ", compression='gzip'"), (plain, "")]
+    ]
+    assert rows[0] == rows[1]
+    assert len(rows[0]) == 3000

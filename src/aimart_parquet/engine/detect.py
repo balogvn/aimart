@@ -11,6 +11,7 @@ import zipfile
 from pathlib import Path
 
 from aimart_parquet.engine.models import InputFormat
+from aimart_parquet.engine.safety import MAGIC_BYTES
 from aimart_parquet.errors import UnsupportedFormat
 
 _SAS7BDAT_MAGIC = bytes.fromhex("000000000000000000000000c2ea8160b31411cfbd92080009c7318c181f1011")
@@ -18,6 +19,8 @@ _BOM = b"\xef\xbb\xbf"
 # PDF readers accept the '%PDF-' header anywhere in the first 1024 bytes and look for the
 # trailer ('startxref', '%%EOF') in the last 1024.
 _PDF_WINDOW = 1024
+# detect_text decides from this much of a file: the PDF header's window.
+HEAD_BYTES = _PDF_WINDOW
 
 _EXTENSIONS: dict[str, InputFormat] = {
     ".csv": InputFormat.CSV,
@@ -103,6 +106,15 @@ def _pdf_after_junk(path: Path, magic: bytes) -> bool:
 
 
 def format_from_magic(path: Path, magic: bytes) -> InputFormat | None:
+    if magic.startswith(b"PK\x03\x04"):
+        return _zip_office_format(path)
+    if (fmt := _signature(magic)) is not None:
+        return fmt
+    return InputFormat.PDF if _pdf_after_junk(path, magic) else None
+
+
+def _signature(magic: bytes) -> InputFormat | None:
+    """What the first bytes alone say: format_from_magic but for a zip and a PDF after junk."""
     if magic.startswith(b"PAR1"):
         return InputFormat.PARQUET
     if magic.removeprefix(_BOM).lstrip(b"\x00\t\r\n ")[:5] == b"%PDF-":
@@ -113,8 +125,6 @@ def format_from_magic(path: Path, magic: bytes) -> InputFormat | None:
         return InputFormat.SAV
     if magic.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
         return InputFormat.XLS
-    if magic.startswith(b"PK\x03\x04"):
-        return _zip_office_format(path)
     if magic[: len(_SAS7BDAT_MAGIC)] == _SAS7BDAT_MAGIC:
         return InputFormat.SAS7BDAT
     if magic.startswith((b"HEADER RECORD*******LIB", b"HEADER RECORD*******LIBV8")):
@@ -123,8 +133,6 @@ def format_from_magic(path: Path, magic: bytes) -> InputFormat | None:
         return InputFormat.DTA
     if b"SPSSPORT" in magic:
         return InputFormat.POR
-    if _pdf_after_junk(path, magic):
-        return InputFormat.PDF
     return None
 
 
@@ -156,7 +164,31 @@ def detect_format(
 ) -> InputFormat:
     if forced is not None:
         return forced
-    by_magic = format_from_magic(path, magic)
+    return _decide(format_from_magic(path, magic), magic, filename)
+
+
+def detect_text(
+    head: bytes, filename: str | None, forced: InputFormat | None
+) -> InputFormat | None:
+    """CSV or TSV when detect_format says so of a file that begins with ``head``, else None.
+
+    ``head`` is the first HEAD_BYTES (all of the file when shorter), of text still in a gzip
+    (convert.keep_gzip). They decide every format but a zip, which may be an Office document,
+    and a '%PDF-' in them, which may begin a PDF after junk: those are None, and get unpacked.
+    """
+    fmt = forced
+    if fmt is None:
+        if head.startswith(b"PK\x03\x04") or b"%PDF-" in head[:HEAD_BYTES]:
+            return None
+        magic = head[:MAGIC_BYTES]
+        try:
+            fmt = _decide(_signature(magic), magic, filename)
+        except UnsupportedFormat:
+            return None  # detect_format raises it after unwrap, which checks the bomb cap first
+    return fmt if fmt in {InputFormat.CSV, InputFormat.TSV} else None
+
+
+def _decide(by_magic: InputFormat | None, magic: bytes, filename: str | None) -> InputFormat:
     by_name = format_from_name(filename)
     if by_magic is not None:
         # .dta files from Stata 13 and older have no textual signature; trust the name there.

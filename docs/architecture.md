@@ -67,9 +67,12 @@ flowchart LR
    decompression (`safety.py`) and UTF-8 transcoding (`text.py`). A reader (`readers/`)
    produces a raw table in a locked-down DuckDB connection (`duck.py`); for delimited text
    it is a view over a compressed Parquet copy of the text, so memory stays flat as files
-   grow, and DuckDB's memory limit sits under the job's cap (`limits.py`). Next come type
-   inference in SQL (`infer.py`), name normalization (`names.py`), and the writer
-   (`writer.py`): DuckDB `COPY` to zstd Parquet, or pyarrow when labels must be embedded
+   grow, and DuckDB's memory limit sits under the job's cap (`limits.py`). Because `/tmp` is
+   RAM on Cloud Run, a gzip of CSV or TSV is not decompressed at all (DuckDB reads it, once a
+   Python pass has checked it against the bomb cap), and any decompressed or transcoded input
+   is deleted as soon as the reader returns. Next come type inference in SQL (`infer.py`),
+   name normalization (`names.py`), and the writer (`writer.py`): DuckDB `COPY` to zstd
+   Parquet, or pyarrow when labels must be embedded
    ([ADR 0006](adr/0006-duckdb-copy-writer.md)).
 6. **Artifact store.** The output goes to `LocalArtifactStore` (TTL disk, HMAC-signed links)
    or `GcsArtifactStore` (V4 signed URLs). The caller gets a reference (`artifact_id` and
