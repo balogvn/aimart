@@ -66,7 +66,7 @@ from aimart_parquet.sources import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 
     from aimart_parquet.artifacts import ArtifactStore
     from aimart_parquet.config import Settings
@@ -119,9 +119,27 @@ class QuantumUnavailable(AimartError):
     http_status = 501
 
 
+# The inputs a caller can name, in the order a refusal names them (``upload`` is the REST form's
+# file part, never named).
+INPUT_KINDS = ("url", "content_base64", "artifact_id", "path")
+
+
+def inputs_among(names: Iterable[str]) -> tuple[str, ...]:
+    """The input kinds among a route's or tool's parameter names, in the order hints name them."""
+    present = set(names)
+    return tuple(kind for kind in INPUT_KINDS if kind in present)
+
+
 @dataclass(frozen=True)
 class SourceRef:
-    """Exactly one field must be set. ``path`` and ``upload`` are never exposed remotely."""
+    """Exactly one input field must be set. ``path`` and ``upload`` are never exposed remotely.
+
+    ``takes`` is what the route or tool that built the ref accepts (``inputs_among`` of its
+    parameters), for the hints of its refusals; None means every input this mode serves. One
+    list for every surface told MCP agents to "Set one of: url, content_base64, artifact_id."
+    where convert_to_parquet took no artifact_id and inspect_parquet no content_base64, so an
+    agent that followed the hint was refused again.
+    """
 
     url: str | None = None
     content_base64: str | None = None
@@ -129,6 +147,7 @@ class SourceRef:
     filename: str | None = None
     path: str | None = None
     upload: Path | None = None
+    takes: tuple[str, ...] | None = field(default=None, compare=False)
 
     def kinds(self) -> list[str]:
         return [
@@ -287,6 +306,23 @@ class Service:
     def check_input(self, src: SourceRef, *, table: str | None = None) -> bytes | None:
         """Exactly one input, of a kind this mode serves; a URL the fetcher could fetch; base64
         that decodes to a file. Returns the bytes ``content_base64`` holds, if that is it."""
+        self._one_input(src, table=table)
+        if src.url is not None:
+            validate_url(src.url, allow_private=self.settings.allow_private_urls)
+        if src.content_base64 is not None:
+            # The one base64 input a call can have, so the whole budget is its limit, as when
+            # _materialize decodes it.
+            return check_base64(src.content_base64, max_bytes=self.settings.max_input_bytes)
+        return None
+
+    def _takes(self, src: SourceRef) -> tuple[str, ...]:
+        """The inputs a refusal's hint may name: what the calling route or tool accepts."""
+        if src.takes is not None:
+            return src.takes
+        return tuple(kind for kind in INPUT_KINDS if self.local_mode or kind != "path")
+
+    def _one_input(self, src: SourceRef, *, table: str | None = None) -> None:
+        """Exactly one input, and a path only in local mode; hints name only ``_takes``."""
         kinds = src.kinds()
         if len(kinds) != 1:
             got = f"got {len(kinds)} ({', '.join(kinds) or 'none'})"
@@ -295,21 +331,16 @@ class Service:
                     f"Table {table!r}: provide exactly one input; {got}.",
                     hint="Give every entry of `tables` one artifact_id (or url).",
                 )
-            allowed = "url, content_base64, artifact_id" + (", path" if self.local_mode else "")
             raise InvalidRequest(
-                f"Provide exactly one input; {got}.", hint=f"Set one of: {allowed}."
+                f"Provide exactly one input; {got}.",
+                hint=f"Set one of: {', '.join(self._takes(src))}.",
             )
         if src.path is not None and not self.local_mode:
+            remote = [kind for kind in self._takes(src) if kind != "path"]
             raise InvalidRequest(
-                "path inputs are only available in local mode.", hint="Pass url or content_base64."
+                "path inputs are only available in local mode.",
+                hint=f"Set one of: {', '.join(remote)}.",
             )
-        if src.url is not None:
-            validate_url(src.url, allow_private=self.settings.allow_private_urls)
-        if src.content_base64 is not None:
-            # The one base64 input a call can have, so the whole budget is its limit, as when
-            # _materialize decodes it.
-            return check_base64(src.content_base64, max_bytes=self.settings.max_input_bytes)
-        return None
 
     def check_parquet_input(self, src: SourceRef) -> None:
         """``check_input`` for inspect and preview, which read their input as Parquet: inline
@@ -356,14 +387,8 @@ class Service:
         self, src: SourceRef, workdir: Path, budget: _InputBudget
     ) -> tuple[Path, str | None]:
         await anyio.to_thread.run_sync(self.store.maybe_sweep)
-        kinds = src.kinds()
-        if len(kinds) != 1:
-            allowed = "url, content_base64, artifact_id" + (", path" if self.local_mode else "")
-            raise InvalidRequest(
-                f"Provide exactly one input; got {len(kinds)} ({', '.join(kinds) or 'none'}).",
-                hint=f"Set one of: {allowed}.",
-            )
-        kind = kinds[0]
+        self._one_input(src)
+        kind = src.kinds()[0]
         name = safe_filename(src.filename) if src.filename else None
         if kind == "upload":
             assert src.upload is not None
@@ -398,11 +423,7 @@ class Service:
             assert src.artifact_id is not None
             art, path = self.store.get(src.artifact_id)
             return path, art.filename
-        if not self.local_mode:
-            raise InvalidRequest(
-                "path inputs are only available in local mode.", hint="Pass url or content_base64."
-            )
-        assert src.path is not None
+        assert src.path is not None  # and self.local_mode (_one_input)
         local = Path(src.path).expanduser()  # noqa: ASYNC240 - pure path arithmetic, no I/O
         if not await anyio.Path(local).is_file():
             raise InvalidRequest(

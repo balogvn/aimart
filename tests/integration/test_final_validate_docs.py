@@ -238,6 +238,29 @@ async def test_the_guide_quotes_each_unreadable_body_problem(
     assert got["problem"] == problem
 
 
+async def test_the_guide_quotes_the_input_hints_each_surface_sends(
+    paid_app: kit.AppHarness,
+) -> None:
+    # Each hint names only the inputs of the route or tool that sent it.
+    r = await paid_app.http.post("/v1/inspect", json={"filename": "x"})
+    hints = [_refused(r, 400, "invalid_request")["hint"]]
+    async with kit.mcp_over_http(paid_app.app) as client:
+        for tool, args in [
+            ("convert_to_parquet", {"filename": "x.csv"}),
+            ("inspect_parquet", {"url": URL, "artifact_id": A}),
+        ]:
+            result = await client.call_tool(tool, args)
+            assert result.is_error
+            hints.append((result.structured_content or {})["error"]["hint"])
+    assert hints == [
+        "Set one of: url, content_base64, artifact_id.",
+        "Set one of: url, content_base64, artifact_id.",
+        "Set one of: url, artifact_id.",
+    ]
+    for hint in hints:
+        assert f'"{hint}"' in GUIDE
+
+
 async def test_the_guide_quotes_the_upload_form_refusal(paid_app: kit.AppHarness) -> None:
     r = await paid_app.http.post(
         "/v1/convert/upload",

@@ -11,8 +11,9 @@ you are calling.
 | files on the same machine as the agent | the local stdio server, `uvx aimart-parquet mcp` (or `make mcp` from a checkout) | free |
 | files at a URL, an agent in the cloud, or signed provenance | the hosted service, over REST or `/mcp` | per call, in USDC |
 
-The local server has the same tools, plus `path` inputs and `output_path`. It never asks for
-payment. Everything below is about the hosted service.
+The local server has the same tools, plus `path` inputs and `output_path`. It keeps no
+artifacts, so its tools take no `artifact_id`. It never asks for payment. Everything below is
+about the hosted service.
 
 The premium quantum tools are off by default. They exist only where the operator enabled them
 (`AIMART_ENABLE_QUANTUM=true`, plus the `quantum` extra), on a hosted deployment or your own
@@ -46,8 +47,13 @@ Pass exactly one input:
   base64 alphabet works (standard, or URL-safe with `-` and `_`), `=` padding is optional, line
   breaks are ignored, and a `data:<type>;base64,` prefix is allowed. Any other character is
   refused, never skipped.
+- `artifact_id`: a file converted earlier, converted again with new `options` (an
+  `expected_schema`, say), on REST and by `convert_to_parquet` alike.
 - REST only: `POST /v1/convert/upload` as multipart (`file`, plus optional `options` as a
   JSON string).
+
+Over MCP, `inspect_parquet`, `preview_parquet` and `query_parquet` take an `artifact_id` or a
+`url`, not `content_base64`: convert the file first.
 
 ```json
 POST /v1/convert
@@ -172,9 +178,11 @@ decided from the request alone:
   may hold.", "The form has more than 1000 fields." or "The form has more than 1000 files.".
   Send long `options` to `POST /v1/convert` as JSON, with a `url` or `content_base64`.
 - Not exactly one input: 400 `invalid_request`, "Provide exactly one input; got 0 (none)." or
-  "Provide exactly one input; got 2 (url, artifact_id).". For a query, also "No tables to
-  query.", "Table name 'data' is used twice." (`data` is the top-level input) and "Table 't':
-  provide exactly one input; got 0 (none).".
+  "Provide exactly one input; got 2 (url, artifact_id).". The hint names the inputs that route
+  or tool takes: "Set one of: url, content_base64, artifact_id." for `POST /v1/inspect` and
+  `convert_to_parquet`, "Set one of: url, artifact_id." for `inspect_parquet`. For a query,
+  also "No tables to query.", "Table name 'data' is used twice." (`data` is the top-level
+  input) and "Table 't': provide exactly one input; got 0 (none).".
 - `content_base64` that holds no file: 400 `invalid_request`, "content_base64 is not valid
   base64." (a character outside the base64 alphabets, or a length no padding completes),
   "content_base64 is a data: URL that is not base64-encoded." (a `data:` URL without

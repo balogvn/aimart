@@ -55,8 +55,10 @@ notes and, on the hosted service, a provenance block with a 3,309-byte ML-DSA-65
 The typical flow is: `convert_to_parquet` returns an `artifact_id` and a schema report. Then
 `inspect_parquet` or `preview_parquet` lets you look, and `query_parquet` answers questions
 with SQL. Pass the `artifact_id` between calls instead of re-sending the file. Inputs are a
-public `url` (best for large files), `content_base64` plus `filename` (under about 3 MB), or an
-`artifact_id`.
+public `url` (best for large files), `content_base64` plus `filename` (under about 3 MB), or the
+`artifact_id` of a file converted earlier (convert takes one too, to convert it again with new
+options). Over MCP only `convert_to_parquet` takes `content_base64`; on REST, convert, inspect,
+preview and query take all three.
 
 ### REST: 402 → decode → pay → retry
 

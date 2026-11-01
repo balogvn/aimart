@@ -14,7 +14,7 @@ from aimart_parquet.artifacts import _ID as _ARTIFACT_ID
 from aimart_parquet.engine.models import ConvertOptions, DuckText
 from aimart_parquet.errors import InvalidRequest
 from aimart_parquet.quantum.models import PortfolioOptions, QuantumCompressOptions
-from aimart_parquet.service import MAX_QUERY_TABLES, TABLE_NAME, SourceRef
+from aimart_parquet.service import MAX_QUERY_TABLES, TABLE_NAME, SourceRef, inputs_among
 
 if TYPE_CHECKING:
     from pydantic import GetJsonSchemaHandler
@@ -55,6 +55,11 @@ ArtifactId = Annotated[str, StringConstraints(pattern=ARTIFACT_ID_PATTERN)]
 NamedKeys = _NamedKeys()
 
 
+def _takes(body: type[BaseModel]) -> tuple[str, ...]:
+    """The inputs a body accepts, for the hints of its refusals (``SourceRef.takes``)."""
+    return inputs_among(body.model_fields)
+
+
 class SourceBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -82,6 +87,7 @@ class SourceBody(BaseModel):
             content_base64=self.content_base64,
             filename=self.filename,
             artifact_id=self.artifact_id,
+            takes=_takes(type(self)),
         )
 
     def precheck(self, service: Service) -> None:
@@ -114,7 +120,7 @@ class TableRef(BaseModel):
     url: str | None = Field(default=None, max_length=4096)
 
     def source(self) -> SourceRef:
-        return SourceRef(artifact_id=self.artifact_id, url=self.url)
+        return SourceRef(artifact_id=self.artifact_id, url=self.url, takes=_takes(type(self)))
 
 
 class QueryBody(SourceBody):
@@ -170,7 +176,7 @@ class ParquetSourceBody(BaseModel):
     )
 
     def source(self) -> SourceRef:
-        return SourceRef(artifact_id=self.artifact_id, url=self.url)
+        return SourceRef(artifact_id=self.artifact_id, url=self.url, takes=_takes(type(self)))
 
     def precheck(self, service: Service) -> None:
         service.check_input(self.source())
