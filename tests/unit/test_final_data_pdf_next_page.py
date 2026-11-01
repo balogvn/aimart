@@ -350,3 +350,134 @@ def test_a_header_ending_in_a_word_like_continued_is_still_a_new_table() -> None
     ]
     tables = pdf_reader._merge([_found(1, first), _found(2, second)])
     assert [t.header for t in tables] == [first[0], second[0]]
+
+
+# ---------------------------------------------------------------- PR4: a wide '(continued)'
+
+LEDGER_HEADER = ["ID", "Date", "Region", "Amount", "Qty"]
+WIDE_CONTINUED = (
+    "Table 4. Quarterly sales ledger, ACME Corporation and subsidiaries, all regions and "
+    "channels (continued)"
+)
+
+
+def _ledger_row(i: int, rnd: random.Random) -> list[str]:
+    return [
+        str(i),
+        f"2025-{(i % 12) + 1:02d}-{(i % 27) + 1:02d}",
+        rnd.choice(["North", "South", "East"]),
+        f"{rnd.uniform(10, 9999):.2f}",
+        str(rnd.randrange(1, 900)),
+    ]
+
+
+@pytest.mark.parametrize(("rows", "pages"), [(120, 3), (70, 2)])
+def test_a_continued_title_across_every_column_does_not_split_the_table(
+    tmp_path: Path, rows: int, pages: int
+) -> None:
+    # 6b5a217 and 07fa450: 79 of 120 rows (41 of 70), the columns named after the title
+    # ('table_4_quarterly_sale', ...), 'found 2 tables; used table 1'.
+    data = _ledger(
+        rows,
+        header=LEDGER_HEADER,
+        row=_ledger_row,
+        title=lambda p: "" if p == 1 else WIDE_CONTINUED,
+    )
+    result = kit.convert_bytes(tmp_path, "continued.pdf", data)
+    report = result.report
+    assert [c.name for c in report.columns] == ["id", "date", "region", "amount", "qty"]
+    assert result.rows["id"] == list(range(1, rows + 1))
+    assert f"merged a table that continues across {pages} pages" in report.warnings
+    assert any(
+        w.startswith(f"dropped {pages - 1} line(s) above the header: 'Table 4. Quarterly")
+        for w in report.warnings
+    ), report.warnings
+    assert not any(w.startswith("found ") for w in report.warnings)
+
+
+def test_a_wide_title_that_does_not_say_continued_still_splits(tmp_path: Path) -> None:
+    # One line of running text across every column, on continuation pages only, is the
+    # page's header to the type rules; positions say it is running text, but nothing says it
+    # belongs to the table above. That is one signal, so the page splits, with the warning.
+    title = WIDE_CONTINUED.removesuffix(" (continued)")
+    data = _ledger(
+        70, header=LEDGER_HEADER, row=_ledger_row, title=lambda p: "" if p == 1 else title
+    )
+    result = kit.convert_bytes(tmp_path, "titled.pdf", data)
+    assert any(w.startswith("found 2 tables") for w in result.report.warnings)
+
+
+@pytest.mark.parametrize(
+    ("layout", "passes"),
+    [("repeated-header", 0), ("header-once", 0), ("continued", 2), ("new-table", 1)],
+)
+def test_positions_are_read_only_under_another_header_on_the_next_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str, passes: int
+) -> None:
+    # Reading positions is a pass over the page's words. A header repeated on every page, or
+    # a page that starts with body, must not pay for it: only a top row of the same width
+    # under another header than the previous page's (a cut title, or a new table) does.
+    calls: list[int] = []
+    running_text = pdf_reader._running_text
+
+    def spy(table: Any, words: Any) -> set[int]:
+        calls.append(1)
+        return running_text(table, words)
+
+    monkeypatch.setattr(pdf_reader, "_running_text", spy)
+    if layout == "new-table":
+        rnd = random.Random(1)
+        first = [LEDGER_HEADER] + [_ledger_row(i, rnd) for i in range(1, 31)]
+        second = [["Order", "Shipped", "Carrier", "Weight", "Boxes"]] + [
+            _ledger_row(i, rnd) for i in range(1, 21)
+        ]
+        data = _two_tables(first, second, ruled=False)
+    else:
+        data = _ledger(
+            120,
+            header=LEDGER_HEADER,
+            row=_ledger_row,
+            title=lambda p: "" if p == 1 or layout != "continued" else WIDE_CONTINUED,
+            repeat=layout == "repeated-header",
+        )
+    kit.convert_bytes(tmp_path, "ledger.pdf", data)
+    assert len(calls) == passes
+
+
+# ---------------------------------------------------------------- PR5: deferred
+
+
+def _shipments(pdf: FPDF) -> None:
+    pdf.ln(8)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 8, "Table 2. Shipments", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", size=9)
+    rnd = random.Random(3)
+    with pdf.table(borders_layout="NONE", headings_style=FontFace(emphasis="BOLD")) as table:
+        line = table.row()
+        for name in ["Order", "Shipped", "Carrier", "Weight", "Boxes"]:
+            line.cell(name)
+        for i in range(1, 11):
+            line = table.row()
+            for value in [
+                str(900 + i),
+                f"2024-0{(i % 9) + 1}-1{i % 9}",
+                rnd.choice(["DHL", "UPS"]),
+                f"{rnd.uniform(1, 99):.2f}",
+                str(i),
+            ]:
+                line.cell(value)
+
+
+@pytest.mark.xfail(
+    reason=(
+        "PR5, pre-existing at 07fa450: the page is one table to text alignment, and the only "
+        "sign of the second table (a row naming every typed column) is also what a first "
+        "suppressed row ('Area5', 'x', 'x') on a continuation page looks like"
+    ),
+    strict=True,
+)
+def test_a_different_table_after_the_last_row_is_not_appended(tmp_path: Path) -> None:
+    data = _ledger(126, header=LEDGER_HEADER, row=_ledger_row, title=lambda _: "", after=_shipments)
+    result = kit.convert_bytes(tmp_path, "spill.pdf", data)
+    assert result.rows["id"] == list(range(1, 127))  # all three versions: 138 rows

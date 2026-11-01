@@ -964,9 +964,9 @@ def test_p6_text_pass_stops_once_a_bordered_table_is_found(
     searched: list[int] = []
     aligned = pdf_reader._aligned_tables
 
-    def spy(page: Any, number: int) -> Any:
+    def spy(page: Any, number: int, *rest: Any) -> Any:
         searched.append(number)
-        return aligned(page, number)
+        return aligned(page, number, *rest)
 
     monkeypatch.setattr(pdf_reader, "_aligned_tables", spy)
     pdf = FPDF()

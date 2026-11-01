@@ -618,7 +618,9 @@ def _headless(rows: list[list[str]], typed: list[int]) -> list[list[str]]:
 
 
 def _split_captions(
-    rows: list[list[str]], running: Callable[[int], bool] = _never
+    rows: list[list[str]],
+    running: Callable[[int], bool] = _never,
+    continued: Callable[[int], bool] = _never,
 ) -> tuple[list[list[str]], list[str]]:
     """Drop rows above the header: titles, and merged title cells of bordered tables.
 
@@ -639,7 +641,10 @@ def _split_captions(
     belong) under their header. A title cut into text under every column ties with the header,
     which only positions tell apart: ``running(i)`` says whether row i is one line of running
     text (``_running_text``), which never names columns. It is asked only about rows that could
-    become the header, as reading positions costs a pass over the page's glyphs.
+    become the header, as reading positions costs a pass over the page's glyphs. A title cut
+    into text under every column above the data names them all, as a header does, so it is
+    asked about only through ``continued(i)``: running text whose whole line, past the table's
+    edge too, says the table continues ('... (continued)'), never a header.
 
     Typed columns are judged on the bottom half of the rows, which is body as long as there are
     no more leading rows than data rows. With no row naming a typed column nothing is dropped
@@ -663,8 +668,9 @@ def _split_captions(
         # not repeat the header. Kept, that title became the page's header, so the page was
         # neither a repeat nor a continuation of page 1's table: a ledger titled on every
         # page came back as 80 of its 120 rows, its columns named after the title. A header
-        # names every typed column, and only a row that does not is worth a glyph pass.
-        if _names(rows[0], typed, tail) < len(typed) and running(0):
+        # names every typed column, and only a row that does not is worth a glyph pass,
+        # unless the caller has a reason to ask (``continued``).
+        if (_names(rows[0], typed, tail) < len(typed) and running(0)) or continued(0):
             return _headless(rows[1:], typed), [_line(rows[0])]
         return rows, []
     names = [_names(rows[i], typed, tail) for i in range(first)]
@@ -733,9 +739,26 @@ class _Words:
         return self._words
 
 
+def _whole_line(bbox: tuple[float, float, float, float], words: list[dict[str, Any]]) -> str:
+    """The words at the height of a table row, past the table's left and right edges too."""
+    line = [w for w in words if bbox[1] <= (w["top"] + w["bottom"]) / 2 <= bbox[3]]
+    return " ".join(w["text"] for w in sorted(line, key=lambda w: w["x0"]))
+
+
 def _aligned_table(
-    table: Table, words: _Words, settings: TableSettings
+    table: Table, words: _Words, settings: TableSettings, after: list[str] | None = None
 ) -> tuple[list[list[str]], list[str]]:
+    """``table``'s rows and the lines dropped above its header (``_split_captions``).
+
+    ``after`` is the header of the borderless table that ended the previous page, when this is
+    the first table on its page. A top row of the same width under another header may be a
+    title cut into every column, and is then worth reading positions for (``continued``):
+    'Table 4. Quarterly sales ledger, ... (continued)', printed on continuation pages only,
+    was those pages' header and split the table (79 of 120 rows), and its '(continued)' was
+    past the table's right edge, so the cut text never showed it. A repeated header, or a
+    page that starts with body, never pays for the pass; 100 pages each holding a different
+    table of the same width took 7.9 s instead of 6.8 s.
+    """
     cells = _cells(table.extract(**(settings.text_settings or {})))
     kept = [i for i, row in enumerate(cells) if any(row)]
     running: set[int] | None = None
@@ -746,16 +769,23 @@ def _aligned_table(
             running = _running_text(table, words.get())
         return kept[k] in running
 
-    return _split_captions([cells[i] for i in kept], is_running)
+    def continued(k: int) -> bool:
+        top = cells[kept[k]]
+        if after is None or k or len(top) != len(after) or top == after or not is_running(k):
+            return False
+        line = _whole_line(table.rows[kept[k]].bbox, words.get())
+        return _CONTINUED.search(_squashed(line).lower()) is not None
+
+    return _split_captions([cells[i] for i in kept], is_running, continued)
 
 
-def _aligned_tables(page: Page, number: int) -> list[_Found]:
+def _aligned_tables(page: Page, number: int, after: list[str] | None = None) -> list[_Found]:
     # page.extract_tables(_TEXT_STRATEGY), keeping the Table objects for their row positions.
     settings = TableSettings.resolve(_TEXT_STRATEGY)
     words = _Words(page)
     found = []
-    for table in page.find_tables(settings):
-        rows, captions = _aligned_table(table, words, settings)
+    for i, table in enumerate(page.find_tables(settings)):  # topmost first
+        rows, captions = _aligned_table(table, words, settings, None if i else after)
         if _looks_tabular(rows):
             edges = tuple(sorted({x for cell in table.cells for x in (cell[0], cell[2])}))
             found.append(_Found(number, rows, "text alignment", captions, edges))
@@ -869,9 +899,10 @@ def _scan_pages(doc: PDF, pages: list[int], budget: _Budget, scan: _Scan) -> Non
             # Pointless once a bordered table exists: it wins.
             bordered_table = bordered_table or any(_usable(f.rows) for f in bordered)
             if not bordered_table:
-                aligned = _aligned_tables(page, number)
-                if not aligned and tail is not None and tail.page == number - 1:
-                    aligned = _spilled_rows(page, number, tail.edges)
+                after = tail if tail is not None and tail.page == number - 1 else None
+                aligned = _aligned_tables(page, number, after.rows[0] if after else None)
+                if not aligned and after is not None:
+                    aligned = _spilled_rows(page, number, after.edges)
                 scan.aligned.extend(aligned)
                 tail = next((f for f in reversed(aligned) if not f.spill), None)
         finally:
