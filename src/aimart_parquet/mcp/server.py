@@ -201,16 +201,33 @@ def argument_checker(
     """A paid tool call's refusal, decided before the gate quotes a price, or None to go on.
 
     The x402 gate wraps tools/call outside the SDK's validation, so without this a call with
-    invalid arguments was quoted, and when paid also verified, before it was rejected. First the
-    SDK's own validation (its text, as the SDK words it), then what the service would refuse
-    from the arguments alone (exactly one input, a fetchable URL, a SELECT; ``Service.check_*``),
-    as the typed error the tool would return. None for a valid call or an unknown tool.
+    invalid arguments was quoted, and when paid also verified, before it was rejected. First an
+    argument the tool does not declare, then the SDK's own validation (its text, as the SDK
+    words it), then what the service would refuse from the arguments alone (exactly one input,
+    a fetchable URL, a SELECT; ``Service.check_*``), as the typed error the tool would return.
+    None for a valid call or an unknown tool.
+
+    The SDK drops undeclared names silently: {artifact_id, url} to a convert that took no
+    artifact_id was charged and converted the url alone, and {artifact_id, content_base64} to
+    inspect_parquet inspected the artifact, with nothing to say the other input was ignored. A
+    null value asks for nothing and is let through, as the SDK lets it.
     """
 
     def check(name: str, arguments: dict[str, Any]) -> CallToolResult | None:
         tool = server._tool_manager.get_tool(name)  # private: mcp 2.x has no public lookup
         if tool is None:
             return None
+        declared = list(tool.parameters.get("properties", {}))
+        unknown = [
+            key for key, value in arguments.items() if key not in declared and value is not None
+        ]
+        if unknown:
+            return _err(
+                InvalidRequest(
+                    f"{name} does not take {', '.join(unknown)}.",
+                    hint=f"Its parameters are: {', '.join(declared)}; you were not charged.",
+                )
+            )
         try:
             validated = tool.fn_metadata.validate_arguments(arguments)
         except ValidationError as exc:
