@@ -15,11 +15,15 @@ exact and cheap. Strategy:
    of equals: a title line above a table (a merged title cell, or a long line that text
    alignment cut into one piece per column) is dropped and reported, not used as column names;
    a section row ('North' alone) or a first row holding a value ('Total', 'TBD', '9999.00')
-   stays a data row.
+   stays a data row. A first row written like the rows under it is data, not names: the table
+   has no header row, and its columns are column_1, column_2, ... (``options.header`` decides
+   when the caller knows better).
 4. A table that continues across pages is merged in page order: by its repeated header (the
    repeats dropped), or, with no repeated header, when the next page's table has the same width
    and starts with a row typed like the body (numbers where the body has numbers), down to a
-   single row spilled onto the next page.
+   single row spilled onto the next page; one line above such rows (a running title, 'Table 1
+   (continued)') is dropped and reported. The last one or two rows of a borderless table, too
+   few for text alignment to see, are read at the previous page's column edges.
 5. The largest table wins unless the caller picks one (``pdf_table``); every table found is
    listed in the report, so nothing is chosen silently.
 
@@ -110,6 +114,7 @@ _TYPED = frozenset({"number", "date"})
 # What a data row may hold under a typed column: a value, a missing-value token, or nothing.
 _DATA = _TYPED | {"missing", "empty"}
 _YEAR = re.compile(r"(?:19|20)\d\d")
+_DIGITS = re.compile(r"\d+")
 _BOUNDED_MARK = "_aimart_bounded"
 _MAX_REASON = 300
 
@@ -349,6 +354,11 @@ class _Found:
     rows: list[list[str]]
     strategy: str
     captions: list[str] = field(default_factory=list)
+    # The x positions of a borderless table's column edges, for reading the next page's top
+    # with them (``_spilled_rows``).
+    edges: tuple[float, ...] = ()
+    # Rows read that way: only ever more body for the table above them, never a table.
+    spill: bool = False
 
 
 @dataclass
@@ -358,6 +368,41 @@ class _Table:
     pages: list[int] = field(default_factory=list)
     strategy: str = "ruling lines"
     captions: list[str] = field(default_factory=list)
+    # Per column: cells holding a value, and how many of those are numbers or dates. Kept as
+    # rows are added (``add``): recounting the body on every page made merging quadratic, and
+    # a 300-page ledger of 40 rows a page, its header printed once, took 18 s (now 0.14 s).
+    _filled: list[int] = field(default_factory=list, init=False, repr=False)
+    _typed: list[int] = field(default_factory=list, init=False, repr=False)
+    # Which cells are filled, in the rows of the body (``shapes``), and in those holding no
+    # number or date (``text_shapes``: a section row, 'North'). ``_continuation`` keeps a line
+    # shaped like a text row as body; ``_spilled_body`` keeps only rows shaped like a body row.
+    shapes: set[frozenset[int]] = field(default_factory=set, init=False, repr=False)
+    text_shapes: set[frozenset[int]] = field(default_factory=set, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        rows, self.rows = self.rows, []
+        self._filled = [0] * len(self.header)
+        self._typed = [0] * len(self.header)
+        self.add(rows)
+
+    def add(self, rows: list[list[str]]) -> None:
+        for row in rows:
+            values = False
+            for c in range(len(self.header)):
+                kind = _kind(_cell(row, c))
+                if kind not in {"empty", "missing"}:
+                    self._filled[c] += 1
+                    self._typed[c] += kind in _TYPED
+                    values = values or kind in _TYPED
+            shape = _shape(row)
+            self.shapes.add(shape)
+            if not values:
+                self.text_shapes.add(shape)
+        self.rows.extend(rows)
+
+    def typed(self) -> list[int]:
+        """The columns whose body is mostly numbers or dates, as ``_typed_share`` judges."""
+        return [c for c, n in enumerate(self._filled) if n and self._typed[c] / n >= 0.8]
 
     @property
     def cells(self) -> int:
@@ -501,6 +546,52 @@ def _never(_: int) -> bool:
     return False
 
 
+def _line(row: list[str]) -> str:
+    """A row as the one line of text it is when it is not table data (a title, a caption)."""
+    return " ".join(c for c in row if c)
+
+
+def _form(value: str) -> str:
+    """A value with its digits collapsed: '12.34' -> '0.0', '4000' -> '0', '2025-02-02' ->
+    '0-0-0'. The sign is dropped, so a negative amount has the form of a positive one."""
+    return _DIGITS.sub("0", value.strip().lstrip("+-"))
+
+
+def _forms(body: list[list[str]], typed: list[int]) -> dict[int, set[str]]:
+    """How the values of each typed column of ``body`` are written (``_form``)."""
+    return {c: {_form(v) for v in _values(body, c)} for c in typed}
+
+
+def _typed_like(row: list[str], forms: dict[int, set[str]]) -> bool:
+    """Does ``row`` hold, under every typed column, nothing, a missing-value token, or a value
+    written the way some value of that column in the body is (``_forms``)?
+
+    A header of codes or dates over number columns ('Account', '4000', '5000' above amounts
+    like '12.34'; 'Item', '2024-12-31', '2023-12-31' on a balance sheet) is a data row to
+    ``_data_row``, but is not written like the body: it stays the header.
+    """
+    for c, written in forms.items():
+        value = _cell(row, c)
+        if _kind(value) not in {"empty", "missing"} and _form(value) not in written:
+            return False
+    return True
+
+
+def _headless(rows: list[list[str]], typed: list[int]) -> list[list[str]]:
+    """``rows`` under an empty header row when its first row is data: a table with no header.
+
+    The first row was the header whatever it held, so a borderless table with no header row
+    lost its first data row, and its columns were named after it ('c_1', 'c_2025_02_02',
+    'east'): 29 of 30 rows, a 200. Under a running title it lost the same row once the title
+    was dropped. A first row written like the rows under it (``_typed_like``) is data, as for
+    a CSV. The empty row names the columns column_1, column_2, ..., and on later pages
+    ``_continuation`` reads it as no header, never as a repeat of another table's.
+    """
+    if not _typed_like(rows[0], _forms(rows[1:], typed)):
+        return rows
+    return [[""] * max(len(r) for r in rows), *rows]
+
+
 def _split_captions(
     rows: list[list[str]], running: Callable[[int], bool] = _never
 ) -> tuple[list[list[str]], list[str]]:
@@ -527,7 +618,9 @@ def _split_captions(
 
     Typed columns are judged on the bottom half of the rows, which is body as long as there are
     no more leading rows than data rows. With no row naming a typed column nothing is dropped
-    and rows[0] stays the header, as before. A header of two lines keeps its first line.
+    and rows[0] stays the header, as before. A header of two lines keeps its first line. With
+    no header at all (the first row is data, or every row above it is running text), the rows
+    come back under an empty header row (``_headless``).
     """
     if len(rows) < 3:
         return rows, []
@@ -536,8 +629,10 @@ def _split_captions(
     if not typed:
         return rows, []
     first = next((i for i, row in enumerate(rows) if _data_row(row, typed, tail)), None)
-    if first is None or first == 0:
+    if first is None:
         return rows, []
+    if first == 0:
+        return _headless(rows, typed), []
     if first == 1:
         # One row above the data: the header, or a running page title on a page that does
         # not repeat the header. Kept, that title became the page's header, so the page was
@@ -545,14 +640,17 @@ def _split_captions(
         # page came back as 80 of its 120 rows, its columns named after the title. A header
         # names every typed column, and only a row that does not is worth a glyph pass.
         if _names(rows[0], typed, tail) < len(typed) and running(0):
-            return rows[1:], [" ".join(c for c in rows[0] if c)]
+            return _headless(rows[1:], typed), [_line(rows[0])]
         return rows, []
     names = [_names(rows[i], typed, tail) for i in range(first)]
     ranked = sorted((i for i in range(first) if names[i]), key=lambda i: (-names[i], i))
-    header = next((i for i in ranked if not running(i)), 0)
-    if header == 0:
+    header = next((i for i in ranked if not running(i)), None)
+    if header is None and ranked:  # every row naming columns is running text: no header
+        cut = max(ranked) + 1
+        return _headless(rows[cut:], typed), [_line(r) for r in rows[:cut]]
+    if not header:
         return rows, []
-    return rows[header:], [" ".join(c for c in r if c) for r in rows[:header]]
+    return rows[header:], [_line(r) for r in rows[:header]]
 
 
 def _running_text(table: Table, words: list[dict[str, Any]]) -> set[int]:
@@ -634,8 +732,33 @@ def _aligned_tables(page: Page, number: int) -> list[_Found]:
     for table in page.find_tables(settings):
         rows, captions = _aligned_table(table, words, settings)
         if _looks_tabular(rows):
-            found.append(_Found(number, rows, "text alignment", captions))
+            edges = tuple(sorted({x for cell in table.cells for x in (cell[0], cell[2])}))
+            found.append(_Found(number, rows, "text alignment", captions, edges))
     return found
+
+
+def _spilled_rows(page: Page, number: int, edges: tuple[float, ...]) -> list[_Found]:
+    """The top of a page with no borderless table, cut at the column ``edges`` of the one that
+    ended the previous page: the rows of that table that spilled onto this page.
+
+    Text alignment sees a column only where three words stack in it, so the last one or two
+    rows of a table, alone on its last page (under a running title or not), were no table and
+    were lost with a 200 and no warning: 125 of 126 rows. ``_merge`` keeps only the leading
+    rows that are more body for that table (``_spilled_body``), so prose, a footer or a lone
+    date below them stays out.
+    """
+    settings = TableSettings.resolve(
+        {
+            "vertical_strategy": "explicit",
+            "explicit_vertical_lines": list(edges),
+            "horizontal_strategy": "text",
+        }
+    )
+    tables = page.find_tables(settings)  # topmost first
+    if not tables:
+        return []
+    rows, captions = _aligned_table(tables[0], _Words(page), settings)
+    return [_Found(number, rows, "text alignment", captions, spill=True)] if rows else []
 
 
 @dataclass
@@ -703,6 +826,7 @@ def _scan(doc: PDF, pages: list[int]) -> _Scan:
 def _scan_pages(doc: PDF, pages: list[int], budget: _Budget, scan: _Scan) -> None:
     wanted = set(pages)
     bordered_table = False
+    tail: _Found | None = None  # the last borderless table found, for ``_spilled_rows``
     for number, page_obj in enumerate(PDFPage.create_pages(doc.doc), 1):
         if number > pages[-1]:
             break
@@ -720,7 +844,11 @@ def _scan_pages(doc: PDF, pages: list[int], budget: _Budget, scan: _Scan) -> Non
             # Pointless once a bordered table exists: it wins.
             bordered_table = bordered_table or any(_usable(f.rows) for f in bordered)
             if not bordered_table:
-                scan.aligned.extend(_aligned_tables(page, number))
+                aligned = _aligned_tables(page, number)
+                if not aligned and tail is not None and tail.page == number - 1:
+                    aligned = _spilled_rows(page, number, tail.edges)
+                scan.aligned.extend(aligned)
+                tail = next((f for f in reversed(aligned) if not f.spill), None)
         finally:
             page.close()  # release its glyph objects before the next page is parsed
 
@@ -735,8 +863,73 @@ def _continues(table: _Table, rows: list[list[str]]) -> bool:
     """
     if len(rows[0]) != len(table.header):
         return False
-    typed = [c for c in range(len(table.header)) if _typed_share(_values(table.rows, c)) >= 0.8]
+    typed = table.typed()
     return bool(typed) and _data_row(rows[0], typed, table.rows)
+
+
+def _shape(row: list[str]) -> frozenset[int]:
+    return frozenset(c for c, v in enumerate(row) if v)
+
+
+def _continuation(table: _Table, rows: list[list[str]]) -> tuple[list[list[str]], str] | None:
+    """The part of ``rows``, the first table on the page after ``table``'s last, that is more
+    body for ``table``, and the line dropped above it ('' for none). None: a new table.
+
+    The page starts with body (``_continues``), with no header row (``_headless``), or with one
+    line above body. That line was the page's header, so the page neither repeated page 1's
+    header nor continued its body: a ledger split into one table per page and the largest was
+    returned with a 200, 41 of 120 rows under 'Ledger p2', 79 under 'Table 1 (continued)'.
+    The line is body when it holds a value under a typed column (a 'pending' row: a value
+    makes a row body, as in ``_names``) or is shaped like a row of text only the body already
+    holds (a section row, 'South'). It starts a new table when it is a header of years, names
+    every typed column, or fills more than half the cells: a new table's header with a blank
+    corner ('', 'Shipped', 'Carrier', ...) over a body typed like this one's was dropped as a
+    title and the two tables merged. Anything else (a title, in one or two cells) is dropped
+    as a caption.
+    """
+    if not any(rows[0]):
+        return (rows[1:], "") if len(rows) > 1 and _continues(table, rows[1:]) else None
+    if _continues(table, rows):
+        return rows, ""
+    if len(rows) < 2 or not _continues(table, rows[1:]):
+        return None
+    line = rows[0]
+    typed = table.typed()
+    if _year_names(line, typed, table.rows):
+        return None
+    if any(_kind(_cell(line, c)) in _TYPED for c in typed):
+        return rows, ""
+    if _shape(line) in table.text_shapes:
+        return rows, ""
+    if _names(line, typed, table.rows) >= len(typed) or 2 * len(_shape(line)) > len(line):
+        return None
+    return rows[1:], _line(line)
+
+
+def _spilled_body(table: _Table, rows: list[list[str]]) -> list[list[str]]:
+    """The leading ``rows`` of a page read at ``table``'s column edges (``_spilled_rows``) that
+    are rows of its body: data rows, written like the body (``_typed_like``) and filling cells
+    a body row fills, and section rows shaped like the body's ('South') above data rows.
+    Nothing tells them from the page's other text but how they look, so a page number or a
+    date alone under a number column ('4', '2025-01-31') is not taken.
+    """
+    typed = table.typed()
+    forms = _forms(table.rows, typed)
+
+    def data(row: list[str]) -> bool:
+        return (
+            _data_row(row, typed, table.rows)
+            and _typed_like(row, forms)
+            and _shape(row) in table.shapes
+        )
+
+    def section(row: list[str]) -> bool:
+        return _shape(row) in table.text_shapes and not any(_kind(v) in _TYPED for v in row)
+
+    end = next((i for i, row in enumerate(rows) if not (data(row) or section(row))), len(rows))
+    while end and not data(rows[end - 1]):  # a section row heads data rows, or is not body
+        end -= 1
+    return rows[:end]
 
 
 def _squashed(text: str) -> str:
@@ -774,21 +967,21 @@ def _merge(found: list[_Found]) -> list[_Table]:
         if last is not None and item.page > last.pages[-1] and _repeats_caption(item, last):
             # The title already dropped above this table's header, repeated at the top of a
             # later page. In one column, positions cannot tell it from a header row.
-            item.captions.append(" ".join(c for c in item.rows[0] if c))
+            item.captions.append(_line(item.rows[0]))
             item.rows = item.rows[1:]
         header = item.rows[0]
-        same = next((t for t in tables if t.header == header), None)
-        if same is not None:  # a repeated header: the table continues on this page
-            same.rows.extend(r for r in item.rows[1:] if r != header)
-            same.pages.append(item.page)
-            same.captions.extend(item.captions)
-            last = same
-        elif last is not None and last_page == item.page - 1 and _continues(last, item.rows):
+        # An empty header row is no header (``_headless``), never a repeat of another table's.
+        same = next((t for t in tables if t.header == header), None) if any(header) else None
+        taken = None
+        if same is None and last is not None and last_page == item.page - 1:
             # The first table on this page, right after the last one on the previous page.
-            last.rows.extend(item.rows)
-            last.pages.append(item.page)
-            last.captions.extend(item.captions)
-        elif not _usable(item.rows):
+            taken = _continuation(last, item.rows)
+        if same is not None:  # a repeated header: the table continues on this page
+            target, body = same, [r for r in item.rows[1:] if r != header]
+        elif last is not None and taken is not None:
+            target, (body, line) = last, taken
+            item.captions.extend([line] if line else [])
+        elif item.spill or not _usable(item.rows):
             # A 1-row box that continues nothing (a note, a signature block) is not a table,
             # nor the first table on its page. Dropping such pieces before merging lost the
             # last row of a table whenever it alone spilled onto the next page.
@@ -802,6 +995,14 @@ def _merge(found: list[_Found]) -> list[_Table]:
                 captions=list(item.captions),
             )
             tables.append(last)
+            last_page = item.page
+            continue
+        if item.spill and not (body := _spilled_body(target, body)):
+            continue
+        target.add(body)
+        target.pages.append(item.page)
+        target.captions.extend(item.captions)
+        last = target
         last_page = item.page
     return [t for t in tables if t.rows]
 
@@ -845,6 +1046,36 @@ def _raise_unreadable(exc: Exception) -> NoReturn:
         f"Could not read the PDF: {_reason(inner)}",
         hint="Check the file opens in a PDF viewer; if it is not a PDF, pass options.format.",
     ) from exc
+
+
+def _settle_header(table: _Table, header: bool | None) -> list[str]:
+    """Apply ``options.header`` to the chosen table, and say when the header is a guess.
+
+    Whether the first row holds names is judged from how it is written (``_headless``), as
+    for a CSV: a header of plain numbers ('Region', '1', '2', '3') reads as data, and a first
+    data row written unlike the rest ('1,204.50' above no other thousands) as the header.
+    Either way the warning names the option that settles it.
+    """
+    width = len(table.header)
+    if not any(table.header):
+        if header and table.rows:  # the caller says the first row holds the names
+            table.header = table.rows.pop(0)
+        elif header is None:
+            return [
+                f"no header row: the first row is data, so the columns are named column_1 to "
+                f"column_{width}; pass header=true if it holds the column names"
+            ]
+        return []
+    if header is False:  # the caller says the first row is data
+        table.rows.insert(0, table.header)
+        table.header = [""] * width
+    elif header is None and (typed := table.typed()) and _data_row(table.header, typed, table.rows):
+        shown = ", ".join(repr(c[:20]) for c in table.header[:6])
+        return [
+            f"the header row ({shown}) holds numbers or dates as the data does; pass "
+            "header=false if it is the first data row"
+        ]
+    return []
 
 
 def read_pdf(
@@ -910,6 +1141,7 @@ def read_pdf(
     else:
         index = max(range(len(tables)), key=lambda i: tables[i].cells)
     chosen = tables[index]
+    warnings.extend(_settle_header(chosen, options.header))
     if len(tables) > 1:
         warnings.append(
             f"found {len(tables)} tables; used {chosen.describe(index)} (pass pdf_table to choose)"
