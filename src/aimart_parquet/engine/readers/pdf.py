@@ -380,8 +380,7 @@ class _Table:
     pages: list[int] = field(default_factory=list)
     strategy: str = "ruling lines"
     captions: list[str] = field(default_factory=list)
-    # The header was printed again atop a later page: names, whatever they hold, so
-    # ``_settle_header`` does not offer to read it as data.
+    # The header was printed again atop a later page (``_settle_header`` reads it as names).
     repeated: bool = False
     # Per column: cells holding a value, and how many of those are numbers or dates. Kept as
     # rows are added (``add``): recounting the body on every page made merging quadratic, and
@@ -532,6 +531,11 @@ def _kind(cell: str) -> str:
     if cell.strip() and cell.strip().lower() in DEFAULT_NULL_TOKENS:
         return "missing"
     return _cell_kind(cell)
+
+
+def _holds_text(row: list[str]) -> bool:
+    """Does ``row`` name something: a cell that is neither a value nor a missing-value token?"""
+    return any(_kind(v) not in _DATA for v in row)
 
 
 def _values(rows: list[list[str]], col: int) -> list[str]:
@@ -1188,12 +1192,14 @@ def _repeated(tables: list[_Table], row: list[str], page: int) -> _Table | None:
     header printed atop every page (fpdf2's default, and most report writers') was a data row
     on each: 123 rows for 120, and header=true took only the first copy away. A row atop a
     later page that is the first row of a table read without a header is that table's header
-    (``_Table.promote``), and its copies are dropped as any repeated header's are.
+    (``_Table.promote``), and its copies are dropped as any repeated header's are. Only a row
+    naming something ('Question'): numbers alone atop two pages ('0', '0', '0' in a sparse
+    matrix) are as likely data.
     """
     if not any(row):  # an empty header row is no header, never a repeat of another table's
         return None
     same = next((t for t in tables if t.header == row), None)
-    if same is None:
+    if same is None and _holds_text(row):
         same = next(
             (
                 t
@@ -1316,8 +1322,10 @@ def _settle_header(table: _Table, header: bool | None) -> list[str]:
     Whether the first row holds names is judged from how it is written (``_headless``), as
     for a CSV: a header of plain numbers ('Region', '1', '2', '3') reads as data, and a first
     data row written unlike the rest ('1,204.50' above no other thousands) as the header.
-    Either way the warning names the option that settles it, unless the header was printed
-    atop a later page too (``_Table.repeated``): that is names, so header=false is no remedy.
+    Either way the warning names the option that settles it, unless the header names
+    something and was printed atop a later page too (``_Table.repeated``, 'Question', '1', ...,
+    '5'): that is names, and header=false would read them as a data row. A date alone atop
+    every page ('2025-03-31') names nothing and keeps the warning.
     """
     width = len(table.header)
     if not any(table.header):
@@ -1336,7 +1344,7 @@ def _settle_header(table: _Table, header: bool | None) -> list[str]:
         table.header = [""] * width
     elif (
         header is None
-        and not table.repeated
+        and not (table.repeated and _holds_text(table.header))
         and (typed := table.typed())
         and _data_row(table.header, typed, table.rows)
     ):

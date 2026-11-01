@@ -236,6 +236,24 @@ def test_merge_a_first_row_on_every_page_is_the_header() -> None:
     (table,) = pdf_reader._merge([page(1, SCORES[:4]), _found(2, [["", "", "", ""], *SCORES[4:]])])
     assert table.header == ["", "", "", ""]
     assert table.rows == [LIKERT, *SCORES]
+    # Numbers alone atop two pages name nothing: as likely data (a sparse matrix), kept.
+    zeros = [["0", "0", "0"], ["1", "0", "2"], ["0", "3", "0"]]
+    (table,) = pdf_reader._merge(
+        [_found(1, [["", "", ""], *zeros]), _found(2, [["", "", ""], *zeros[:1], *zeros[2:]])]
+    )
+    assert table.header == ["", "", ""]
+    assert table.rows == [*zeros, zeros[0], zeros[2]]
+
+
+def test_a_repeated_header_naming_nothing_keeps_the_warning() -> None:
+    # A date alone atop every page (r2 C_date_title.pdf) is a title taken as the header, not
+    # names: the warning that it holds a date as the data does stays, as at 7759739.
+    body = [[str(i), f"2025-01-{i:02d}", f"{i}.50"] for i in range(1, 9)]
+    date = ["2025-03-31", "", ""]
+    (table,) = pdf_reader._merge([_found(1, [date, *body[:4]]), _found(2, [date, *body[4:]])])
+    assert table.repeated
+    (warning,) = pdf_reader._settle_header(table, None)
+    assert warning.startswith("the header row ('2025-03-31', '', '') holds numbers or dates")
 
 
 def test_header_true_drops_every_copy_of_the_names() -> None:
