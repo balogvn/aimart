@@ -2,7 +2,7 @@
 
 Found by the second review of this branch, each decided from the request alone:
 
-* ``content_base64`` that base64 cannot decode ("abc") or that decodes to nothing ("") was
+* ``content_base64`` that base64 cannot decode ("a") or that decodes to nothing ("") was
   quoted and, paid, verified before it was refused (400 "not valid base64", 422 "no rows").
 * A JSON body ``json.loads`` refuses with a plain ValueError (bytes that are not UTF-8, an
   integer over Python's 4,300-digit limit) was handed on to the quote, and the paid retry got
@@ -72,11 +72,13 @@ def _refused(r: httpx.Response, status: int, code: str, fake: kit.FakeFacilitato
 # ------------------------------------------------------------------------------ content_base64
 # Each: the content_base64, then the code and message it is refused with.
 BASE64: list[tuple[str, str, str]] = [
-    ("abc", "invalid_request", "content_base64 is not valid base64."),  # incorrect padding
+    # "abc" was here as incorrect padding; unpadded, it is now read as the 2 bytes it encodes.
+    ("YWJjZ", "invalid_request", "content_base64 is not valid base64."),  # no padding completes it
     ("a", "invalid_request", "content_base64 is not valid base64."),
     ("café", "invalid_request", "content_base64 is not valid base64."),  # not ASCII
     ("", "invalid_request", "content_base64 is empty."),
-    ("!!!!", "invalid_request", "content_base64 is empty."),  # no base64 characters at all
+    # No base64 characters at all: "empty" while unknown characters were dropped, now refused.
+    ("!!!!", "invalid_request", "content_base64 is not valid base64."),
     ("data:text/csv;base64,", "invalid_request", "content_base64 is empty."),
 ]
 
@@ -115,7 +117,12 @@ async def test_base64_over_the_input_limit_is_refused_before_the_quote(
 
 
 async def test_valid_base64_is_still_quoted(paid_app: kit.AppHarness) -> None:
-    for value in (kit.b64(CSV), "data:text/csv;base64," + kit.b64(CSV), "YSxi\nCjEs\nMgo="):
+    for value in (
+        kit.b64(CSV),
+        "data:text/csv;base64," + kit.b64(CSV),
+        "YSxi\nCjEs\nMgo=",
+        base64.urlsafe_b64encode(CSV).decode().rstrip("="),
+    ):
         r = await paid_app.http.post("/v1/convert", json={"content_base64": value})
         assert r.status_code == 402, (value, r.text)
 
