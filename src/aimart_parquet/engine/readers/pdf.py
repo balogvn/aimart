@@ -25,7 +25,10 @@ exact and cheap. Strategy:
    single row spilled onto the next page. A line above such rows is dropped and reported only
    on evidence that it is this table's title (it says 'continued', it is the line dropped above
    page 1, or it names its page), or kept when it is body (a section row). A line that may be
-   a new table's header or title, or that nothing settles, splits the page off instead, with
+   a new table's header (it names every typed column or fills more than half the cells) is a
+   title only as the line dropped above page 1: 'P02' or 'Cont.' in a header is a column's
+   name, not a page label or 'continued'. A line that may be a new table's header or title,
+   or that nothing settles, splits the page off instead, with
    the 'found N tables' warning: a split is a reported partial result, a merged table or a
    title kept as a row is silent wrong data. The last one or two rows of a borderless table,
    too few for text alignment to see, are read at the previous page's column edges.
@@ -986,7 +989,10 @@ def _running_title(table: _Table, line: str, page: int) -> bool:
     d4d0ad0), each merged a different table without a header row into the one above (round 4: Q1, Q3,
     Q10, Q11), where 07fa450 split. A page label says only that the line is the page's, not
     the table's: under a table with no header over its typed columns (``_headless``), whose
-    next page lacking a header says nothing either, it splits too.
+    next page lacking a header says nothing either, it splits too. And only one: a line with
+    a label per column ('P01', 'P02', ...; 'P5', 'P10', ...) is a header of periods or
+    percentiles, one of which may be the page's (found reviewing d13688e, and
+    ``_header_like``).
     """
     text = _squashed(line)
     if _CONTINUED.search(text.lower()) or text in {_squashed(c) for c in table.captions}:
@@ -994,7 +1000,7 @@ def _running_title(table: _Table, line: str, page: int) -> bool:
     if not any(_cell(table.header, c) for c in table.typed()):
         return False
     numbers = _PAGE_LABEL.findall(line) or ([text] if text.isdecimal() else [])
-    return any(n.lstrip("0") == str(page) for n in numbers)
+    return len(numbers) == 1 and numbers[0].lstrip("0") == str(page)
 
 
 def _section_row(table: _Table, row: list[str]) -> bool:
@@ -1065,6 +1071,14 @@ def _body_row(table: _Table, row: list[str]) -> bool:
     return _typed_like(row, table.forms(table.typed())) and _shape(row) in table.shapes
 
 
+def _header_like(table: _Table, row: list[str], typed: list[int]) -> bool:
+    """May ``row``, atop a page over more of ``table``'s body, be a new table's header? It
+    names every typed column, or fills more than half the cells: a header with a year or a
+    blank among its names ('Sector', '2024', 'Ret.', 'Cont.'; 'Sector', '', 'Ret.', 'Cont.')
+    names no typed column to ``_names``, which reads a row holding a value as body."""
+    return _names(row, typed, table.rows) >= len(typed) or 2 * len(_shape(row)) > len(row)
+
+
 def _continuation(
     table: _Table, found: _Found, tops: dict[int, _Found]
 ) -> tuple[list[list[str]], str] | None:
@@ -1089,7 +1103,12 @@ def _continuation(
       a row written and filled like a body row (``_body_row``: not '', '1', '2', '3' over
       amounts like '1,234.56', a new table's header of numbers). It is dropped and reported.
       Lines dropped above the rows before ``_merge`` sees them (``_split_captions``: a title
-      cut into the columns) need the same evidence.
+      cut into the columns) need the same evidence. A line that may be a new table's header
+      (``_header_like``) is one only when it was already dropped above the table: a page
+      label or 'cont.' in a header is a column's name. Found reviewing d13688e, which asked
+      first: 'Cost centre', 'P01', 'P02', ... named page 2 ('P02'), percentiles ('P5', 'P10',
+      ...) pages 5 and 10, and 'Sector', ..., 'Ret.', 'Cont.' ended like 'Table 1. Cont.', so
+      a different table on the next page merged in under the first one's names: 60 rows for 30.
     - a 'pending' row (``_pending``: 'Area9', '109', 'pending'), body.
     - a section row (``_section_row``, 'South') when another page of the table starts with
       body (``_untitled``), so the pages carry no running title, and page 1 had a header over
@@ -1116,15 +1135,14 @@ def _continuation(
     typed = table.typed()
     if _year_names(line, typed, table.rows) or not _body_row(table, rows[1]):
         return None
-    if _running_title(table, _line(line), page):
+    header = _header_like(table, line, typed)
+    if header and _squashed(_line(line)) in {_squashed(c) for c in table.captions}:
+        return rows[1:], _line(line)
+    if not header and _running_title(table, _line(line), page):
         return rows[1:], _line(line)
     if _pending(table, line, typed):
         return rows, ""
-    if (
-        _names(line, typed, table.rows) >= len(typed)
-        or 2 * len(_shape(line)) > len(line)
-        or not any(_cell(table.header, c) for c in typed)
-    ):
+    if header or not any(_cell(table.header, c) for c in typed):
         return None
     if _section_row(table, line) and _untitled(table, page, tops):
         return rows, ""
