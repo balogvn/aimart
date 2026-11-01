@@ -126,10 +126,10 @@ class Fetched:
     size: int
 
 
-@dataclass(frozen=True)
+@dataclass
 class _CallDownloads:
-    deadline: float  # on anyio's clock
-    seconds: float
+    seconds: float  # the call's whole allowance
+    remaining: float  # what its downloads have not spent yet
 
 
 _CALL_DOWNLOADS: ContextVar[_CallDownloads | None] = ContextVar("call_downloads", default=None)
@@ -137,14 +137,19 @@ _CALL_DOWNLOADS: ContextVar[_CallDownloads | None] = ContextVar("call_downloads"
 
 @contextlib.contextmanager
 def downloads_deadline(seconds: float) -> Iterator[None]:
-    """Every ``fetch_url`` inside shares one deadline, ``seconds`` from now.
+    """Every ``fetch_url`` inside shares ``seconds`` of download time.
 
     ``Service._job`` opens one per call, so ``fetch_timeout_s`` bounds all of a call's downloads
     together, as the payment-window check at startup counts it. Each fetch used to get its own:
     a query over `data` and 7 URL tables could download for 8 x 60 s, holding a job slot past
     the 300 s the caller's payment authorization is valid for, so its work could not settle.
+
+    Only the time spent inside ``fetch_url`` counts. A deadline running from the slot also
+    charged the downloads for the artifact sweep, which on GCS lists the bucket and deletes
+    expired blobs one by one, and for fetching the call's stored artifacts back from the
+    bucket: a URL served in a second was refused, "took longer than 60 s in all".
     """
-    token = _CALL_DOWNLOADS.set(_CallDownloads(anyio.current_time() + seconds, seconds))
+    token = _CALL_DOWNLOADS.set(_CallDownloads(seconds, seconds))
     try:
         yield
     finally:
@@ -243,7 +248,8 @@ async def fetch_url(
         (b"Accept-Encoding", b"identity"),
     ]
     call = _CALL_DOWNLOADS.get()
-    limit = deadline_s if call is None else min(deadline_s, call.deadline - anyio.current_time())
+    limit = deadline_s if call is None else min(deadline_s, call.remaining)
+    started = anyio.current_time()
     current = url
     try:
         with anyio.fail_after(max(0.0, limit)):
@@ -313,6 +319,9 @@ async def fetch_url(
         raise FetchFailed(
             f"Could not download the URL: {exc}", hint="Check the URL and its TLS certificate."
         ) from exc
+    finally:
+        if call is not None:  # a call's fetches run one after another: none is counted twice
+            call.remaining -= anyio.current_time() - started
 
 
 def _redirect_target(current: str, location: bytes) -> str:

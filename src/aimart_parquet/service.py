@@ -218,8 +218,9 @@ class Service:
         if not acquired:
             raise busy
         try:
-            # One download deadline for all of the call's URL inputs, from here: the payment-window
-            # check at startup counts queue_wait_s, then one fetch_timeout_s, per call.
+            # One download allowance for all of the call's URL inputs, as the payment-window
+            # check at startup counts queue_wait_s, then one fetch_timeout_s, per call. Only
+            # time spent downloading draws on it (not the sweep, nor stored artifacts fetched).
             with self.store.hold(), downloads_deadline(self.settings.fetch_timeout_s):
                 yield
         finally:

@@ -262,7 +262,7 @@ to 256 characters that is not one `SELECT` (400 `invalid_request`, 422 `url_not_
 | stored outputs | 512 MiB for all outputs together (256 MiB on the Cloud Run deploy without a bucket) | 413 for one output larger than the whole budget; 503 `busy` while the space is held by recent outputs or outputs still settling |
 | preview and query results | 500 preview rows, 1,000 query rows, cells cut to 2,000 characters, 64 MB in all | more rows: `truncated: true`; over 64 MB: 413 |
 | time | 120 s to convert, 15 s to inspect, preview or query | 504 `timeout` |
-| downloads | 60 s for all of a call's `url` inputs together | 422 `fetch_failed` |
+| downloads | 60 s of downloading for all of a call's `url` inputs together | 422 `fetch_failed` |
 | concurrency | 2 jobs; a call waits up to 10 s for a free one | 503 `busy` |
 
 **Large CSVs, roughly over 180 MB uncompressed, may be refused on the default hosted
