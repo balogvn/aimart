@@ -11,7 +11,8 @@ from typing import TYPE_CHECKING, Any
 
 from aimart_parquet import __version__
 from aimart_parquet.engine.detect import SUPPORTED_EXTENSIONS
-from aimart_parquet.payments.pricing import active_operations
+from aimart_parquet.mcp.server import REMOTE_CONVERT_INPUTS, REMOTE_PARQUET_INPUTS
+from aimart_parquet.payments.pricing import BY_KEY, active_operations
 from aimart_parquet.service import MAX_QUERY_TABLES
 
 if TYPE_CHECKING:
@@ -28,6 +29,26 @@ DESCRIPTION = (
 def _tools(settings: Settings) -> list[str]:
     """MCP tool names, from the same table that prices them."""
     return list(dict.fromkeys(op.tool for op in active_operations(settings)))
+
+
+def _mcp_inputs(settings: Settings) -> str:
+    """Which inputs each remote MCP tool takes, as its parameters declare them.
+
+    llms.txt said every tool took url, content_base64 or artifact_id, but over MCP only
+    convert_to_parquet takes content_base64; an agent that sent bytes to inspect_parquet was
+    refused (or, before argument_checker refused undeclared names, charged for the other input).
+    """
+
+    def takes(tool: str) -> str:
+        inputs = REMOTE_CONVERT_INPUTS if tool == BY_KEY["convert"].tool else REMOTE_PARQUET_INPUTS
+        names = [f"`{name}`" for name in inputs]
+        return f"`{tool}` takes {', '.join(names[:-1])} or {names[-1]}"
+
+    return (
+        "- Over MCP each tool takes only its own inputs: "
+        + "; ".join(takes(tool) for tool in _tools(settings))
+        + ". On REST, convert, inspect, preview and query take all three."
+    )
 
 
 def pricing(settings: Settings, networks: list[dict[str, str]]) -> dict[str, Any]:
@@ -144,6 +165,7 @@ def llms_txt(settings: Settings) -> str:
         "## Notes",
         "",
         "- Inputs: `url` (preferred), `content_base64` + `filename`, or `artifact_id` from an earlier convert.",
+        _mcp_inputs(settings),
         "- Data handling: inputs are deleted when the call ends; "
         f"{retention_policy(settings)['outputs']}. File contents are never logged or used for "
         "training.",
