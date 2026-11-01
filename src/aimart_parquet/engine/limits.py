@@ -1,4 +1,8 @@
-"""Resource limits for one conversion job, decoupled from the settings object."""
+"""Resource limits for one conversion job, decoupled from the settings object.
+
+The defaults are ``Settings``' defaults (``Service`` uses ``from_settings``; tests build
+``Limits()`` directly), so a limit changed in one place is changed in both.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +16,8 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class Limits:
     max_input_bytes: int = 50 * 1024 * 1024
-    max_decompressed_bytes: int = 512 * 1024 * 1024
+    max_decompressed_bytes: int = 256 * 1024 * 1024  # a gzip/bz2/zip stream
+    max_workbook_xml_bytes: int = 512 * 1024 * 1024  # all the XML parts of an xlsx/ods
     max_json_repair_bytes: int = 5 * 1024 * 1024
     duckdb_memory_limit: str = "1GB"
     duckdb_threads: int = 2
@@ -22,6 +27,7 @@ class Limits:
         return cls(
             max_input_bytes=s.max_input_bytes,
             max_decompressed_bytes=s.max_decompressed_bytes,
+            max_workbook_xml_bytes=s.max_workbook_xml_bytes,
             max_json_repair_bytes=s.max_json_repair_bytes,
             duckdb_memory_limit=s.duckdb_memory_limit,
             duckdb_threads=s.duckdb_threads,

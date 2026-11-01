@@ -260,7 +260,7 @@ Parquet file), a URL that can never be fetched, or SQL of up to 256 characters t
 | limit | default | over it |
 |---|---|---|
 | input size (`url`, `content_base64` or upload) | 50 MB per call, all inputs of the call together; stored `artifact_id`s do not count | 413 `input_too_large` |
-| decompressed size | 512 MB | 413 `input_too_large` |
+| decompressed size | 256 MB for a gzip, bz2 or zip stream; 512 MB for the XML of all the sheets of an xlsx or ods | 413 `input_too_large` |
 | memory per job | 700 MB | 413 `input_too_large` ("The job exceeded its memory budget") |
 | stored outputs | 512 MiB for all outputs together (256 MiB on the Cloud Run deploy without a bucket) | 413 for one output larger than the whole budget; 503 `busy` while the space is held by recent outputs or outputs still settling |
 | preview and query results | 500 preview rows, 1,000 query rows, cells cut to 2,000 characters, 64 MB in all | more rows: `truncated: true`; over 64 MB: 413 |

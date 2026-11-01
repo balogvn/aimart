@@ -77,9 +77,10 @@ flowchart LR
    at about 3.5 times its decompressed size in memory, plus the decompressed file itself, so on
    the default 2 GiB instance CSVs above roughly 120-150 MB decompressed are refused. A
    convert's input is on that disk once: an upload is written into the work directory, and a
-   stored artifact is hard-linked there, not copied. `max_decompressed_bytes` (512 MB) is a
-   bomb cap, not this budget: it also caps the XML of every sheet of a workbook, of which only
-   one is parsed. See [ADR 0005](adr/0005-job-isolation-forkserver.md).
+   stored artifact is hard-linked there, not copied. A gzip/bz2/zip stream also stops as it
+   inflates past `max_decompressed_bytes` (256 MB), and a workbook's XML parts, every sheet
+   counted though one is parsed, have their own `max_workbook_xml_bytes` (512 MB). See
+   [ADR 0005](adr/0005-job-isolation-forkserver.md).
 5. **Engine** (`engine/`). Detection by magic bytes (`detect.py`) is followed by bomb-safe
    decompression (`safety.py`) and UTF-8 transcoding (`text.py`). A reader (`readers/`)
    produces a raw table in a locked-down DuckDB connection (`duck.py`). Next come type

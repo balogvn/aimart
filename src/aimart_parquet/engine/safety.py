@@ -96,6 +96,7 @@ def check_zip(path: Path, cap: int) -> list[zipfile.ZipInfo]:
             f"Zip archive expands to {total} bytes, over the {cap} byte limit.",
             hint="Split the archive or send a smaller extract.",
             limit_bytes=cap,
+            expanded_bytes=total,
         )
     if packed and total / packed > MAX_ZIP_RATIO and total > 10 * _CHUNK:
         raise InvalidInput(

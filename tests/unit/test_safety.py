@@ -101,7 +101,8 @@ class TestCheckZip:
         path = kit.write(tmp_path / "a.zip", kit.zip_bytes({"a.csv": b"0" * (2 * MB)}))
         with pytest.raises(InputTooLarge) as info:
             safety.check_zip(path, MB)
-        assert info.value.details == {"limit_bytes": MB}
+        # expanded_bytes since the workbook check names the size in its own message.
+        assert info.value.details == {"limit_bytes": MB, "expanded_bytes": 2 * MB}
 
     def test_high_ratio_zip_bomb_is_rejected(self, tmp_path) -> None:
         bomb = kit.zip_bytes({"bomb.csv": b"0" * (30 * MB)})

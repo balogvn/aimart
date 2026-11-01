@@ -116,7 +116,8 @@ class TestMessyWorkbook:
 
     def test_xlsx_zip_bomb_is_checked_before_parsing(self, workbook) -> None:
         with pytest.raises(InputTooLarge):
-            kit.convert_path(workbook, limits=Limits(max_decompressed_bytes=100))
+            # The workbook cap since the integration split it from the stream cap.
+            kit.convert_path(workbook, limits=Limits(max_workbook_xml_bytes=100))
 
 
 class TestHelpers:

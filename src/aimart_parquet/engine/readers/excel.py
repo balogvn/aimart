@@ -20,7 +20,7 @@ from aimart_parquet.engine.duck import ident
 from aimart_parquet.engine.models import InputFormat
 from aimart_parquet.engine.readers import RAW_TABLE, RawColumn, RawTable
 from aimart_parquet.engine.safety import check_zip
-from aimart_parquet.errors import InvalidInput, InvalidRequest
+from aimart_parquet.errors import InputTooLarge, InvalidInput, InvalidRequest
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -128,6 +128,24 @@ def _fill_merged_headers(
                     header[c] = text
 
 
+def _check_workbook_zip(path: Path, cap: int) -> None:
+    """xlsx/ods are zips of XML: the bomb check, from the zip's directory, over every part.
+
+    Its own cap, not the stream cap: the parts of every sheet are summed though calamine parses
+    one, so a workbook's small sheet beside large ones would be refused with the stream's 256
+    MB. And its own hint: "Split the archive" names nothing an agent with a workbook can do.
+    """
+    try:
+        check_zip(path, cap)
+    except InputTooLarge as exc:
+        raise InputTooLarge(
+            f"The workbook's XML parts expand to {exc.details['expanded_bytes']} bytes, "
+            f"over the {cap} byte limit for a workbook.",
+            hint="Save the sheet you need as its own workbook or as CSV, then send that.",
+            **exc.details,
+        ) from exc
+
+
 def read_excel(
     con: duckdb.DuckDBPyConnection,
     path: Path,
@@ -137,7 +155,7 @@ def read_excel(
     limits: Limits,
 ) -> RawTable:
     if fmt in {InputFormat.XLSX, InputFormat.ODS}:
-        check_zip(path, limits.max_decompressed_bytes)  # xlsx/ods are zips of XML: bomb check
+        _check_workbook_zip(path, limits.max_workbook_xml_bytes)
     wb: CalamineWorkbook | None = None
     try:
         wb = CalamineWorkbook.from_path(str(path))

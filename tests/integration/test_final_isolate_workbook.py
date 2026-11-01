@@ -8,7 +8,9 @@ of a 200-row 'summary' sheet beside two raw-data sheets of 129.6 MB of XML each 
 07fa450 and became 413 'Zip archive expands to 271774583 bytes, over the 268435456 byte
 limit.' for every sheet, before any was parsed: unpaid, but a lost sale, with a hint ('Split
 the archive') an agent cannot act on. The job cap, which now counts a decompressed stream's
-file, is what bounds a stream's RAM, so the cap is 512 MB again (ADR 0005).
+file, is what bounds a stream's RAM, so the cap was 512 MB again (ADR 0005). Since the
+integration of the final fixes a workbook has its own cap, ``max_workbook_xml_bytes`` (512 MB),
+with a hint about workbooks, and streams are back at 256 MB (test_final_integrate_stream_cap.py).
 """
 
 from __future__ import annotations
@@ -133,6 +135,7 @@ async def test_a_small_sheet_beside_large_ones_converts_with_the_defaults(
     make_settings: Callable[..., Settings], workbook: Path
 ) -> None:
     settings = make_settings()
+    assert settings.max_decompressed_bytes == 256 * _MB  # the stream cap does not apply
     service = Service(settings, build_store(settings))
     result = await service.convert(_source(workbook), ConvertOptions(sheet="summary"))
     assert result.report.rows == 200
@@ -144,10 +147,19 @@ async def test_the_cap_still_refuses_a_workbook_past_it(
     make_settings: Callable[..., Settings], workbook: Path
 ) -> None:
     # The cap is still a bomb check over every part, from the directory, before inflating.
-    settings = make_settings(max_decompressed_bytes=256 * _MB)
+    # (It was max_decompressed_bytes, shared with streams, until the integration split them.)
+    settings = make_settings(max_workbook_xml_bytes=256 * _MB)
     service = Service(settings, build_store(settings))
-    with pytest.raises(InputTooLarge, match="over the 268435456 byte limit"):
+    with pytest.raises(InputTooLarge) as info:
         await service.convert(_source(workbook), ConvertOptions(sheet="summary"))
+    assert info.value.message.startswith("The workbook's XML parts expand to ")
+    assert info.value.message.endswith(" bytes, over the 268435456 byte limit for a workbook.")
+    # An agent can act on this one; "Split the archive" was meant for zip archives.
+    assert (
+        info.value.hint == "Save the sheet you need as its own workbook or as CSV, then send that."
+    )
+    assert info.value.details["limit_bytes"] == 256 * _MB
+    assert 256 * _MB < info.value.details["expanded_bytes"] < 512 * _MB
 
 
 async def test_the_workbook_converts_paid_in_an_isolated_job_under_the_default_cap(

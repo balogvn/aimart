@@ -104,25 +104,28 @@ OOM-kill the instance and every other caller's request, and both ended in 413, u
   into the work directory the convert then uses (it had a directory of its own, and a 50 MB
   upload counted 100 MB), and a stored artifact given as a convert's input is hard-linked in
   rather than copied, falling back to the copy where a link fails.
-- **`max_decompressed_bytes` stays 512 MB: a bomb cap, not a memory budget.** This amendment
-  first lowered it to 256 MB, sized to the job cap from single-sheet measurements (with the
-  700 MB default the largest inputs that converted were 120 MB of decompressed CSV and an xlsx
-  of 144 MB of XML). That was wrong for workbooks: the excel reader checks the sum of every part
-  against it, though calamine parses only the sheet asked for and writes none of them to disk,
-  and a 27.5 MB workbook of a 200-row `summary` sheet beside two raw sheets of 129.6 MB of XML
-  each, whose `summary` converted at 07fa450, became 413 from the zip's directory for every
-  sheet, before any was parsed. The job cap above is what bounds a stream: its decompressed
-  file is in the work directory and counts. Measured on macOS with the defaults, two of the
-  incident's calls at once: each 500 MiB stream and the child's 60-80 MiB resident stayed under
-  the cap together (under 600 MiB), and the watchdog stopped each job when parsing began, at
-  about 720-900 MiB in all, the overshoot between two polls that any job allocating fast gets
-  (see above). At e8d228e the same pair held about 2.5 GB. An unpaid input of a few KB, such as a
-  PDF drawing glyphs, reaches the cap anyway, so the instance has to hold two jobs at the cap
-  whatever this limit is. The cost: a stream between about 250 and 500 MB, which cannot
-  convert, now spends a job's whole budget before its 413 instead of stopping at 256 MB.
-  Splitting the setting (a stream limit sized to the job cap beside a workbook limit, or
-  counting only the parts calamine reads) would win that back, and belongs to
-  `engine/limits.py` and the readers.
+- **Streams and workbooks have separate caps.** This amendment first lowered
+  `max_decompressed_bytes` to 256 MB, sized to the job cap from single-sheet measurements (with
+  the 700 MB default the largest inputs that converted were 120 MB of decompressed CSV and an
+  xlsx of 144 MB of XML). That was wrong for workbooks: the excel reader checked the sum of
+  every part against the same setting, though calamine parses only the sheet asked for and
+  writes none of them to disk, and a 27.5 MB workbook of a 200-row `summary` sheet beside two
+  raw sheets of 129.6 MB of XML each, whose `summary` converted at 07fa450, became 413 from the
+  zip's directory for every sheet, before any was parsed. Round 2 put the shared setting back
+  at 512 MB, which let a stream between about 250 and 500 MB spend a job's whole budget in the
+  RAM-backed work directory before its 413. The integration of the final fixes split it:
+  `max_decompressed_bytes` (256 MB) caps a gzip/bz2/zip stream, and is checked as it inflates,
+  so a 300 MB gzip CSV is refused at 256 MB (0.3 s once the forkserver is warm);
+  `max_workbook_xml_bytes` (512 MB) caps the XML parts of an xlsx/ods, from the directory, with
+  the hint "Save the sheet you need as its own workbook or as CSV, then send that.". The
+  workbook above converts its `summary` sheet with the defaults. The job cap above still bounds
+  a stream under 256 MB: its decompressed file is in the work directory and counts. Measured
+  on macOS with the defaults, two of the incident's calls at once: each 500 MiB stream and the
+  child's 60-80 MiB resident stayed under the cap together (under 600 MiB), and the watchdog
+  stopped each job when parsing began, at about 720-900 MiB in all, the overshoot between two
+  polls that any job allocating fast gets (see above). At e8d228e the same pair held about
+  2.5 GB. An unpaid input of a few KB, such as a PDF drawing glyphs, reaches the cap anyway, so
+  the instance has to hold two jobs at the cap whatever these limits are.
 - **A crash's log carries no exception text.** The published retention policy says logs never
   hold file contents, and since e8d228e the child's unexpected exception was logged in full,
   which can quote a column name or a cell. The log now has its type and traceback frames only.

@@ -229,7 +229,10 @@ The `input_too_large` messages, and what to change (numbers are the defaults):
 - "The inputs of this call together exceed the 50 MB limit per call.": every `url` and
   `content_base64` input of one call, a query's joined tables included, shares one budget.
   Convert each file first and pass the `artifact_id`s, which do not count.
-- "Decompressed input exceeds the 512 MB limit.", or a zip that expands past it.
+- "Decompressed input exceeds the 256 MB limit." (a gzip or bz2 file), or "Zip archive expands
+  to N bytes, over the 268435456 byte limit.": send the file uncompressed, or a smaller
+  extract. "The workbook's XML parts expand to N bytes, over the 536870912 byte limit for a
+  workbook.": every sheet counts, so save the sheet you need as its own workbook or as CSV.
 - "The job exceeded its memory budget (700 MB) and was stopped.": each job's memory is
   capped. Large CSVs, roughly over 180 MB uncompressed, can reach it on the default hosted
   instance: split them. For a PDF, read fewer pages with `pdf_pages`; for a query, return less.

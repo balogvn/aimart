@@ -71,9 +71,10 @@ exists only for tests.
 ### Untrusted files: caps and process isolation
 
 - **Decompression bombs.** gzip, bz2 and zip are inflated as streams and counted against
-  `AIMART_MAX_DECOMPRESSED_BYTES` (512 MB). Zip archives are checked from the central
+  `AIMART_MAX_DECOMPRESSED_BYTES` (256 MB). Zip archives are checked from the central
   directory before any member is inflated: at most 10,000 members, and a ratio above 250× is
-  refused. Excel files are zips and get the same check.
+  refused. xlsx and ods files are zips and get the same check, with the XML of all their parts
+  counted against `AIMART_MAX_WORKBOOK_XML_BYTES` (512 MB).
 - **Parser crashes and memory bombs.** Every parse of a caller's file (convert, inspect,
   preview, query, and the quantum tools) runs in a short-lived child forked from a
   `forkserver` (`engine/isolate.py`). Native code can crash rather than raise: DuckDB's

@@ -69,17 +69,26 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------- limits
     max_input_bytes: int = 50 * 1024 * 1024
     max_decompressed_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        description=(
+            "Bytes a gzip/bz2/zip input may expand to; past it the call fails with 413 "
+            "input_too_large, unpaid (a zip from its directory, before anything is inflated, a "
+            "gzip/bz2 stream as soon as the next byte would pass it). The decompressed file is "
+            "written to the work directory, RAM on Cloud Run, and counts toward "
+            "job_memory_limit_mb; about 120-150 MB of decompressed CSV already reaches that "
+            "cap, so a stream is stopped here before it fills the instance. Workbooks have "
+            "their own cap, max_workbook_xml_bytes."
+        ),
+    )
+    max_workbook_xml_bytes: int = Field(
         default=512 * 1024 * 1024,
         description=(
-            "Bytes a gzip/bz2/zip input, or all the XML parts of an xlsx/ods together, may "
-            "expand to; past it the call fails with 413 input_too_large, unpaid (a zip or xlsx "
-            "from its directory, before anything is inflated). A bomb cap, not a memory "
-            "budget: job_memory_limit_mb counts a decompressed stream's file in the work "
-            "directory, so that cap bounds the RAM a stream takes, while a workbook's parts "
-            "are summed over every sheet though one is parsed and none is written to disk. "
-            "Lowered to 256 MB in the final review, it refused a 27.5 MB workbook (a 200-row "
-            "sheet beside two raw sheets, 259 MB of XML in all) whose small sheet converted "
-            "before, so it is 512 MB again."
+            "Bytes all the XML parts of an xlsx/ods together may expand to, read from the "
+            "zip's directory before anything is inflated; past it the call fails with 413 "
+            "input_too_large, unpaid. A bomb cap over every sheet, though one is parsed and "
+            "none is written to disk: under the stream cap (256 MB) a 27.5 MB workbook, a "
+            "200-row sheet beside two raw sheets of 259 MB of XML in all, was refused for "
+            "every sheet, so workbooks keep the 512 MB that cap had before."
         ),
     )
     max_json_repair_bytes: int = 5 * 1024 * 1024

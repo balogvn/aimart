@@ -219,17 +219,23 @@ async def test_query_counts_inputs_it_downloaded_but_not_stored_artifacts(
         await isolated.query({"data": inline}, _SLOW_SQL, limit=5, fmt="json")
 
 
-def test_the_decompression_limit_is_a_bomb_cap_not_the_job_budget() -> None:
-    # Round 1 lowered it to 256 MB, sized to the 700 MB job cap from single-sheet measurements.
-    # The excel reader sums every part of a workbook against it, though one sheet is parsed and
-    # none is written to disk, so 256 MB refused a workbook whose small sheet converted before
-    # (integration/test_final_isolate_workbook.py). A stream's decompressed file counts toward
-    # the job cap, which bounds it (test_convert_counts_its_decompressed_input above).
+def test_the_workbook_cap_is_not_the_stream_cap() -> None:
+    # Round 1 lowered max_decompressed_bytes to 256 MB, sized to the 700 MB job cap from
+    # single-sheet measurements. The excel reader summed every part of a workbook against it,
+    # though one sheet is parsed and none is written to disk, so 256 MB refused a workbook whose
+    # small sheet converted before (integration/test_final_isolate_workbook.py), and round 2
+    # put it back at 512 MB for streams too. Workbooks now have max_workbook_xml_bytes (512 MB)
+    # and streams 256 MB again (integration/test_final_integrate_stream_cap.py); a stream's
+    # decompressed file also counts toward the job cap (test_convert_counts_its_decompressed_
+    # input above). This test asserted the shared 512 MB until the split.
     from aimart_parquet.config import Settings
     from aimart_parquet.engine.limits import Limits
 
     settings = Settings(_env_file=None)
     assert settings.job_memory_limit_mb == 700
-    assert settings.max_decompressed_bytes == 512 * _MB
-    assert Limits.from_settings(settings).max_decompressed_bytes == 512 * _MB
+    assert settings.max_decompressed_bytes == 256 * _MB
+    assert settings.max_workbook_xml_bytes == 512 * _MB
+    limits = Limits.from_settings(settings)
+    assert (limits.max_decompressed_bytes, limits.max_workbook_xml_bytes) == (256 * _MB, 512 * _MB)
     assert Limits().max_decompressed_bytes == settings.max_decompressed_bytes  # one default
+    assert Limits().max_workbook_xml_bytes == settings.max_workbook_xml_bytes
