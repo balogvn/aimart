@@ -641,10 +641,10 @@ def _split_captions(
     belong) under their header. A title cut into text under every column ties with the header,
     which only positions tell apart: ``running(i)`` says whether row i is one line of running
     text (``_running_text``), which never names columns. It is asked only about rows that could
-    become the header, as reading positions costs a pass over the page's glyphs. A title cut
-    into text under every column above the data names them all, as a header does, so it is
-    asked about only through ``continued(i)``: running text whose whole line, past the table's
-    edge too, says the table continues ('... (continued)'), never a header.
+    become the header, as reading positions costs a pass over the page's glyphs. One row above
+    the data that names every typed column is the header, unless ``continued(0)`` says it is
+    running text whose whole line, past the table's edge too, says the table continues ('...
+    (continued)'): the caller asks only when it has a reason to (``_aligned_table``).
 
     Typed columns are judged on the bottom half of the rows, which is body as long as there are
     no more leading rows than data rows. With no row naming a typed column nothing is dropped
@@ -934,9 +934,10 @@ def _running_title(row: list[str], captions: list[str]) -> bool:
     pass cuts a line at each page's column edges.
 
     Found reviewing 6b5a217: in the column of the section rows such a title is shaped like one
-    ('North'), so 'Ledger p2', 'Ledger p3', ... became data rows, with no warning. Printed on
-    continuation pages only and across every typed column, '(continued)' names the columns as
-    a header does, and the table split: 79 of 120 rows. Neither is ever a header or body.
+    ('North'), so 'Ledger p2', 'Ledger p3', ... (or '(continued)' three times) became data
+    rows, with no warning: 127 rows for 124. Neither is ever a header or body. A '(continued)'
+    past the table's right edge never reaches the cut text; positions read it (``continued``
+    in ``_aligned_table``).
     """
     text = _squashed(_line(row))
     if _CONTINUED.search(text.lower()):
