@@ -146,3 +146,13 @@ def test_check_input_applies_the_input_limit(make_settings: Callable[..., Settin
     with pytest.raises(InputTooLarge, match="larger than the 1 MB limit"):
         service.check_input(SourceRef(content_base64="A" * (2 * 1024 * 1024)))
     service.check_input(SourceRef(content_base64="YQ=="))  # one byte is enough
+
+
+@pytest.mark.parametrize("value", ["A" * 140, "A" * 1000, "AAAA\n" * 50])
+def test_text_too_long_for_the_limit_is_refused_before_it_is_copied(value: str) -> None:
+    # 100 bytes encode to 136 characters; line breaks do not count, but twice that is refused
+    # before the text is copied at all.
+    with pytest.raises(InputTooLarge) as info:
+        check_base64(value, max_bytes=100)
+    assert info.value.details["limit_bytes"] == 100
+    assert check_base64("AAAA\n" * 34, max_bytes=102) == b"\x00" * 102
