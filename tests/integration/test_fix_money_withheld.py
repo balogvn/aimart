@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Any
 import anyio
 import pytest
 from x402 import SettleResponse, parse_payment_required
-from x402.http.clients.httpx import PaymentError
 
 import aimart_testkit as kit
 from aimart_parquet import artifacts
@@ -371,7 +370,8 @@ async def test_rest_handler_crash_after_the_output_was_stored_deletes_it(
     paid_app: kit.AppHarness, facilitator: kit.FakeFacilitator, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Not an AimartError: the exception escapes the route (a 500, never settled); the file it
-    # stored first must not stay behind.
+    # stored first must not stay behind. It used to reach the server as a bare 500; it is now
+    # the typed one (InternalErrorMiddleware), and still never settled.
     service = paid_app.app.state.service
     real = service.convert
 
@@ -380,9 +380,10 @@ async def test_rest_handler_crash_after_the_output_was_stored_deletes_it(
         raise RuntimeError("bug after storing")
 
     monkeypatch.setattr(service, "convert", convert_then_crash)
-    # The paying client wraps what the in-process transport re-raises.
-    with pytest.raises(PaymentError, match="bug after storing"):
-        await paid_app.paying.post("/v1/convert", **convert_body(SMALL_CSV))
+    r = await paid_app.paying.post("/v1/convert", **convert_body(SMALL_CSV))
+    assert r.status_code == 500
+    assert r.json()["error"]["code"] == "internal_error"
+    assert "bug after storing" not in r.text
     assert facilitator.settled == []
     assert stored(paid_app.settings) == set()
 

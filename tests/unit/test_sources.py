@@ -21,11 +21,11 @@ from aimart_parquet import sources
 from aimart_parquet.errors import FetchFailed, InputTooLarge, InvalidRequest, UrlNotAllowed
 from aimart_parquet.sources import (
     _filename_from,
-    _validate_url,
     decode_base64,
     fetch_url,
     ip_is_public,
     safe_filename,
+    validate_url,
 )
 
 if TYPE_CHECKING:
@@ -74,7 +74,7 @@ def test_ip_is_public(address: str, public: bool) -> None:
     assert ip_is_public(ipaddress.ip_address(address)) is public
 
 
-# ------------------------------------------------------------------------------ _validate_url
+# ------------------------------------------------------------------------------ validate_url
 @pytest.mark.parametrize(
     "url",
     [
@@ -87,7 +87,7 @@ def test_ip_is_public(address: str, public: bool) -> None:
     ],
 )
 def test_validate_url_accepts_web_ports(url: str) -> None:
-    _validate_url(url)
+    validate_url(url)
 
 
 @pytest.mark.parametrize(
@@ -107,7 +107,7 @@ def test_validate_url_accepts_web_ports(url: str) -> None:
 )
 def test_validate_url_rejects(url: str, message: str) -> None:
     with pytest.raises(UrlNotAllowed, match=message):
-        _validate_url(url)
+        validate_url(url)
 
 
 # ------------------------------------------------------------------------------ filenames
@@ -176,9 +176,11 @@ def test_decode_base64_exact_limit_is_accepted(tmp_path: Path) -> None:
     assert decode_base64(data, tmp_path / "out", max_bytes=100) == 100
 
 
-def test_decode_base64_rejects_garbage(tmp_path: Path) -> None:
+@pytest.mark.parametrize("garbage", ["a", "ab!c", "YWJj YQ=*"])
+def test_decode_base64_rejects_garbage(garbage: str, tmp_path: Path) -> None:
+    # "abc" was the example here; unpadded, it is now read as the 2 bytes it encodes.
     with pytest.raises(InvalidRequest, match="not valid base64"):
-        decode_base64("abc", tmp_path / "out", max_bytes=100)
+        decode_base64(garbage, tmp_path / "out", max_bytes=100)
 
 
 # ------------------------------------------------------------------------------ fetch_url
@@ -223,6 +225,12 @@ class Handler(BaseHTTPRequestHandler):
             ),
             "/redirect-file": lambda: self._send(308, headers={"Location": "file:///etc/passwd"}),
             "/redirect-nowhere": lambda: self._send(302),
+            "/redirect-malformed": lambda: self._send(302, headers={"Location": "http://[::1/x"}),
+            # Raw UTF-8 bytes in Location, as servers send them (http.server encodes latin-1).
+            "/redirect-utf8": lambda: self._send(
+                302, headers={"Location": b"/donn\xc3\xa9es.csv".decode("latin-1")}
+            ),
+            "/donn%C3%A9es.csv": lambda: self._send(200, b"a\n1\n"),
             "/loop": lambda: self._send(302, headers={"Location": "/loop"}),
             "/big-declared": lambda: self._send(200, BIG),
             "/big-streamed": self._stream_big,
@@ -333,6 +341,49 @@ async def test_redirect_hops_are_revalidated(
 ) -> None:
     with pytest.raises(UrlNotAllowed, match=message):
         await fetch(f"{server}{path}", tmp_path)
+
+
+@pytest.mark.anyio
+async def test_a_malformed_redirect_is_url_not_allowed(server: str, tmp_path: Path) -> None:
+    # Before: urljoin's ValueError ('Invalid IPv6 URL') escaped, a bare 500 after payment.
+    with pytest.raises(UrlNotAllowed, match="The URL is malformed"):
+        await fetch(f"{server}/redirect-malformed", tmp_path)
+
+
+@pytest.mark.anyio
+async def test_non_ascii_paths_are_percent_encoded(server: str, tmp_path: Path) -> None:
+    # Before: httpcore raised TypeError ("url strings may not include unicode characters").
+    got = await fetch(f"{server}/données.csv", tmp_path)
+    assert got.path.read_bytes() == b"a\n1\n"
+    got = await fetch(f"{server}/redirect-utf8", tmp_path)
+    assert got.path.read_bytes() == b"a\n1\n"
+    assert Handler.requests == ["/donn%C3%A9es.csv", "/redirect-utf8", "/donn%C3%A9es.csv"]
+
+
+@pytest.mark.parametrize(
+    ("url", "message"),
+    [
+        ("http://[::1/a.csv", "The URL is malformed."),
+        ("http://[zz]/a.csv", "The URL is malformed."),
+        ("https://exämple.com/a.csv", "The URL's host is not ASCII."),
+        ("http://\ud800/", "The URL's host is not ASCII."),
+        ("http://e.example/\ud800", "The URL is malformed."),
+        ("http://127.0.0.1/a.csv", "Host '127.0.0.1' resolves to a non-public address."),
+        ("http://[::1]/a.csv", "Host '::1' resolves to a non-public address."),
+        ("http://[fe80::1%25eth0]/", "Host 'fe80::1%25eth0' resolves to a non-public address."),
+    ],
+)
+def test_validate_url_refuses_what_could_never_be_fetched(url: str, message: str) -> None:
+    with pytest.raises(UrlNotAllowed) as info:
+        validate_url(url)
+    assert info.value.message == message
+
+
+def test_validate_url_lets_tests_reach_loopback_and_encodes_non_ascii() -> None:
+    assert validate_url("http://127.0.0.1:8080/a", allow_private=True) == "http://127.0.0.1:8080/a"
+    assert validate_url("https://8.8.8.8/a.csv") == "https://8.8.8.8/a.csv"
+    assert validate_url("https://e.example/é?q=ü#f") == "https://e.example/%C3%A9?q=%C3%BC#f"
+    assert validate_url("https://e.example/a%20b?x=1") == "https://e.example/a%20b?x=1"
 
 
 @pytest.mark.anyio

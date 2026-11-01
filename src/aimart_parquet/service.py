@@ -7,15 +7,22 @@ and both map ``AimartError`` to a >= 400 response that cancels payment.
 Capacity: every operation holds one job slot (``_job``) from before its inputs are fetched
 until its result is built. URL inputs land on the artifact disk, which on Cloud Run is RAM, so
 downloads must count toward capacity and share one byte budget per call.
+
+Before a price is quoted, REST and MCP ask ``check_input`` / ``check_parquet_input`` /
+``check_query`` what the service would refuse about a request from the request alone, so an
+agent never signs for a call that can only fail. ``internal_error`` is the one answer, on both
+transports, for an exception that is not an ``AimartError``.
 """
 
 from __future__ import annotations
 
 import contextlib
 import functools
+import logging
 import re
 import shutil
 import tempfile
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -37,21 +44,29 @@ from aimart_parquet.engine.models import (
     Provenance,
     TabularResult,
 )
-from aimart_parquet.engine.tabular import OutputFormat, preview, query
+from aimart_parquet.engine.tabular import OutputFormat, preview, query, validate_select
 from aimart_parquet.errors import (
     AimartError,
     Busy,
     InputTooLarge,
+    InvalidInput,
     InvalidRequest,
     Timeout,
     UnsupportedFormat,
 )
 from aimart_parquet.provenance import ALGORITHM, build_manifest
 from aimart_parquet.provenance import verify as verify_signature
-from aimart_parquet.sources import decode_base64, fetch_url, safe_filename
+from aimart_parquet.sources import (
+    check_base64,
+    decode_base64,
+    downloads_deadline,
+    fetch_url,
+    safe_filename,
+    validate_url,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 
     from aimart_parquet.artifacts import ArtifactStore
     from aimart_parquet.config import Settings
@@ -64,9 +79,39 @@ if TYPE_CHECKING:
     )
 
 T = TypeVar("T")
+log = logging.getLogger("aimart")
 _QUEUE_FACTOR = 4  # callers allowed to wait per worker slot before we answer "busy"
 MAX_QUERY_TABLES = 8
 TABLE_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+# SQL longer than this is not parsed before the quote, only where the query runs (in the job's
+# child process, with a deadline). DuckDB's parser holds the GIL and is cubic on runs of '+'
+# and '-': 1,600 characters took 1.3 s, and the 20,000 the schema allows would stall the API
+# process for most of an hour. At 256 the worst found is ~7 ms, under what parsing the JSON
+# body of a large request already costs.
+PRECHECK_SQL_CHARS = 256
+
+
+def _not_parquet(raw: bytes) -> str | None:
+    """Why pyarrow cannot open ``raw`` as Parquet, judged from its last 8 bytes as pyarrow
+    judges them first, in pyarrow's words; None when only the engine can tell.
+
+    inspect, preview and query open every input with ``pq.ParquetFile`` (engine/inspect.py,
+    engine/tabular.py). Inline bytes it can only refuse, a CSV sent to preview before it was
+    converted most often, were quoted and, paid, verified before that 422. Only the footer is
+    judged: pyarrow never reads the leading 'PAR1', so a file without it still opens.
+    """
+    if len(raw) < 8:
+        return (
+            f"Parquet file size is {len(raw)} bytes, smaller than the minimum file footer (8 bytes)"
+        )
+    if raw[-4:] == b"PARE":  # an encrypted footer: this server never holds the keys
+        return "Could not read encrypted metadata, no decryption found in reader's properties"
+    if raw[-4:] != b"PAR1":
+        return (
+            "Parquet magic bytes not found in footer. Either the file is corrupted or this is "
+            "not a parquet file."
+        )
+    return None
 
 
 class QuantumUnavailable(AimartError):
@@ -74,9 +119,27 @@ class QuantumUnavailable(AimartError):
     http_status = 501
 
 
+# The inputs a caller can name, in the order a refusal names them (``upload`` is the REST form's
+# file part, never named).
+INPUT_KINDS = ("url", "content_base64", "artifact_id", "path")
+
+
+def inputs_among(names: Iterable[str]) -> tuple[str, ...]:
+    """The input kinds among a route's or tool's parameter names, in the order hints name them."""
+    present = set(names)
+    return tuple(kind for kind in INPUT_KINDS if kind in present)
+
+
 @dataclass(frozen=True)
 class SourceRef:
-    """Exactly one field must be set. ``path`` and ``upload`` are never exposed remotely."""
+    """Exactly one input field must be set. ``path`` and ``upload`` are never exposed remotely.
+
+    ``takes`` is what the route or tool that built the ref accepts (``inputs_among`` of its
+    parameters), for the hints of its refusals; None means every input this mode serves. One
+    list for every surface told MCP agents to "Set one of: url, content_base64, artifact_id."
+    where convert_to_parquet took no artifact_id and inspect_parquet no content_base64, so an
+    agent that followed the hint was refused again.
+    """
 
     url: str | None = None
     content_base64: str | None = None
@@ -84,6 +147,7 @@ class SourceRef:
     filename: str | None = None
     path: str | None = None
     upload: Path | None = None
+    takes: tuple[str, ...] | None = field(default=None, compare=False)
 
     def kinds(self) -> list[str]:
         return [
@@ -117,6 +181,27 @@ class _InputBudget:
             "do not count), or send smaller extracts; you were not charged.",
             limit_bytes=self.total,
         )
+
+
+def internal_error(exc: BaseException, **context: Any) -> AimartError:
+    """The typed 500 for an exception that is not an ``AimartError``, logged without its text.
+
+    The text can quote server paths or the caller's data, so the caller gets only the type and
+    the log gets the type and the frames. Raised on a paid call, it is never settled (REST
+    settles below 400, MCP only a result that is not an error).
+    """
+    frames = [
+        f"{Path(frame.filename).name}:{frame.lineno} in {frame.name}"
+        for frame in traceback.extract_tb(exc.__traceback__)
+    ]
+    log.error(
+        "internal error",
+        extra={"error_type": type(exc).__name__, "frames": frames[-30:], **context},
+    )
+    return AimartError(
+        f"Internal error ({type(exc).__name__}).",
+        hint="Retry; if it persists, report it. You were not charged.",
+    )
 
 
 class Service:
@@ -153,17 +238,36 @@ class Service:
         disk until it ends (``store.hold``): on GCS, fetching a query's second table evicted
         the cached copy of its first, and the join failed on a missing file.
         """
+        busy = Busy(
+            "The server is at capacity.", hint="Retry in a few seconds; you were not charged."
+        )
         stats = self._limiter.statistics()
         if (
             stats.borrowed_tokens >= stats.total_tokens
             and stats.tasks_waiting >= _QUEUE_FACTOR * stats.total_tokens
         ):
-            raise Busy(
-                "The server is at capacity.", hint="Retry in a few seconds; you were not charged."
-            )
-        async with self._limiter:
-            with self.store.hold():
+            raise busy
+        # A paid call's signed authorization expires (payments.PAYMENT_WINDOW_S): waiting for a
+        # slot as long as the calls ahead took (up to 4 x 180 s) ran work that could no longer
+        # settle. queue_wait_s bounds the wait; a free slot is taken even when it is 0.
+        acquired = False
+        try:
+            self._limiter.acquire_nowait()
+            acquired = True
+        except anyio.WouldBlock:
+            with anyio.move_on_after(self.settings.queue_wait_s):
+                await self._limiter.acquire()
+                acquired = True
+        if not acquired:
+            raise busy
+        try:
+            # One download allowance for all of the call's URL inputs, as the payment-window
+            # check at startup counts queue_wait_s, then one fetch_timeout_s, per call. Only
+            # time spent downloading draws on it (not the sweep, nor stored artifacts fetched).
+            with self.store.hold(), downloads_deadline(self.settings.fetch_timeout_s):
                 yield
+        finally:
+            self._limiter.release()
 
     async def _execute(
         self, fn: Callable[..., T], *args: Any, timeout_s: float, isolate: bool, **kwargs: Any
@@ -194,18 +298,97 @@ class Service:
     def _budget(self) -> _InputBudget:
         return _InputBudget(self.settings.max_input_bytes)
 
+    # ------------------------------------------------------------------ before the quote
+    # What the operations below would refuse about a request, decided from the request alone
+    # (no download, no file, no DuckDB run), with the same error. REST's _body_check and MCP's
+    # argument checker call these before a price is quoted: without them an agent signed for,
+    # and the facilitator verified, calls that could only fail. The operations check again.
+    def check_input(self, src: SourceRef, *, table: str | None = None) -> bytes | None:
+        """Exactly one input, of a kind this mode serves; a URL the fetcher could fetch; base64
+        that decodes to a file. Returns the bytes ``content_base64`` holds, if that is it."""
+        self._one_input(src, table=table)
+        if src.url is not None:
+            validate_url(src.url, allow_private=self.settings.allow_private_urls)
+        if src.content_base64 is not None:
+            # The one base64 input a call can have, so the whole budget is its limit, as when
+            # _materialize decodes it.
+            return check_base64(src.content_base64, max_bytes=self.settings.max_input_bytes)
+        return None
+
+    def _takes(self, src: SourceRef) -> tuple[str, ...]:
+        """The inputs a refusal's hint may name: what the calling route or tool accepts."""
+        if src.takes is not None:
+            return src.takes
+        return tuple(kind for kind in INPUT_KINDS if self.local_mode or kind != "path")
+
+    def _one_input(self, src: SourceRef, *, table: str | None = None) -> None:
+        """Exactly one input, and a path only in local mode; hints name only ``_takes``."""
+        kinds = src.kinds()
+        if len(kinds) != 1:
+            got = f"got {len(kinds)} ({', '.join(kinds) or 'none'})"
+            if table is not None:
+                raise InvalidRequest(
+                    f"Table {table!r}: provide exactly one input; {got}.",
+                    hint="Give every entry of `tables` one artifact_id (or url).",
+                )
+            raise InvalidRequest(
+                f"Provide exactly one input; {got}.",
+                hint=f"Set one of: {', '.join(self._takes(src))}.",
+            )
+        if src.path is not None and not self.local_mode:
+            remote = [kind for kind in self._takes(src) if kind != "path"]
+            raise InvalidRequest(
+                "path inputs are only available in local mode.",
+                hint=f"Set one of: {', '.join(remote)}.",
+            )
+
+    def check_parquet_input(self, src: SourceRef) -> None:
+        """``check_input`` for inspect and preview, which read their input as Parquet: inline
+        bytes that can never open as Parquet are refused as the engine refuses them."""
+        raw = self.check_input(src)
+        reason = None if raw is None else _not_parquet(raw)
+        if reason is not None:
+            raise InvalidInput(
+                f"Not a readable Parquet file: {reason}", hint="Convert the file first."
+            )
+
+    def check_query(self, tables: Mapping[str, SourceRef], sql: str) -> None:
+        """The table map ``query`` takes, each table's input, and the SQL (when short)."""
+        if not tables:
+            raise InvalidRequest(
+                "No tables to query.", hint="Pass an input; it is available as table `data`."
+            )
+        if len(tables) > MAX_QUERY_TABLES:
+            raise InvalidRequest(
+                f"{len(tables)} tables requested; the limit is {MAX_QUERY_TABLES}.",
+                hint="Join fewer files per query, or pre-aggregate them.",
+            )
+        bad = [name for name in tables if not TABLE_NAME.match(name)]
+        if bad:
+            raise InvalidRequest(
+                f"Invalid table names: {bad}.",
+                hint="Use lowercase names of letters, digits and underscores, e.g. 'gl' or 'bank_2025'.",
+            )
+        inline = {
+            name: self.check_input(ref, table=None if name == "data" else name)
+            for name, ref in tables.items()
+        }
+        if len(sql) <= PRECHECK_SQL_CHARS:
+            validate_select(sql)  # the engine's own rule: one read-only SELECT
+        for name, raw in inline.items():  # then, as the engine does, each table is opened
+            if raw is not None and _not_parquet(raw) is not None:
+                raise InvalidInput(
+                    f"Table {name!r} is not a readable Parquet file.",
+                    hint="Convert it first (/v1/convert or the convert tool) and pass the "
+                    "returned artifact_id.",
+                )
+
     async def _materialize(
         self, src: SourceRef, workdir: Path, budget: _InputBudget
     ) -> tuple[Path, str | None]:
         await anyio.to_thread.run_sync(self.store.maybe_sweep)
-        kinds = src.kinds()
-        if len(kinds) != 1:
-            allowed = "url, content_base64, artifact_id" + (", path" if self.local_mode else "")
-            raise InvalidRequest(
-                f"Provide exactly one input; got {len(kinds)} ({', '.join(kinds) or 'none'}).",
-                hint=f"Set one of: {allowed}.",
-            )
-        kind = kinds[0]
+        self._one_input(src)
+        kind = src.kinds()[0]
         name = safe_filename(src.filename) if src.filename else None
         if kind == "upload":
             assert src.upload is not None
@@ -240,11 +423,7 @@ class Service:
             assert src.artifact_id is not None
             art, path = self.store.get(src.artifact_id)
             return path, art.filename
-        if not self.local_mode:
-            raise InvalidRequest(
-                "path inputs are only available in local mode.", hint="Pass url or content_base64."
-            )
-        assert src.path is not None
+        assert src.path is not None  # and self.local_mode (_one_input)
         local = Path(src.path).expanduser()  # noqa: ASYNC240 - pure path arithmetic, no I/O
         if not await anyio.Path(local).is_file():
             raise InvalidRequest(

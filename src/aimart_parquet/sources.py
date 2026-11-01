@@ -14,16 +14,17 @@ check and connect is impossible. Redirects re-enter the same path, so each hop i
 
 from __future__ import annotations
 
-import base64
 import binascii
+import contextlib
 import ipaddress
 import re
 import socket
 import ssl
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 
 import anyio
 import httpcore
@@ -32,7 +33,7 @@ from aimart_parquet import __version__
 from aimart_parquet.errors import FetchFailed, InputTooLarge, InvalidRequest, UrlNotAllowed
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
 
 MAX_REDIRECTS = 5
 _CHUNK = 256 * 1024
@@ -42,6 +43,9 @@ _IPV4_COMPATIBLE = ipaddress.ip_network("::/96")  # deprecated ::a.b.c.d form; i
 # SMTP, Redis or SSH on public addresses.
 ALLOWED_PORTS = frozenset({80, 443, 8080, 8443})
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+_ASCII = "".join(map(chr, range(128)))  # quote(..., safe=_ASCII) escapes only non-ASCII
+_NON_ASCII_BYTE = re.compile(rb"[\x80-\xff]")
+_URLSAFE_TO_STANDARD = bytes.maketrans(b"-_", b"+/")
 
 
 def ip_is_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -122,6 +126,36 @@ class Fetched:
     size: int
 
 
+@dataclass
+class _CallDownloads:
+    seconds: float  # the call's whole allowance
+    remaining: float  # what its downloads have not spent yet
+
+
+_CALL_DOWNLOADS: ContextVar[_CallDownloads | None] = ContextVar("call_downloads", default=None)
+
+
+@contextlib.contextmanager
+def downloads_deadline(seconds: float) -> Iterator[None]:
+    """Every ``fetch_url`` inside shares ``seconds`` of download time.
+
+    ``Service._job`` opens one per call, so ``fetch_timeout_s`` bounds all of a call's downloads
+    together, as the payment-window check at startup counts it. Each fetch used to get its own:
+    a query over `data` and 7 URL tables could download for 8 x 60 s, holding a job slot past
+    the 300 s the caller's payment authorization is valid for, so its work could not settle.
+
+    Only the time spent inside ``fetch_url`` counts. A deadline running from the slot also
+    charged the downloads for the artifact sweep, which on GCS lists the bucket and deletes
+    expired blobs one by one, and for fetching the call's stored artifacts back from the
+    bucket: a URL served in a second was refused, "took longer than 60 s in all".
+    """
+    token = _CALL_DOWNLOADS.set(_CallDownloads(seconds, seconds))
+    try:
+        yield
+    finally:
+        _CALL_DOWNLOADS.reset(token)
+
+
 def _filename_from(url: str, disposition: str | None) -> str | None:
     if disposition:
         match = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)\"?", disposition, re.IGNORECASE)
@@ -138,11 +172,27 @@ def safe_filename(name: str) -> str:
     return cleaned[:120]
 
 
-def _validate_url(url: str) -> None:
-    parts = urlsplit(url)
+def _malformed() -> UrlNotAllowed:
+    return UrlNotAllowed("The URL is malformed.", hint="Check the URL; pass a full https:// URL.")
+
+
+def validate_url(url: str, *, allow_private: bool = False) -> str:
+    """Refuse a URL the fetcher could never fetch, from the text alone; return it as fetched.
+
+    Runs before a price is quoted, and again for every redirect hop. ``urlsplit`` raises
+    ValueError on a malformed bracketed host ('http://[::1/a.csv', 'http://[zz]/') and httpcore
+    TypeError on any non-ASCII character: both escaped as bare 500s after the payment was
+    verified. A non-ASCII path or query is percent-encoded as UTF-8, as a browser does. An IP
+    literal that is not public is refused here; a hostname is checked when it is resolved.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError as exc:
+        raise _malformed() from exc
     if parts.scheme not in {"http", "https"}:
         raise UrlNotAllowed("Only http and https URLs are supported.", hint="Pass an https:// URL.")
-    if not parts.hostname:
+    host = parts.hostname
+    if not host:
         raise UrlNotAllowed("The URL has no host.", hint="Pass a full https:// URL.")
     try:
         port = parts.port if parts.port is not None else (443 if parts.scheme == "https" else 80)
@@ -153,6 +203,31 @@ def _validate_url(url: str) -> None:
             f"Port {port} is not allowed.",
             hint=f"Use a URL on one of ports {sorted(ALLOWED_PORTS)}.",
         )
+    if not parts.netloc.isascii():
+        raise UrlNotAllowed(
+            "The URL's host is not ASCII.", hint="Use the host's ASCII (xn--) form."
+        )
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        ip = None  # a hostname: GuardedBackend checks every address it resolves to
+    if ip is not None and not allow_private and not ip_is_public(ip):
+        raise UrlNotAllowed(
+            f"Host {host!r} resolves to a non-public address.",
+            hint="Only publicly reachable http(s) URLs can be fetched.",
+        )
+    if url.isascii():
+        return url
+    try:
+        return urlunsplit(
+            parts._replace(
+                path=quote(parts.path, safe=_ASCII),
+                query=quote(parts.query, safe=_ASCII),
+                fragment=quote(parts.fragment, safe=_ASCII),
+            )
+        )
+    except UnicodeError as exc:  # a lone surrogate has no UTF-8 form
+        raise _malformed() from exc
 
 
 async def fetch_url(
@@ -172,9 +247,12 @@ async def fetch_url(
         (b"Accept", b"*/*"),
         (b"Accept-Encoding", b"identity"),
     ]
+    call = _CALL_DOWNLOADS.get()
+    limit = deadline_s if call is None else min(deadline_s, call.remaining)
+    started = anyio.current_time()
     current = url
     try:
-        with anyio.fail_after(deadline_s):
+        with anyio.fail_after(max(0.0, limit)):
             async with httpcore.AsyncConnectionPool(
                 ssl_context=ssl_context,
                 network_backend=GuardedBackend(allow_private=allow_private),
@@ -182,7 +260,7 @@ async def fetch_url(
                 retries=0,
             ) as pool:
                 for _hop in range(MAX_REDIRECTS + 1):
-                    _validate_url(current)
+                    current = validate_url(current, allow_private=allow_private)
                     async with pool.stream("GET", current, headers=headers) as resp:
                         if resp.status in {301, 302, 303, 307, 308}:
                             location = _header(resp.headers, b"location")
@@ -190,7 +268,7 @@ async def fetch_url(
                                 raise FetchFailed(
                                     "Redirect without a Location header.", hint="Check the URL."
                                 )
-                            current = urljoin(current, location.decode("latin-1"))
+                            current = _redirect_target(current, location)
                             continue
                         if resp.status >= 400:
                             raise FetchFailed(
@@ -222,6 +300,12 @@ async def fetch_url(
                     f"More than {MAX_REDIRECTS} redirects.", hint="Pass the final URL."
                 )
     except TimeoutError as exc:
+        if call is not None:
+            raise FetchFailed(
+                f"Downloading this call's URL inputs took longer than {call.seconds:g} s in all.",
+                hint="Use a faster host or smaller files. To join several files, convert each "
+                "first and pass the artifact_ids: stored artifacts are not downloaded.",
+            ) from exc
         raise FetchFailed(
             f"Downloading the URL took longer than {deadline_s:g} s.",
             hint="Use a faster host or a smaller file.",
@@ -235,6 +319,19 @@ async def fetch_url(
         raise FetchFailed(
             f"Could not download the URL: {exc}", hint="Check the URL and its TLS certificate."
         ) from exc
+    finally:
+        if call is not None:  # a call's fetches run one after another: none is counted twice
+            call.remaining -= anyio.current_time() - started
+
+
+def _redirect_target(current: str, location: bytes) -> str:
+    """Where a Location header points, as ASCII: raw non-ASCII bytes (servers send UTF-8 there)
+    are percent-encoded byte for byte, so the next request names exactly what the server sent."""
+    escaped = _NON_ASCII_BYTE.sub(lambda m: b"%%%02X" % m[0][0], location).decode("ascii")
+    try:
+        return urljoin(current, escaped)
+    except ValueError as exc:  # a malformed bracketed host, as in validate_url
+        raise _malformed() from exc
 
 
 def _header(headers: list[tuple[bytes, bytes]], name: bytes) -> bytes | None:
@@ -252,18 +349,63 @@ def _too_large(max_bytes: int) -> InputTooLarge:
     )
 
 
-def decode_base64(data: str, dest: Path, *, max_bytes: int) -> int:
-    # base64 inflates by 4/3; refuse before decoding rather than after allocating.
-    if len(data) > max_bytes * 4 // 3 + 4:
+def _not_base64() -> InvalidRequest:
+    return InvalidRequest(
+        "content_base64 is not valid base64.",
+        hint="Base64-encode the raw file bytes (standard or URL-safe alphabet) and send nothing "
+        "else in the string.",
+    )
+
+
+def check_base64(data: str, *, max_bytes: int) -> bytes:
+    """The bytes ``content_base64`` holds, or the error it can only ever get. Writes nothing.
+
+    Also run before the price is quoted (``Service.check_input``): a value that does not decode
+    ("a") or decodes to nothing ("") was quoted and, paid, verified, and only then refused.
+    Decoding the 16 MiB a JSON body may hold takes about 60 ms.
+
+    Every character must count. The decoder used to drop any it did not know, so the URL-safe
+    '-' and '_' (``urlsafe_b64encode``, Node's 'base64url') vanished and every later 6-bit
+    group shifted; when a multiple of 4 were dropped there was no error at all, and a 5-row CSV
+    was converted, and charged for, as 1 row of garbage. Accepted besides strict base64 is only
+    what has one reading: either alphabet (they differ in '-_' versus '+/' alone), missing '='
+    padding, ASCII whitespace (line-wrapped MIME base64) and a ``data:<type>;base64,`` prefix.
+    """
+    # base64 inflates by 4/3 (line breaks a little more): refuse before copying the text.
+    if len(data) > 2 * (max_bytes * 4 // 3 + 4):
         raise _too_large(max_bytes)
-    payload = data.split(",", 1)[1] if data.startswith("data:") and "," in data else data
+    payload = data
+    if data[:5].lower() == "data:":  # ':' is in neither alphabet: base64 never starts so
+        header, comma, payload = data[5:].partition(",")
+        if not comma or not header.lower().endswith(";base64"):
+            # "data:text/csv," + encodeURIComponent(csv) is percent-encoded text: decoded as
+            # base64 it was refused, or, sometimes, silently turned into other bytes.
+            raise InvalidRequest(
+                "content_base64 is a data: URL that is not base64-encoded.",
+                hint="Base64-encode the raw file bytes and send them alone, or as "
+                "data:<type>;base64,<data>.",
+            )
     try:
-        raw = base64.b64decode(payload, validate=False)
-    except (binascii.Error, ValueError) as exc:
-        raise InvalidRequest(
-            "content_base64 is not valid base64.", hint="Base64-encode the raw file bytes."
-        ) from exc
+        text = payload.encode("ascii").translate(None, b" \t\n\r\v\f")
+    except UnicodeEncodeError as exc:
+        raise _not_base64() from exc
+    text = text.translate(_URLSAFE_TO_STANDARD) + b"=" * (-len(text) % 4)
+    if len(text) > max_bytes * 4 // 3 + 4:
+        raise _too_large(max_bytes)
+    try:
+        raw = binascii.a2b_base64(text, strict_mode=True)  # any other character is an error
+    except binascii.Error as exc:
+        raise _not_base64() from exc
     if len(raw) > max_bytes:
         raise _too_large(max_bytes)
+    if not raw:  # an empty file has nothing to convert or read: it was a 422 after payment
+        raise InvalidRequest(
+            "content_base64 is empty.", hint="Base64-encode the raw bytes of a non-empty file."
+        )
+    return raw
+
+
+def decode_base64(data: str, dest: Path, *, max_bytes: int) -> int:
+    raw = check_base64(data, max_bytes=max_bytes)
     dest.write_bytes(raw)
     return len(raw)

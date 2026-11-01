@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from charset_normalizer import from_bytes
 
-from aimart_parquet.errors import InvalidRequest
+from aimart_parquet.errors import InvalidInput, InvalidRequest
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -99,6 +99,26 @@ def _plausible_cp1252(sample: bytes) -> bool:
     return sum(ch in _CP1252_TEXT for ch in non_ascii) / len(non_ascii) >= 0.95
 
 
+def encoding_problem(name: str) -> str | None:
+    """Why ``name`` cannot decode a text file, or None when it can. Decided from the name alone.
+
+    ``codecs.lookup`` also finds codecs that are not text encodings at all: decoding with
+    'rot13' raised TypeError and 'base64' AssertionError, a bare 500 after payment. 'idna'
+    refuses the "replace" error handler every transcode uses, and 'undefined' refuses all input.
+    """
+    try:
+        info = codecs.lookup(name)
+    except LookupError:
+        return f"Unknown encoding {name!r}."
+    if not info._is_text_encoding:  # bytes-to-bytes (base64, zlib) or str-to-str (rot13)
+        return f"{name!r} is not a text encoding."
+    try:
+        codecs.getincrementaldecoder(info.name)(errors="replace").decode(b"", final=True)
+    except UnicodeError:
+        return f"{name!r} cannot decode a file."
+    return None
+
+
 def _transcode(src: Path, dst: Path, encoding: str) -> int:
     """Transcode to UTF-8; returns how many undecodable characters became U+FFFD.
 
@@ -108,26 +128,43 @@ def _transcode(src: Path, dst: Path, encoding: str) -> int:
     replaced = 0
     decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
     with src.open("rb") as fin, dst.open("w", encoding="utf-8", newline="") as fout:
-        while chunk := fin.read(_CHUNK):
-            text = decoder.decode(chunk)
-            replaced += text.count("�")
-            fout.write(text)
-        tail = decoder.decode(b"", final=True)
+        try:
+            while chunk := fin.read(_CHUNK):
+                text = decoder.decode(chunk)
+                replaced += text.count("�")
+                fout.write(text)
+            tail = decoder.decode(b"", final=True)
+        except UnicodeError as exc:
+            # Errors that "replace" cannot absorb: the generic 'utf-16' and 'utf-32' decoders
+            # refuse a stream without a byte-order mark. It used to escape as a bare 500.
+            raise _undecodable(encoding, exc) from exc
         replaced += tail.count("�")
         fout.write(tail)
     return replaced
 
 
+def _undecodable(encoding: str, exc: UnicodeError) -> InvalidInput:
+    name = codecs.lookup(encoding).name
+    reason = exc.reason if isinstance(exc, UnicodeDecodeError) else "decoding failed"
+    hint = (
+        f"Name the byte order, e.g. '{name}-le' or '{name}-be', or omit encoding to detect it."
+        if "BOM" in reason
+        else "Pass the file's actual encoding, or omit encoding to detect it."
+    )
+    return InvalidInput(f"The file cannot be decoded as {name}: {reason}.", hint=hint)
+
+
 def to_utf8(path: Path, workdir: Path, forced_encoding: str | None = None) -> TextInfo:
     """Return a UTF-8 version of ``path`` (the same path when it already is UTF-8)."""
     if forced_encoding:
-        try:
-            codecs.lookup(forced_encoding)
-        except LookupError as exc:
+        # ConvertOptions refuses these before the quote; repeated for callers that build the
+        # options without validation.
+        problem = encoding_problem(forced_encoding)
+        if problem is not None:
             raise InvalidRequest(
-                f"Unknown encoding {forced_encoding!r}.",
+                problem,
                 hint="Use a Python codec name such as 'utf-8', 'latin-1' or 'cp1252', or omit it.",
-            ) from exc
+            )
         if codecs.lookup(forced_encoding).name == "utf-8":
             return TextInfo(path, "utf-8", 0)
         encoding = forced_encoding

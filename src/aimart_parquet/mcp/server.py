@@ -14,7 +14,7 @@ the x402 extension (``payments.mcp_gate``). Local stdio mode adds ``path`` input
 # and the parameter types below are local to build_mcp (they embed per-deployment limits).
 
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import Extension, MCPServer
@@ -22,10 +22,22 @@ from mcp_types import CallToolResult, ResourceLink, TextContent, ToolAnnotations
 from pydantic import BaseModel, Field, ValidationError
 
 from aimart_parquet import __version__
-from aimart_parquet.api.schemas import MAX_EXTRA_TABLES, NamedKeys, TableName
+from aimart_parquet.api.schemas import (
+    ARTIFACT_ID_PATTERN,
+    MAX_EXTRA_TABLES,
+    ArtifactId,
+    NamedKeys,
+    TableName,
+)
 from aimart_parquet.config import Settings
 from aimart_parquet.demand import CapabilityAck, CapabilityRequest
-from aimart_parquet.engine.models import ConvertOptions, ConvertResult, InspectResult, TabularResult
+from aimart_parquet.engine.models import (
+    ConvertOptions,
+    ConvertResult,
+    DuckText,
+    InspectResult,
+    TabularResult,
+)
 from aimart_parquet.errors import AimartError, InvalidRequest
 from aimart_parquet.payments.pricing import quantum_enabled
 from aimart_parquet.quantum.models import (
@@ -34,7 +46,7 @@ from aimart_parquet.quantum.models import (
     QuantumCompressOptions,
     QuantumCompressResult,
 )
-from aimart_parquet.service import Service, SourceRef
+from aimart_parquet.service import Service, SourceRef, inputs_among, internal_error
 
 PARQUET_MIME = "application/vnd.apache.parquet"
 
@@ -46,8 +58,9 @@ Typical flow: convert_to_parquet (returns an artifact_id and a schema report) ->
 inspect_parquet or preview_parquet to look -> query_parquet to answer questions with SQL. \
 Pass the artifact_id between calls instead of re-sending the file.
 
-Inputs: a public http(s) `url` (best for large files), or `content_base64` plus `filename` \
-(small files, under ~3 MB). Formats: CSV/TSV, JSON/NDJSON, Excel (xlsx/xls/ods), tables in \
+Inputs: a public http(s) `url` (best for large files), `content_base64` plus `filename` \
+(small files, under ~3 MB; convert_to_parquet only), or the `artifact_id` of a file converted \
+earlier. Formats: CSV/TSV, JSON/NDJSON, Excel (xlsx/xls/ods), tables in \
 digital PDFs, SPSS (sav/zsav/por), Stata (dta), SAS (sas7bdat/xpt), Parquet; optionally gzip/bz2/zip.\
 """
 
@@ -60,7 +73,10 @@ UrlArg = Annotated[
 ]
 B64Arg = Annotated[
     str | None,
-    Field(description="The file's raw bytes, base64-encoded. Small files only (under ~3 MB)."),
+    Field(
+        description="The file's raw bytes, base64-encoded (standard or URL-safe alphabet, '=' "
+        "padding optional). Small files only (under ~3 MB)."
+    ),
 ]
 NameArg = Annotated[
     str | None,
@@ -71,7 +87,20 @@ NameArg = Annotated[
 ]
 ArtifactArg = Annotated[
     str | None,
-    Field(description="artifact_id returned by an earlier convert_to_parquet call.", max_length=64),
+    Field(
+        description="artifact_id returned by an earlier convert_to_parquet call.",
+        max_length=64,
+        pattern=ARTIFACT_ID_PATTERN,
+    ),
+]
+ConvertArtifactArg = Annotated[
+    str | None,
+    Field(
+        description="artifact_id returned by an earlier convert_to_parquet call: converts that "
+        "stored Parquet file again, with these options (an expected_schema, say).",
+        max_length=64,
+        pattern=ARTIFACT_ID_PATTERN,
+    ),
 ]
 PathArg = Annotated[
     str | None, Field(description="Local filesystem path of the input file.", max_length=4096)
@@ -80,6 +109,16 @@ FormatArg = Annotated[
     Literal["json", "markdown", "csv"],
     Field(description="json rows (default), a Markdown table, or CSV text."),
 ]
+
+# The inputs each tool takes, as its parameters name them: a refusal's hint names only these
+# (SourceRef.takes). The service's one list told every tool's caller to "Set one of: url,
+# content_base64, artifact_id.", so an agent that followed it on a tool without the parameter
+# was refused again. argument_checker reads a tool's inputs from its schema instead; a test
+# holds both to the schema of every tool (test_final_validate_input_hints.py).
+REMOTE_CONVERT_INPUTS = inputs_among(("url", "content_base64", "artifact_id"))
+REMOTE_PARQUET_INPUTS = inputs_among(("url", "artifact_id"))
+LOCAL_CONVERT_INPUTS = inputs_among(("url", "content_base64", "path"))
+LOCAL_PARQUET_INPUTS = inputs_among(("url", "path"))
 
 
 def _ok(model: BaseModel, extra: list[TextContent | ResourceLink] | None = None) -> CallToolResult:
@@ -110,29 +149,79 @@ async def _wrap(coro: Awaitable[BaseModel]) -> CallToolResult:
 
 
 async def _guard(fn: Callable[[], Awaitable[CallToolResult]]) -> CallToolResult:
-    """Every failure becomes an isError result — which the payment gate never settles."""
+    """Every failure becomes a typed isError result — which the payment gate never settles."""
     try:
         return await fn()
     except AimartError as exc:
         return _err(exc)
+    except Exception as exc:  # noqa: BLE001 - the backstop for a bug: typed, its text kept out
+        # The SDK answered these "Error executing tool <name>": no code, no hint, no word on
+        # whether the caller was charged.
+        return _err(internal_error(exc))
 
 
-def argument_checker(server: MCPServer) -> Callable[[str, dict[str, Any]], str | None]:
-    """The SDK's own argument validation for a tool, callable before the tool runs.
+def _tables(
+    src: SourceRef, extra: Mapping[str, str] | None, *, local: bool
+) -> dict[str, SourceRef]:
+    """query_parquet's tables: the main input as `data`, plus the joins by name."""
+    refs: dict[str, SourceRef] = {"data": src} if src.kinds() else {}
+    for name, value in (extra or {}).items():
+        if name in refs:
+            raise InvalidRequest(
+                f"Table name {name!r} is used twice.", hint="`data` is the main input."
+            )
+        refs[name] = SourceRef(path=value) if local else SourceRef(artifact_id=value)
+    return refs
+
+
+def _precheck(service: Service, args: Mapping[str, Any], takes: tuple[str, ...]) -> None:
+    """What a paid tool would refuse about its validated arguments, from the arguments alone.
+
+    Every paid tool names its input as url / content_base64 / artifact_id (path, locally), and
+    query_parquet alone takes `sql` and `tables`: the tools build their SourceRefs the same way.
+    ``takes`` is the tool's inputs, which a refusal's hint names.
+    """
+    src = SourceRef(
+        url=args.get("url"),
+        content_base64=args.get("content_base64"),
+        artifact_id=args.get("artifact_id"),
+        path=args.get("path"),
+        takes=takes,
+    )
+    if "sql" in args:
+        tables = _tables(src, args.get("tables"), local=service.local_mode)
+        service.check_query(tables, args["sql"])
+    else:
+        service.check_input(src)
+
+
+def argument_checker(
+    server: MCPServer, service: Service
+) -> Callable[[str, dict[str, Any]], CallToolResult | None]:
+    """A paid tool call's refusal, decided before the gate quotes a price, or None to go on.
 
     The x402 gate wraps tools/call outside the SDK's validation, so without this a call with
-    invalid arguments was quoted, and when paid also verified, before it was rejected. Returns
-    the SDK's error text, or None when the arguments are valid or the tool is unknown.
+    invalid arguments was quoted, and when paid also verified, before it was rejected. First the
+    SDK's own validation (its text, as the SDK words it), then what the service would refuse
+    from the arguments alone (exactly one input, a fetchable URL, a SELECT; ``Service.check_*``),
+    as the typed error the tool would return. None for a valid call or an unknown tool.
     """
 
-    def check(name: str, arguments: dict[str, Any]) -> str | None:
+    def check(name: str, arguments: dict[str, Any]) -> CallToolResult | None:
         tool = server._tool_manager.get_tool(name)  # private: mcp 2.x has no public lookup
         if tool is None:
             return None
         try:
-            tool.fn_metadata.validate_arguments(arguments)
+            validated = tool.fn_metadata.validate_arguments(arguments)
         except ValidationError as exc:
-            return f"Error executing tool {name}: {exc}"  # the SDK's wording for the same error
+            text = f"Error executing tool {name}: {exc}"  # the SDK's wording for the same error
+            return CallToolResult(content=[TextContent(type="text", text=text)], is_error=True)
+        try:
+            _precheck(service, validated, inputs_among(tool.parameters.get("properties", {})))
+        except AimartError as exc:
+            return _err(exc)
+        except Exception as exc:  # noqa: BLE001 - a bug in a check is refused, typed, unquoted
+            return _err(internal_error(exc, tool=name))
         return None
 
     return check
@@ -221,7 +310,13 @@ type, and warnings. {note(settings.price_convert)}"""
             ] = None,
             options: ConvertOptions | None = None,
         ) -> Annotated[CallToolResult, ConvertResult]:
-            src = SourceRef(path=path, url=url, content_base64=content_base64, filename=filename)
+            src = SourceRef(
+                path=path,
+                url=url,
+                content_base64=content_base64,
+                filename=filename,
+                takes=LOCAL_CONVERT_INPUTS,
+            )
             return await _guard(lambda: _convert(src, options, output_path))
 
     else:
@@ -240,10 +335,19 @@ type, and warnings. {note(settings.price_convert)}"""
         async def convert_remote(
             url: UrlArg = None,
             content_base64: B64Arg = None,
+            artifact_id: ConvertArtifactArg = None,
             filename: NameArg = None,
             options: ConvertOptions | None = None,
         ) -> Annotated[CallToolResult, ConvertResult]:
-            src = SourceRef(url=url, content_base64=content_base64, filename=filename)
+            # artifact_id as REST /v1/convert takes it. Without it the SDK dropped the argument:
+            # the call was quoted, and the paid retry verified and then refused "got 0 (none)".
+            src = SourceRef(
+                url=url,
+                content_base64=content_base64,
+                artifact_id=artifact_id,
+                filename=filename,
+                takes=REMOTE_CONVERT_INPUTS,
+            )
             return await _guard(lambda: _convert(src, options, None))
 
     async def _convert(
@@ -278,6 +382,7 @@ rejected. Example: SELECT region, sum(units) FROM data GROUP BY 1 ORDER BY 2 DES
     ]
     Sql = Annotated[
         str,
+        DuckText,
         Field(
             description="One DuckDB SELECT statement over table `data`.",
             min_length=1,
@@ -296,18 +401,6 @@ rejected. Example: SELECT region, sum(units) FROM data GROUP BY 1 ORDER BY 2 DES
                 service.preview(src, columns=columns, offset=offset, limit=limit, fmt=fmt)
             )
         )
-
-    def _tables(
-        src: SourceRef, extra: dict[str, str] | None, *, local: bool
-    ) -> dict[str, SourceRef]:
-        refs: dict[str, SourceRef] = {"data": src} if src.kinds() else {}
-        for name, value in (extra or {}).items():
-            if name in refs:
-                raise InvalidRequest(
-                    f"Table name {name!r} is used twice.", hint="`data` is the main input."
-                )
-            refs[name] = SourceRef(path=value) if local else SourceRef(artifact_id=value)
-        return refs
 
     async def _query(
         src: SourceRef, sql: str, limit: int, fmt: Any, extra: dict[str, str] | None = None
@@ -329,7 +422,7 @@ rejected. Example: SELECT region, sum(units) FROM data GROUP BY 1 ORDER BY 2 DES
         async def inspect_local(
             path: PathArg = None, url: UrlArg = None
         ) -> Annotated[CallToolResult, InspectResult]:
-            return await _inspect(SourceRef(path=path, url=url))
+            return await _inspect(SourceRef(path=path, url=url, takes=LOCAL_PARQUET_INPUTS))
 
         @server.tool(
             name="preview_parquet",
@@ -345,7 +438,8 @@ rejected. Example: SELECT region, sum(units) FROM data GROUP BY 1 ORDER BY 2 DES
             limit: PreviewLimit = 20,
             format: FormatArg = "json",
         ) -> Annotated[CallToolResult, TabularResult]:
-            return await _preview(SourceRef(path=path, url=url), columns, offset, limit, format)
+            src = SourceRef(path=path, url=url, takes=LOCAL_PARQUET_INPUTS)
+            return await _preview(src, columns, offset, limit, format)
 
         @server.tool(
             name="query_parquet",
@@ -370,7 +464,8 @@ rejected. Example: SELECT region, sum(units) FROM data GROUP BY 1 ORDER BY 2 DES
             limit: QueryLimit = 100,
             format: FormatArg = "json",
         ) -> Annotated[CallToolResult, TabularResult]:
-            return await _query(SourceRef(path=path, url=url), sql, limit, format, tables)
+            src = SourceRef(path=path, url=url, takes=LOCAL_PARQUET_INPUTS)
+            return await _query(src, sql, limit, format, tables)
 
     else:
 
@@ -383,7 +478,9 @@ rejected. Example: SELECT region, sum(units) FROM data GROUP BY 1 ORDER BY 2 DES
         async def inspect_remote(
             artifact_id: ArtifactArg = None, url: UrlArg = None
         ) -> Annotated[CallToolResult, InspectResult]:
-            return await _inspect(SourceRef(artifact_id=artifact_id, url=url))
+            return await _inspect(
+                SourceRef(artifact_id=artifact_id, url=url, takes=REMOTE_PARQUET_INPUTS)
+            )
 
         @server.tool(
             name="preview_parquet",
@@ -399,9 +496,8 @@ rejected. Example: SELECT region, sum(units) FROM data GROUP BY 1 ORDER BY 2 DES
             limit: PreviewLimit = 20,
             format: FormatArg = "json",
         ) -> Annotated[CallToolResult, TabularResult]:
-            return await _preview(
-                SourceRef(artifact_id=artifact_id, url=url), columns, offset, limit, format
-            )
+            src = SourceRef(artifact_id=artifact_id, url=url, takes=REMOTE_PARQUET_INPUTS)
+            return await _preview(src, columns, offset, limit, format)
 
         @server.tool(
             name="query_parquet",
@@ -414,7 +510,7 @@ rejected. Example: SELECT region, sum(units) FROM data GROUP BY 1 ORDER BY 2 DES
             artifact_id: ArtifactArg = None,
             url: UrlArg = None,
             tables: Annotated[
-                Annotated[dict[TableName, str], NamedKeys] | None,
+                Annotated[dict[TableName, ArtifactId], NamedKeys] | None,
                 Field(
                     description=(
                         f"Extra tables for joins: {{name: artifact_id}}, up to {MAX_EXTRA_TABLES} "
@@ -426,9 +522,8 @@ rejected. Example: SELECT region, sum(units) FROM data GROUP BY 1 ORDER BY 2 DES
             limit: QueryLimit = 100,
             format: FormatArg = "json",
         ) -> Annotated[CallToolResult, TabularResult]:
-            return await _query(
-                SourceRef(artifact_id=artifact_id, url=url), sql, limit, format, tables
-            )
+            src = SourceRef(artifact_id=artifact_id, url=url, takes=REMOTE_PARQUET_INPUTS)
+            return await _query(src, sql, limit, format, tables)
 
     if quantum_enabled(settings):  # keep in step with pricing.active_operations()
         _register_quantum_tools(server, service, settings, local_mode=local_mode)
@@ -532,7 +627,8 @@ classical_optimum when you only need the best basket. {QUANTUM_HONESTY} \
                 str | None, Field(description="Where to write the output Parquet.")
             ] = None,
         ) -> Annotated[CallToolResult, QuantumCompressResult]:
-            return await compress(SourceRef(path=path, url=url), options, output_path)
+            src = SourceRef(path=path, url=url, takes=LOCAL_PARQUET_INPUTS)
+            return await compress(src, options, output_path)
 
         @server.tool(
             name="quantum_optimize_portfolio",
@@ -545,7 +641,9 @@ classical_optimum when you only need the best basket. {QUANTUM_HONESTY} \
             url: UrlArg = None,
             options: PortfolioOptions | None = None,
         ) -> Annotated[CallToolResult, PortfolioResult]:
-            return await portfolio(SourceRef(path=path, url=url), options)
+            return await portfolio(
+                SourceRef(path=path, url=url, takes=LOCAL_PARQUET_INPUTS), options
+            )
 
     else:
 
@@ -560,7 +658,8 @@ classical_optimum when you only need the best basket. {QUANTUM_HONESTY} \
             url: UrlArg = None,
             options: QuantumCompressOptions | None = None,
         ) -> Annotated[CallToolResult, QuantumCompressResult]:
-            return await compress(SourceRef(artifact_id=artifact_id, url=url), options, None)
+            src = SourceRef(artifact_id=artifact_id, url=url, takes=REMOTE_PARQUET_INPUTS)
+            return await compress(src, options, None)
 
         @server.tool(
             name="quantum_optimize_portfolio",
@@ -573,7 +672,8 @@ classical_optimum when you only need the best basket. {QUANTUM_HONESTY} \
             url: UrlArg = None,
             options: PortfolioOptions | None = None,
         ) -> Annotated[CallToolResult, PortfolioResult]:
-            return await portfolio(SourceRef(artifact_id=artifact_id, url=url), options)
+            src = SourceRef(artifact_id=artifact_id, url=url, takes=REMOTE_PARQUET_INPUTS)
+            return await portfolio(src, options)
 
 
 class VerifyResult(BaseModel):

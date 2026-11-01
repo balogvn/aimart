@@ -55,8 +55,10 @@ notes and, on the hosted service, a provenance block with a 3,309-byte ML-DSA-65
 The typical flow is: `convert_to_parquet` returns an `artifact_id` and a schema report. Then
 `inspect_parquet` or `preview_parquet` lets you look, and `query_parquet` answers questions
 with SQL. Pass the `artifact_id` between calls instead of re-sending the file. Inputs are a
-public `url` (best for large files), `content_base64` plus `filename` (under about 3 MB), or an
-`artifact_id`.
+public `url` (best for large files), `content_base64` plus `filename` (under about 3 MB), or the
+`artifact_id` of a file converted earlier (convert takes one too, to convert it again with new
+options). Over MCP only `convert_to_parquet` takes `content_base64`; on REST, convert, inspect,
+preview and query take all three.
 
 ### REST: 402 → decode → pay → retry
 
@@ -247,9 +249,13 @@ in the [agents guide](docs/agents-guide.md#3-convert).
 ## Limits and errors
 
 A failed call is never charged: every refusal is HTTP ≥ 400 (or an MCP `isError` result) with
-a `code`, a `message` and a `hint`. A call whose body or arguments can only fail is refused
-(400 `invalid_request`, or an MCP error result) before any price is quoted. The defaults, which
-an operator can change:
+a `code`, a `message` and a `hint`. A call that can only fail, decided from the request alone,
+is refused before any price is quoted: a body or arguments that fail the schema, not exactly one
+input, `content_base64` that decodes to no file (or, for inspect, preview and query, to no
+Parquet file), a URL that can never be fetched, or SQL of up to 256 characters that is not one
+`SELECT` (400 `invalid_request`, 422 `invalid_input`, 422 `url_not_allowed` or 400
+`query_rejected`, or an MCP error result; the full list is in the
+[agents guide](docs/agents-guide.md#6-handle-errors)). The defaults, which an operator can change:
 
 | limit | default | over it |
 |---|---|---|
@@ -259,7 +265,8 @@ an operator can change:
 | stored outputs | 512 MiB for all outputs together (256 MiB on the Cloud Run deploy without a bucket) | 413 for one output larger than the whole budget; 503 `busy` while the space is held by recent outputs or outputs still settling |
 | preview and query results | 500 preview rows, 1,000 query rows, cells cut to 2,000 characters, 64 MB in all | more rows: `truncated: true`; over 64 MB: 413 |
 | time | 120 s to convert, 15 s to inspect, preview or query | 504 `timeout` |
-| concurrency | 2 jobs and a short queue | 503 `busy` |
+| downloads | 60 s of downloading for all of a call's `url` inputs together | 422 `fetch_failed` |
+| concurrency | 2 jobs; a call waits up to 10 s for a free one | 503 `busy` |
 
 **Large CSVs, roughly over 180 MB uncompressed, may be refused on the default hosted
 instance** (413, unpaid). Converting a CSV takes about 3.5 times its uncompressed size in

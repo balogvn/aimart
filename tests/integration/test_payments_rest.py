@@ -52,6 +52,8 @@ PRICES_CSV = (
 ).encode()
 
 UNKNOWN_ARTIFACT = "Zz" * 12  # well-formed, never issued
+# Longer than service.PRECHECK_SQL_CHARS: checked where the query runs, after verification.
+LONG_DROP = "DROP TABLE data -- " + "x" * 300
 
 
 def request_for(key: str, artifact_id: str) -> dict[str, Any]:
@@ -247,17 +249,16 @@ async def test_paid_call_succeeds_and_settles_the_quoted_amount_once(
     ("key", "body", "status", "code"),
     [
         ("inspect", {"artifact_id": UNKNOWN_ARTIFACT}, 404, "artifact_not_found"),
-        ("inspect", {}, 400, "invalid_request"),
-        ("inspect", {"artifact_id": "bad id!"}, 404, "artifact_not_found"),
-        ("query", {"artifact_id": "ARTIFACT", "sql": "DROP TABLE data"}, 400, "query_rejected"),
-        # A schema-invalid body ("limit": 0) is now refused before any quote (see
-        # test_fix_money_gate.py); this one passes the schema and fails in the service.
+        # A body that can only fail, decided from the body alone ({} paid, a malformed id, two
+        # inputs, ftp://, an IP literal like 127.0.0.1, short non-SELECT SQL), is now refused
+        # before the quote (test_fix_money_gate.py, test_final_validate_prequote.py). These
+        # pass every pre-quote check and fail on what the service finds.
+        ("query", {"artifact_id": "ARTIFACT", "sql": LONG_DROP}, 400, "query_rejected"),
         ("preview", {"artifact_id": "ARTIFACT", "columns": ["nope"]}, 400, "invalid_request"),
-        ("convert", {"url": "http://127.0.0.1/data.csv"}, 422, "url_not_allowed"),
-        ("convert", {"url": "ftp://example.com/data.csv"}, 422, "url_not_allowed"),
+        ("convert", {"url": "http://localhost/data.csv"}, 422, "url_not_allowed"),  # at connect
         (
             "convert",
-            {"content_base64": kit.b64(b"a,b\n1,2\n"), "url": "https://example.com/a.csv"},
+            {"content_base64": kit.b64(b"a,b\n1,2\n"), "options": {"sort_by": ["nope"]}},
             400,
             "invalid_request",
         ),

@@ -249,12 +249,23 @@ async def test_paid_tool_call_returns_the_result_and_the_settlement(
     assert len(facilitator.verified) == 2
 
 
+# Calls that pass every pre-quote check and fail on what the service finds. Arguments that
+# can only fail ({} paid, 127.0.0.1, a short DELETE) are refused before the quote instead
+# (test_final_validate_prequote.py).
 FAILING_CALLS = [
-    ("convert_to_parquet", {"url": "http://127.0.0.1/a.csv"}, "url_not_allowed"),
-    ("convert_to_parquet", {}, "invalid_request"),
+    ("convert_to_parquet", {"url": "http://localhost/a.csv"}, "url_not_allowed"),  # at connect
+    (
+        "convert_to_parquet",
+        {"content_base64": "YSxiCjEsMgo=", "options": {"sort_by": ["nope"]}},
+        "invalid_request",
+    ),
     ("inspect_parquet", {"artifact_id": UNKNOWN_ARTIFACT}, "artifact_not_found"),
     ("preview_parquet", {"artifact_id": UNKNOWN_ARTIFACT}, "artifact_not_found"),
-    ("query_parquet", {"artifact_id": "ARTIFACT", "sql": "DELETE FROM data"}, "query_rejected"),
+    (
+        "query_parquet",
+        {"artifact_id": "ARTIFACT", "sql": "DELETE FROM data -- " + "x" * 300},
+        "query_rejected",
+    ),
     ("query_parquet", {"artifact_id": UNKNOWN_ARTIFACT, "sql": "SELECT 1"}, "artifact_not_found"),
     ("quantum_compress_features", {"artifact_id": UNKNOWN_ARTIFACT}, "artifact_not_found"),
     ("quantum_optimize_portfolio", {"artifact_id": UNKNOWN_ARTIFACT}, "artifact_not_found"),

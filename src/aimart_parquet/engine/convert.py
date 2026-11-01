@@ -436,13 +436,15 @@ def _finish(
         )
 
     summary = inspect_parquet(out_path)
-    stats = {c.name: c for c in summary.columns}
     columns: list[ColumnReport] = []
-    for o in outputs:
-        st = stats[o.name]
+    # By position: the file's columns are the SELECT's, in order. Looked up by name, two outputs
+    # with one name (DuckDB writes the second as 'a_1') both reported the first column's type
+    # and nulls, charged as the description of a file it did not match, and two names equal
+    # but for case ('a', 'A' -> 'A_1') crashed with KeyError: 'A'. The name is the file's.
+    for o, st in zip(outputs, summary.columns, strict=True):
         columns.append(
             ColumnReport(
-                name=o.name,
+                name=st.name,
                 original_name=o.raw.original if o.raw is not None else o.name,
                 type=st.type,
                 nullable=st.nullable,
