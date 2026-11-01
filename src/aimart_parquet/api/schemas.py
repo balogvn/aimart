@@ -62,7 +62,9 @@ class SourceBody(BaseModel):
         default=None, max_length=4096, description="Public http(s) URL of the input file."
     )
     content_base64: str | None = Field(
-        default=None, description="Raw file bytes, base64-encoded (small files)."
+        default=None,
+        description="Raw file bytes, base64-encoded (small files). Standard or URL-safe "
+        "alphabet, '=' padding optional; no other characters.",
     )
     filename: str | None = Field(
         default=None, max_length=255, description="Original filename; helps detection."

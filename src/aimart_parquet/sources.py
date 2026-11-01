@@ -14,7 +14,6 @@ check and connect is impossible. Redirects re-enter the same path, so each hop i
 
 from __future__ import annotations
 
-import base64
 import binascii
 import contextlib
 import ipaddress
@@ -46,6 +45,7 @@ ALLOWED_PORTS = frozenset({80, 443, 8080, 8443})
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 _ASCII = "".join(map(chr, range(128)))  # quote(..., safe=_ASCII) escapes only non-ASCII
 _NON_ASCII_BYTE = re.compile(rb"[\x80-\xff]")
+_URLSAFE_TO_STANDARD = bytes.maketrans(b"-_", b"+/")
 
 
 def ip_is_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -340,23 +340,53 @@ def _too_large(max_bytes: int) -> InputTooLarge:
     )
 
 
+def _not_base64() -> InvalidRequest:
+    return InvalidRequest(
+        "content_base64 is not valid base64.",
+        hint="Base64-encode the raw file bytes (standard or URL-safe alphabet) and send nothing "
+        "else in the string.",
+    )
+
+
 def check_base64(data: str, *, max_bytes: int) -> bytes:
     """The bytes ``content_base64`` holds, or the error it can only ever get. Writes nothing.
 
     Also run before the price is quoted (``Service.check_input``): a value that does not decode
-    ("abc") or decodes to nothing ("") was quoted and, paid, verified, and only then refused.
-    Decoding the 16 MiB a JSON body may hold takes about 20 ms.
+    ("a") or decodes to nothing ("") was quoted and, paid, verified, and only then refused.
+    Decoding the 16 MiB a JSON body may hold takes about 60 ms.
+
+    Every character must count. The decoder used to drop any it did not know, so the URL-safe
+    '-' and '_' (``urlsafe_b64encode``, Node's 'base64url') vanished and every later 6-bit
+    group shifted; when a multiple of 4 were dropped there was no error at all, and a 5-row CSV
+    was converted, and charged for, as 1 row of garbage. Accepted besides strict base64 is only
+    what has one reading: either alphabet (they differ in '-_' versus '+/' alone), missing '='
+    padding, ASCII whitespace (line-wrapped MIME base64) and a ``data:<type>;base64,`` prefix.
     """
-    # base64 inflates by 4/3; refuse before decoding rather than after allocating.
-    if len(data) > max_bytes * 4 // 3 + 4:
+    # base64 inflates by 4/3 (line breaks a little more): refuse before copying the text.
+    if len(data) > 2 * (max_bytes * 4 // 3 + 4):
         raise _too_large(max_bytes)
-    payload = data.split(",", 1)[1] if data.startswith("data:") and "," in data else data
+    payload = data
+    if data[:5].lower() == "data:":  # ':' is in neither alphabet: base64 never starts so
+        header, comma, payload = data[5:].partition(",")
+        if not comma or not header.lower().endswith(";base64"):
+            # "data:text/csv," + encodeURIComponent(csv) is percent-encoded text: decoded as
+            # base64 it was refused, or, sometimes, silently turned into other bytes.
+            raise InvalidRequest(
+                "content_base64 is a data: URL that is not base64-encoded.",
+                hint="Base64-encode the raw file bytes and send them alone, or as "
+                "data:<type>;base64,<data>.",
+            )
     try:
-        raw = base64.b64decode(payload, validate=False)
-    except (binascii.Error, ValueError) as exc:
-        raise InvalidRequest(
-            "content_base64 is not valid base64.", hint="Base64-encode the raw file bytes."
-        ) from exc
+        text = payload.encode("ascii").translate(None, b" \t\n\r\v\f")
+    except UnicodeEncodeError as exc:
+        raise _not_base64() from exc
+    text = text.translate(_URLSAFE_TO_STANDARD) + b"=" * (-len(text) % 4)
+    if len(text) > max_bytes * 4 // 3 + 4:
+        raise _too_large(max_bytes)
+    try:
+        raw = binascii.a2b_base64(text, strict_mode=True)  # any other character is an error
+    except binascii.Error as exc:
+        raise _not_base64() from exc
     if len(raw) > max_bytes:
         raise _too_large(max_bytes)
     if not raw:  # an empty file has nothing to convert or read: it was a 422 after payment

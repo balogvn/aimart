@@ -42,7 +42,10 @@ Pass exactly one input:
 
 - `url`: a public http(s) URL. Best for anything over about 3 MB. The server fetches it with
   an SSRF guard, so private and loopback addresses are refused.
-- `content_base64` plus `filename`: small files only. The extension helps detection.
+- `content_base64` plus `filename`: small files only. The extension helps detection. Either
+  base64 alphabet works (standard, or URL-safe with `-` and `_`), `=` padding is optional, line
+  breaks are ignored, and a `data:<type>;base64,` prefix is allowed. Any other character is
+  refused, never skipped.
 - REST only: `POST /v1/convert/upload` as multipart (`file`, plus optional `options` as a
   JSON string).
 
@@ -169,7 +172,9 @@ decided from the request alone:
   query.", "Table name 'data' is used twice." (`data` is the top-level input) and "Table 't':
   provide exactly one input; got 0 (none).".
 - `content_base64` that holds no file: 400 `invalid_request`, "content_base64 is not valid
-  base64." or "content_base64 is empty.". Too large to send inline it is 413
+  base64." (a character outside the base64 alphabets, or a length no padding completes),
+  "content_base64 is a data: URL that is not base64-encoded." (a `data:` URL without
+  `;base64`) or "content_base64 is empty.". Too large to send inline it is 413
   `input_too_large` (the request body may be 16 MB): pass a `url` instead.
 - A URL the server can never fetch: 422 `url_not_allowed`, with "Only http and https URLs are
   supported.", "The URL is malformed.", "The URL has no host.", "Port 22 is not allowed." (ports

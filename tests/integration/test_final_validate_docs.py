@@ -126,10 +126,17 @@ MESSAGES: list[tuple[str, dict[str, Any], int, str, str]] = [
     ),
     (
         "/v1/convert",
-        {"content_base64": "abc"},
+        {"content_base64": "ab*c"},  # "abc" was the example; unpadded, it is now 2 bytes
         400,
         "invalid_request",
         "content_base64 is not valid base64.",
+    ),
+    (
+        "/v1/convert",
+        {"content_base64": "data:text/csv,a%2Cb"},
+        400,
+        "invalid_request",
+        "content_base64 is a data: URL that is not base64-encoded.",
     ),
     ("/v1/convert", {"content_base64": ""}, 400, "invalid_request", "content_base64 is empty."),
 ]

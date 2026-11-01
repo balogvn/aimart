@@ -176,9 +176,11 @@ def test_decode_base64_exact_limit_is_accepted(tmp_path: Path) -> None:
     assert decode_base64(data, tmp_path / "out", max_bytes=100) == 100
 
 
-def test_decode_base64_rejects_garbage(tmp_path: Path) -> None:
+@pytest.mark.parametrize("garbage", ["a", "ab!c", "YWJj YQ=*"])
+def test_decode_base64_rejects_garbage(garbage: str, tmp_path: Path) -> None:
+    # "abc" was the example here; unpadded, it is now read as the 2 bytes it encodes.
     with pytest.raises(InvalidRequest, match="not valid base64"):
-        decode_base64("abc", tmp_path / "out", max_bytes=100)
+        decode_base64(garbage, tmp_path / "out", max_bytes=100)
 
 
 # ------------------------------------------------------------------------------ fetch_url

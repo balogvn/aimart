@@ -72,7 +72,10 @@ UrlArg = Annotated[
 ]
 B64Arg = Annotated[
     str | None,
-    Field(description="The file's raw bytes, base64-encoded. Small files only (under ~3 MB)."),
+    Field(
+        description="The file's raw bytes, base64-encoded (standard or URL-safe alphabet, '=' "
+        "padding optional). Small files only (under ~3 MB)."
+    ),
 ]
 NameArg = Annotated[
     str | None,
