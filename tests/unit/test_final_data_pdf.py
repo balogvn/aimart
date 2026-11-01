@@ -358,10 +358,13 @@ def test_the_line_above_a_continuation_is_body_when_the_body_holds_its_like() ->
     (table,) = pdf_reader._merge([_found(1, SECTIONS), _found(2, [["South", "", ""], *more])])
     assert table.rows == [*SECTIONS[1:], ["South", "", ""], *more]
     assert table.captions == []
-    # A row holding a value is body too, whatever else it holds.
+    # A row holding a value is body too, when its text is text the body holds there. Round 3:
+    # a first 'pending' was body as well, but so was a new table's header holding a year
+    # ('Region', '2023', 'Change %'), so it now splits (test_final_data_pdf_next_page.py).
+    seen = [*SECTIONS, ["Area6", "pending", "1006.50"]]
     pending = ["Area9", "pending", "1009.50"]
-    (table,) = pdf_reader._merge([_found(1, SECTIONS), _found(2, [pending, *more])])
-    assert table.rows == [*SECTIONS[1:], pending, *more]
+    (table,) = pdf_reader._merge([_found(1, seen), _found(2, [pending, *more])])
+    assert table.rows == [*seen[1:], pending, *more]
     # A title: dropped and reported. A header naming every typed column: a new table.
     (table,) = pdf_reader._merge([_found(1, SECTIONS), _found(2, [["", "Sales p2", ""], *more])])
     assert table.rows == [*SECTIONS[1:], *more]

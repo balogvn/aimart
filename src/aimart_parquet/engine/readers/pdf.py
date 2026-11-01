@@ -22,7 +22,9 @@ exact and cheap. Strategy:
    repeats dropped), or, with no repeated header, when the next page's table has the same width
    and starts with a row typed like the body (numbers where the body has numbers), down to a
    single row spilled onto the next page; one line above such rows (a running title, 'Table 1
-   (continued)') is dropped and reported. The last one or two rows of a borderless table, too
+   (continued)') is dropped and reported. A line that may be a new table's header splits the
+   page off instead, with the 'found N tables' warning: a split is a reported partial result,
+   a merged table is silent wrong data. The last one or two rows of a borderless table, too
    few for text alignment to see, are read at the previous page's column edges.
 5. The largest table wins unless the caller picks one (``pdf_table``); every table found is
    listed in the report, so nothing is chosen silently.
@@ -115,6 +117,13 @@ _TYPED = frozenset({"number", "date"})
 _DATA = _TYPED | {"missing", "empty"}
 _YEAR = re.compile(r"(?:19|20)\d\d")
 _DIGITS = re.compile(r"\d+")
+# The end of a line saying a table goes on from an earlier page, read without spaces and in
+# lower case: 'Table 1 (continued)', '(cont.)', "North (cont'd)", 'Table 1 - continued',
+# 'Continued from page 1'. Only alone or after punctuation: a header's last column may be
+# named 'Continued' (patients still on treatment), and 'Discontinued' is a section row.
+_CONTINUED = re.compile(
+    r"(?:^|[(\[\-\u2013\u2014.,:;])(?:continued|cont['\u2019]?d\.?|cont\.?)(?:from\w*)?[)\]]?[.:]?$"
+)
 _BOUNDED_MARK = "_aimart_bounded"
 _MAX_REASON = 300
 
@@ -375,25 +384,37 @@ class _Table:
     _typed: list[int] = field(default_factory=list, init=False, repr=False)
     # Which cells are filled, in the rows of the body (``shapes``), and in those holding no
     # number or date (``text_shapes``: a section row, 'North'). ``_continuation`` keeps a line
-    # shaped like a text row as body; ``_spilled_body`` keeps only rows shaped like a body row.
+    # shaped like a section row as body; ``_spilled_body`` keeps only rows shaped like body.
     shapes: set[frozenset[int]] = field(default_factory=set, init=False, repr=False)
     text_shapes: set[frozenset[int]] = field(default_factory=set, init=False, repr=False)
+    # Per column: how its values are written (``_form``), and the text it holds ('pending').
+    # Kept as rows are added for the same reason as the counts; ``_pending`` reads both.
+    written: list[set[str]] = field(default_factory=list, init=False, repr=False)
+    texts: list[set[str]] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
         rows, self.rows = self.rows, []
         self._filled = [0] * len(self.header)
         self._typed = [0] * len(self.header)
+        self.written = [set() for _ in self.header]
+        self.texts = [set() for _ in self.header]
         self.add(rows)
 
     def add(self, rows: list[list[str]]) -> None:
         for row in rows:
             values = False
             for c in range(len(self.header)):
-                kind = _kind(_cell(row, c))
-                if kind not in {"empty", "missing"}:
-                    self._filled[c] += 1
-                    self._typed[c] += kind in _TYPED
-                    values = values or kind in _TYPED
+                value = _cell(row, c)
+                kind = _kind(value)
+                if kind in {"empty", "missing"}:
+                    continue
+                self._filled[c] += 1
+                self.written[c].add(_form(value))
+                if kind in _TYPED:
+                    self._typed[c] += 1
+                    values = True
+                else:
+                    self.texts[c].add(value)
             shape = _shape(row)
             self.shapes.add(shape)
             if not values:
@@ -403,6 +424,10 @@ class _Table:
     def typed(self) -> list[int]:
         """The columns whose body is mostly numbers or dates, as ``_typed_share`` judges."""
         return [c for c, n in enumerate(self._filled) if n and self._typed[c] / n >= 0.8]
+
+    def forms(self, typed: list[int]) -> dict[int, set[str]]:
+        """``_forms(self.rows, typed)``, without reading the body again."""
+        return {c: self.written[c] for c in typed}
 
     @property
     def cells(self) -> int:
@@ -871,6 +896,68 @@ def _shape(row: list[str]) -> frozenset[int]:
     return frozenset(c for c, v in enumerate(row) if v)
 
 
+def _running_title(row: list[str], captions: list[str]) -> bool:
+    """Is ``row`` a running title above a continuation: a line saying the table continues
+    ('(continued)', ``_CONTINUED``), or a line already dropped above this table with other
+    numbers in it ('Ledger p1', then 'Ledger p2')? Compared without spaces, as the alignment
+    pass cuts a line at each page's column edges.
+
+    Found reviewing 6b5a217: in the column of the section rows such a title is shaped like one
+    ('North'), so 'Ledger p2', 'Ledger p3', ... became data rows, with no warning. Printed on
+    continuation pages only and across every typed column, '(continued)' names the columns as
+    a header does, and the table split: 79 of 120 rows. Neither is ever a header or body.
+    """
+    text = _squashed(_line(row))
+    if _CONTINUED.search(text.lower()):
+        return True
+    form = _form(text)
+    return any(_form(_squashed(c)) == form for c in captions)
+
+
+def _section_row(table: _Table, row: list[str]) -> bool:
+    """Is ``row`` shaped like a section row of ``table``'s body ('North', '', '')? Text only,
+    filling the cells some text-only body row fills, and at most half of them.
+
+    The half is what tells a section row from a new table's header. Found reviewing 6b5a217:
+    after a suppressed row in the body ('Area5', 'x', 'x': text in every cell), a different
+    table's header on the next page ('City', 'Stores', 'Sales') had that row's shape and was
+    taken as body, the whole table with it: 51 rows for 30.
+    """
+    shape = _shape(row)
+    return (
+        shape in table.text_shapes
+        and 2 * len(shape) <= len(table.header)
+        and not any(_kind(v) in _TYPED for v in row)
+    )
+
+
+def _pending(table: _Table, row: list[str], typed: list[int]) -> bool:
+    """Is ``row`` a body row with text where a value belongs ('Area9', '109', 'pending')?
+
+    A value under a typed column makes a row body (``_names``), but a new table's header holds
+    values too. Found reviewing 6b5a217: ('Region', '2023', '2024', 'Change %') on the page
+    after a table of the same width was taken as body, and the second table merged into the
+    first with its header as a data row: 51 rows for 30, 'units' int64 to double, a 200. So
+    each value must be written as the body's are (``_form``: '1' over integers is, '2024' over
+    amounts like '12.34' is not) and not be a year, the text beside it must be text that column
+    of the body already holds ('pending' seen before, never 'Mean' or 'Change %'), and the row
+    must fill cells as a body row does. A first 'pending' at the top of a page splits.
+    """
+    if _shape(row) not in table.shapes:
+        return False
+    valued = False
+    for c in typed:
+        value = _cell(row, c)
+        kind = _kind(value)
+        if kind in _TYPED:
+            if _YEAR.fullmatch(value) or _form(value) not in table.written[c]:
+                return False
+            valued = True
+        elif kind not in {"empty", "missing"} and value not in table.texts[c]:
+            return False
+    return valued
+
+
 def _continuation(table: _Table, rows: list[list[str]]) -> tuple[list[list[str]], str] | None:
     """The part of ``rows``, the first table on the page after ``table``'s last, that is more
     body for ``table``, and the line dropped above it ('' for none). None: a new table.
@@ -879,13 +966,15 @@ def _continuation(table: _Table, rows: list[list[str]]) -> tuple[list[list[str]]
     line above body. That line was the page's header, so the page neither repeated page 1's
     header nor continued its body: a ledger split into one table per page and the largest was
     returned with a 200, 41 of 120 rows under 'Ledger p2', 79 under 'Table 1 (continued)'.
-    The line is body when it holds a value under a typed column (a 'pending' row: a value
-    makes a row body, as in ``_names``) or is shaped like a row of text only the body already
-    holds (a section row, 'South'). It starts a new table when it is a header of years, names
-    every typed column, or fills more than half the cells: a new table's header with a blank
-    corner ('', 'Shipped', 'Carrier', ...) over a body typed like this one's was dropped as a
-    title and the two tables merged. Anything else (a title, in one or two cells) is dropped
-    as a caption.
+
+    A header of years starts a new table. A running title (``_running_title``) is dropped as a
+    caption. The line is body when it is a 'pending' row (``_pending``) or a section row
+    (``_section_row``, 'South'). It starts a new table when it names every typed column or
+    fills more than half the cells: a new table's header with a blank corner ('', 'Shipped',
+    'Carrier', ...) over a body typed like this one's was dropped as a title and the two tables
+    merged. Anything else (a title, in one or two cells) is dropped as a caption. Each body
+    rule is narrow on purpose: a page split off is a reported partial result ('found 2
+    tables'), a different table merged in is silent wrong data.
     """
     if not any(rows[0]):
         return (rows[1:], "") if len(rows) > 1 and _continues(table, rows[1:]) else None
@@ -897,9 +986,9 @@ def _continuation(table: _Table, rows: list[list[str]]) -> tuple[list[list[str]]
     typed = table.typed()
     if _year_names(line, typed, table.rows):
         return None
-    if any(_kind(_cell(line, c)) in _TYPED for c in typed):
-        return rows, ""
-    if _shape(line) in table.text_shapes:
+    if _running_title(line, table.captions):
+        return rows[1:], _line(line)
+    if _pending(table, line, typed) or _section_row(table, line):
         return rows, ""
     if _names(line, typed, table.rows) >= len(typed) or 2 * len(_shape(line)) > len(line):
         return None
@@ -914,7 +1003,7 @@ def _spilled_body(table: _Table, rows: list[list[str]]) -> list[list[str]]:
     date alone under a number column ('4', '2025-01-31') is not taken.
     """
     typed = table.typed()
-    forms = _forms(table.rows, typed)
+    forms = table.forms(typed)
 
     def data(row: list[str]) -> bool:
         return (
@@ -923,10 +1012,10 @@ def _spilled_body(table: _Table, rows: list[list[str]]) -> list[list[str]]:
             and _shape(row) in table.shapes
         )
 
-    def section(row: list[str]) -> bool:
-        return _shape(row) in table.text_shapes and not any(_kind(v) in _TYPED for v in row)
+    def body(row: list[str]) -> bool:
+        return data(row) or _section_row(table, row)
 
-    end = next((i for i, row in enumerate(rows) if not (data(row) or section(row))), len(rows))
+    end = next((i for i, row in enumerate(rows) if not body(row)), len(rows))
     while end and not data(rows[end - 1]):  # a section row heads data rows, or is not body
         end -= 1
     return rows[:end]
