@@ -73,7 +73,7 @@ from pdfplumber.utils.exceptions import PdfminerException
 
 from aimart_parquet.engine.duck import ident
 from aimart_parquet.engine.infer import DEFAULT_NULL_TOKENS
-from aimart_parquet.engine.models import InputFormat
+from aimart_parquet.engine.models import InputFormat, pdf_page_ranges
 from aimart_parquet.engine.readers import RAW_TABLE, RawColumn, RawTable
 from aimart_parquet.engine.readers.delimited import _cell_kind
 from aimart_parquet.errors import AimartError, InputTooLarge, InvalidInput, InvalidRequest
@@ -116,7 +116,6 @@ MAX_REF_HOPS = 32
 # /FontBBox). A CJK font's /W lists ~65k widths, a few hundred thousand parts at most; objects
 # that name a shared object twice per level unfold to 2**depth, 2**40 in 3 KB.
 MAX_RESOLVED_PARTS = 1_000_000
-_RANGE = re.compile(r"^\s*(\d+)\s*(?:-\s*(\d+))?\s*$")
 _TEXT_STRATEGY = {"vertical_strategy": "text", "horizontal_strategy": "text"}
 _TYPED = frozenset({"number", "date"})
 # What a data row may hold under a typed column: a value, a missing-value token, or nothing.
@@ -463,22 +462,19 @@ class _Table:
 
 
 def parse_pages(spec: str | None, total: int) -> list[int]:
-    """'1-3,7' -> [1, 2, 3, 7] (1-based, in range). None -> every page up to MAX_PAGES."""
+    """'1-3,7' -> [1, 2, 3, 7] (1-based, in range). None -> every page up to MAX_PAGES.
+
+    The syntax is ``pdf_page_ranges``'s, which ``ConvertOptions`` applies before the price
+    quote; what a range selects depends on the document, so only that is checked here.
+    """
     if not spec:
         return list(range(1, min(total, MAX_PAGES) + 1))
+    try:
+        ranges = pdf_page_ranges(spec)
+    except ValueError as exc:  # refused before the quote through ConvertOptions
+        raise InvalidRequest(str(exc), hint="Use a form like '1-3,7'; pages start at 1.") from None
     pages: set[int] = set()
-    for part in spec.split(","):
-        match = _RANGE.match(part)
-        if not match:
-            raise InvalidRequest(
-                f"pdf_pages {spec!r} is not a page list.", hint="Use a form like '1-3,7'."
-            )
-        start = int(match.group(1))
-        end = int(match.group(2) or start)
-        if start < 1 or end < start:
-            raise InvalidRequest(
-                f"pdf_pages range {part.strip()!r} is invalid.", hint="Pages start at 1."
-            )
+    for start, end in ranges:
         # Clamp before iterating: '1-99999999999' once walked 1e11 numbers to keep three,
         # holding a job slot until the deadline.
         pages.update(range(start, min(end, total) + 1))

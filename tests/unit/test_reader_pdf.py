@@ -11,7 +11,7 @@ from fpdf import FPDF
 
 from aimart_parquet.engine.convert import convert_file
 from aimart_parquet.engine.limits import Limits
-from aimart_parquet.engine.models import ConvertOptions, InputFormat
+from aimart_parquet.engine.models import ConvertOptions, InputFormat, pdf_page_ranges
 from aimart_parquet.engine.readers.pdf import parse_pages
 from aimart_parquet.errors import InvalidInput, InvalidRequest
 
@@ -182,3 +182,14 @@ def test_parse_pages(spec: str | None, total: int, expected: list[int]) -> None:
 def test_parse_pages_rejects(spec: str) -> None:
     with pytest.raises(InvalidRequest):
         parse_pages(spec, 3)
+
+
+@pytest.mark.parametrize("spec", ["0", "5-2", "1,,2", "a"])
+def test_parse_pages_refuses_what_convert_options_refuses_in_its_words(spec: str) -> None:
+    # One syntax, ``pdf_page_ranges``: ConvertOptions refuses these before the price quote,
+    # and a direct call says the same thing.
+    with pytest.raises(ValueError, match="pdf_pages") as quoted:
+        pdf_page_ranges(spec)
+    with pytest.raises(InvalidRequest) as read:
+        parse_pages(spec, 3)
+    assert read.value.message == str(quoted.value)
