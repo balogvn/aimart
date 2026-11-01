@@ -54,11 +54,11 @@ from aimart_parquet.api.middleware import (
 )
 from aimart_parquet.api.schemas import (
     ConvertBody,
+    InspectBody,
     PortfolioBody,
     PreviewBody,
     QuantumCompressBody,
     QueryBody,
-    SourceBody,
     VerifyBody,
 )
 from aimart_parquet.artifacts import ArtifactStore, build_store
@@ -502,7 +502,7 @@ def create_app(
         response_model=InspectResult,
         openapi_extra=paid("inspect"),
     )
-    async def inspect(body: SourceBody) -> InspectResult:
+    async def inspect(body: InspectBody) -> InspectResult:
         return await service.inspect(body.source())
 
     @app.post(

@@ -92,7 +92,15 @@ class ConvertBody(SourceBody):
     options: ConvertOptions = Field(default_factory=ConvertOptions)
 
 
-class PreviewBody(SourceBody):
+class InspectBody(SourceBody):
+    """inspect and preview read their input as Parquet: ``content_base64`` that cannot be one
+    (a CSV not converted yet) is refused before the quote, not after the payment."""
+
+    def precheck(self, service: Service) -> None:
+        service.check_parquet_input(self.source())
+
+
+class PreviewBody(InspectBody):
     columns: list[str] | None = Field(default=None, max_length=200)
     offset: int = Field(default=0, ge=0)
     limit: int = Field(default=20, ge=1, le=500)

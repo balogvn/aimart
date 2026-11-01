@@ -139,6 +139,21 @@ MESSAGES: list[tuple[str, dict[str, Any], int, str, str]] = [
         "content_base64 is a data: URL that is not base64-encoded.",
     ),
     ("/v1/convert", {"content_base64": ""}, 400, "invalid_request", "content_base64 is empty."),
+    (
+        "/v1/preview",
+        {"content_base64": B64, "filename": "x.csv"},
+        422,
+        "invalid_input",
+        "Not a readable Parquet file: Parquet magic bytes not found in footer. Either the file "
+        "is corrupted or this is not a parquet file.",
+    ),
+    (
+        "/v1/query",
+        {"content_base64": B64, "sql": "SELECT * FROM data"},
+        422,
+        "invalid_input",
+        "Table 'data' is not a readable Parquet file.",
+    ),
 ]
 # Bodies JSON cannot be read from, and the one problem the guide quotes for each.
 UNREADABLE: list[tuple[bytes, str]] = [
@@ -243,7 +258,7 @@ def test_the_docs_state_the_limits_the_code_applies() -> None:
     assert f"the request body may be {JSON_BODY_LIMIT // 2**20} MB" in GUIDE
     longest = ConvertOptions.model_json_schema()["properties"]["encoding"]["anyOf"][0]["maxLength"]
     assert f"longer than {longest} characters" in GUIDE
-    fetch = f"{Settings().fetch_timeout_s:g} s for all of a call's `url` inputs together"
+    fetch = f"{Settings().fetch_timeout_s:g} s of downloading for all of a call's `url` inputs"
     assert fetch in README
     ports = sorted(ALLOWED_PORTS)
     listed = ", ".join(map(str, ports[:-1])) + f" and {ports[-1]}"

@@ -176,6 +176,11 @@ decided from the request alone:
   "content_base64 is a data: URL that is not base64-encoded." (a `data:` URL without
   `;base64`) or "content_base64 is empty.". Too large to send inline it is 413
   `input_too_large` (the request body may be 16 MB): pass a `url` instead.
+- `content_base64` sent to inspect, preview or query that cannot be a Parquet file (it does not
+  end in the Parquet footer, as a CSV not converted yet): 422 `invalid_input`, "Not a readable
+  Parquet file: Parquet magic bytes not found in footer. Either the file is corrupted or this
+  is not a parquet file." (inspect and preview) or "Table 'data' is not a readable Parquet
+  file." (query). Convert the file first and pass its `artifact_id`.
 - A URL the server can never fetch: 422 `url_not_allowed`, with "Only http and https URLs are
   supported.", "The URL is malformed.", "The URL has no host.", "Port 22 is not allowed." (ports
   80, 443, 8080 and 8443 are), "The URL's host is not ASCII." (use its `xn--` form), or, for an

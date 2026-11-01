@@ -8,10 +8,10 @@ Capacity: every operation holds one job slot (``_job``) from before its inputs a
 until its result is built. URL inputs land on the artifact disk, which on Cloud Run is RAM, so
 downloads must count toward capacity and share one byte budget per call.
 
-Before a price is quoted, REST and MCP ask ``check_input`` / ``check_query`` what the service
-would refuse about a request from the request alone, so an agent never signs for a call that
-can only fail. ``internal_error`` is the one answer, on both transports, for an exception that
-is not an ``AimartError``.
+Before a price is quoted, REST and MCP ask ``check_input`` / ``check_parquet_input`` /
+``check_query`` what the service would refuse about a request from the request alone, so an
+agent never signs for a call that can only fail. ``internal_error`` is the one answer, on both
+transports, for an exception that is not an ``AimartError``.
 """
 
 from __future__ import annotations
@@ -49,6 +49,7 @@ from aimart_parquet.errors import (
     AimartError,
     Busy,
     InputTooLarge,
+    InvalidInput,
     InvalidRequest,
     Timeout,
     UnsupportedFormat,
@@ -88,6 +89,29 @@ TABLE_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 # process for most of an hour. At 256 the worst found is ~7 ms, under what parsing the JSON
 # body of a large request already costs.
 PRECHECK_SQL_CHARS = 256
+
+
+def _not_parquet(raw: bytes) -> str | None:
+    """Why pyarrow cannot open ``raw`` as Parquet, judged from its last 8 bytes as pyarrow
+    judges them first, in pyarrow's words; None when only the engine can tell.
+
+    inspect, preview and query open every input with ``pq.ParquetFile`` (engine/inspect.py,
+    engine/tabular.py). Inline bytes it can only refuse, a CSV sent to preview before it was
+    converted most often, were quoted and, paid, verified before that 422. Only the footer is
+    judged: pyarrow never reads the leading 'PAR1', so a file without it still opens.
+    """
+    if len(raw) < 8:
+        return (
+            f"Parquet file size is {len(raw)} bytes, smaller than the minimum file footer (8 bytes)"
+        )
+    if raw[-4:] == b"PARE":  # an encrypted footer: this server never holds the keys
+        return "Could not read encrypted metadata, no decryption found in reader's properties"
+    if raw[-4:] != b"PAR1":
+        return (
+            "Parquet magic bytes not found in footer. Either the file is corrupted or this is "
+            "not a parquet file."
+        )
+    return None
 
 
 class QuantumUnavailable(AimartError):
@@ -260,9 +284,9 @@ class Service:
     # (no download, no file, no DuckDB run), with the same error. REST's _body_check and MCP's
     # argument checker call these before a price is quoted: without them an agent signed for,
     # and the facilitator verified, calls that could only fail. The operations check again.
-    def check_input(self, src: SourceRef, *, table: str | None = None) -> None:
+    def check_input(self, src: SourceRef, *, table: str | None = None) -> bytes | None:
         """Exactly one input, of a kind this mode serves; a URL the fetcher could fetch; base64
-        that decodes to a file."""
+        that decodes to a file. Returns the bytes ``content_base64`` holds, if that is it."""
         kinds = src.kinds()
         if len(kinds) != 1:
             got = f"got {len(kinds)} ({', '.join(kinds) or 'none'})"
@@ -284,7 +308,18 @@ class Service:
         if src.content_base64 is not None:
             # The one base64 input a call can have, so the whole budget is its limit, as when
             # _materialize decodes it.
-            check_base64(src.content_base64, max_bytes=self.settings.max_input_bytes)
+            return check_base64(src.content_base64, max_bytes=self.settings.max_input_bytes)
+        return None
+
+    def check_parquet_input(self, src: SourceRef) -> None:
+        """``check_input`` for inspect and preview, which read their input as Parquet: inline
+        bytes that can never open as Parquet are refused as the engine refuses them."""
+        raw = self.check_input(src)
+        reason = None if raw is None else _not_parquet(raw)
+        if reason is not None:
+            raise InvalidInput(
+                f"Not a readable Parquet file: {reason}", hint="Convert the file first."
+            )
 
     def check_query(self, tables: Mapping[str, SourceRef], sql: str) -> None:
         """The table map ``query`` takes, each table's input, and the SQL (when short)."""
@@ -303,10 +338,19 @@ class Service:
                 f"Invalid table names: {bad}.",
                 hint="Use lowercase names of letters, digits and underscores, e.g. 'gl' or 'bank_2025'.",
             )
-        for name, ref in tables.items():
-            self.check_input(ref, table=None if name == "data" else name)
+        inline = {
+            name: self.check_input(ref, table=None if name == "data" else name)
+            for name, ref in tables.items()
+        }
         if len(sql) <= PRECHECK_SQL_CHARS:
             validate_select(sql)  # the engine's own rule: one read-only SELECT
+        for name, raw in inline.items():  # then, as the engine does, each table is opened
+            if raw is not None and _not_parquet(raw) is not None:
+                raise InvalidInput(
+                    f"Table {name!r} is not a readable Parquet file.",
+                    hint="Convert it first (/v1/convert or the convert tool) and pass the "
+                    "returned artifact_id.",
+                )
 
     async def _materialize(
         self, src: SourceRef, workdir: Path, budget: _InputBudget
