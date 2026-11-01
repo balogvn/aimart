@@ -15,6 +15,8 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import duckdb
+
 from aimart_parquet import __version__
 from aimart_parquet.engine import safety
 from aimart_parquet.engine.detect import _zip_office_format, detect_format
@@ -43,12 +45,10 @@ from aimart_parquet.engine.readers.jsonish import read_json
 from aimart_parquet.engine.readers.pdf import read_pdf
 from aimart_parquet.engine.readers.statistical import labels_json, read_statistical
 from aimart_parquet.engine.writer import copy_to_parquet, write_parquet
-from aimart_parquet.errors import InvalidRequest, SchemaViolation
+from aimart_parquet.errors import InputTooLarge, InvalidRequest, SchemaViolation
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import duckdb
 
     from aimart_parquet.engine.limits import Limits
     from aimart_parquet.engine.readers import RawColumn, RawTable, Reader
@@ -327,7 +327,17 @@ def convert_file(
     )
     try:
         raw = READERS[fmt](con, path, workdir, options, fmt, limits)
-        report = _finish(con, raw, out_path, name, options, fmt)
+        try:
+            report = _finish(con, raw, out_path, name, options, fmt)
+        except duckdb.OutOfMemoryException as exc:
+            # Inference and the final COPY run every column's type ladder over the whole table:
+            # 30 ISO-date columns of 100 rows once passed the 1 GB memory_limit here. It was a
+            # 500 whose hint said to retry; the file, not the moment, is the problem.
+            raise InputTooLarge(
+                "The file needs more memory to convert than this server allows.",
+                hint="Split the file into parts with fewer columns or rows, or pass "
+                "options.infer_types=false to keep text columns as text; you were not charged.",
+            ) from exc
     finally:
         con.close()
     report.source_bytes = source_bytes
