@@ -302,12 +302,19 @@ def test_merge_a_running_title_is_not_a_section_row() -> None:
     (table,) = pdf_reader._merge([_found(1, first), _found(2, [["2", "", ""], *more])])
     assert table.rows == [*first[1:], *more]
     assert table.captions == ["2"]
-    # A real section row still is one; so is a word that only ends like the marker.
+    # A real section row still is one; so is a word that only ends like the marker. Round 4:
+    # when another page starts with body (no running title); on the last page of two, nothing
+    # tells it from a title printed there only, so the page splits (test_final_data_pdf.py).
+    last = [[f"Area{i}", str(100 + i), f"{1000 + i}.50"] for i in range(9, 12)]
     for section in ["South", "Discontinued"]:
         (table,) = pdf_reader._merge(
-            [_found(1, first, ["Ledger p1"]), _found(2, [[section, "", ""], *more])]
+            [
+                _found(1, first, ["Ledger p1"]),
+                _found(2, [[section, "", ""], *more]),
+                _found(3, last),
+            ]
         )
-        assert table.rows == [*first[1:], [section, "", ""], *more]
+        assert table.rows == [*first[1:], [section, "", ""], *more, *last]
 
 
 @pytest.mark.parametrize(

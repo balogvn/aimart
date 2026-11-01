@@ -354,10 +354,19 @@ SECTIONS = [["Region", "Units", "Revenue"], ["North", "", ""]] + [
 
 def test_the_line_above_a_continuation_is_body_when_the_body_holds_its_like() -> None:
     more = [[f"Area{i}", str(100 + i), f"{1000 + i}.50"] for i in range(6, 9)]
-    # A section row at the top of page 2, shaped like 'North': body, as it is on page 1.
-    (table,) = pdf_reader._merge([_found(1, SECTIONS), _found(2, [["South", "", ""], *more])])
-    assert table.rows == [*SECTIONS[1:], ["South", "", ""], *more]
+    last = [[f"Area{i}", str(100 + i), f"{1000 + i}.50"] for i in range(9, 12)]
+    # A section row at the top of page 2, shaped like 'North': body, as it is on page 1, when
+    # another page starts with body (so the pages carry no running title).
+    (table,) = pdf_reader._merge(
+        [_found(1, SECTIONS), _found(2, [["South", "", ""], *more]), _found(3, last)]
+    )
+    assert table.rows == [*SECTIONS[1:], ["South", "", ""], *more, *last]
     assert table.captions == []
+    # Round 4: on the last page of two it was body too, and so was a title printed there only
+    # ('Brought forward'), which nothing tells from it: the page splits, warned, as at 07fa450
+    # (test_final_data_pdf_page_tops.py).
+    tables = pdf_reader._merge([_found(1, SECTIONS), _found(2, [["South", "", ""], *more])])
+    assert [t.header for t in tables] == [SECTIONS[0], ["South", "", ""]]
     # A row holding a value is body too, when its text is text the body holds there. Round 3:
     # a first 'pending' was body as well, but so was a new table's header holding a year
     # ('Region', '2023', 'Change %'), so it now splits (test_final_data_pdf_next_page.py).
@@ -389,9 +398,13 @@ def test_the_line_above_a_continuation_is_body_when_the_body_holds_its_like() ->
 
 def test_tables_without_a_header_row_merge_only_page_to_page() -> None:
     # An empty header row is no header: two such tables pages apart are not one repeated.
-    body = [[f"Area{i}", str(100 + i), f"{1000 + i}.50"] for i in range(6)]
-    piece = [["", "", ""], *body]
-    tables = pdf_reader._merge([_found(1, piece), _found(2, piece), _found(4, piece)])
+    # (Round 4: each page holds other rows. One first row atop every page is a header printed
+    # on each, test_final_data_pdf_page_tops.py, and three copies of one piece were that.)
+    def piece(start: int) -> list[list[str]]:
+        body = [[f"Area{i}", str(100 + i), f"{1000 + i}.50"] for i in range(start, start + 6)]
+        return [["", "", ""], *body]
+
+    tables = pdf_reader._merge([_found(1, piece(0)), _found(2, piece(6)), _found(4, piece(12))])
     assert [t.pages for t in tables] == [[1, 2], [4]]
 
 
@@ -478,7 +491,6 @@ LEDGER = [HEADER, ["North", "", "", "", ""], *BODY]
     ("rows", "kept"),
     [
         ([["9", "2025-01-09", "North", "9.50", "27"]], 1),
-        ([["South", "", "", "", ""], ["9", "2025-01-09", "South", "9.50", "27"]], 2),
         ([["9", "2025-01-09", "North", "9.50", "27"], ["South", "", "", "", ""]], 1),
         ([["9", "2025-01-09", "North", "9.50", "27"], ["", "", "", "", "4"]], 1),
         ([["", "", "", "", "4"]], 0),  # a page number under the Qty column
@@ -489,7 +501,6 @@ LEDGER = [HEADER, ["North", "", "", "", ""], *BODY]
     ],
     ids=[
         "row",
-        "section-then-row",
         "row-then-section",
         "row-then-page-number",
         "page-number",
@@ -505,6 +516,23 @@ def test_rows_read_at_the_column_edges_are_kept_only_when_they_are_body(
     (table,) = pdf_reader._merge([_found(1, LEDGER), _spill(2, rows)])
     assert table.rows == [*LEDGER[1:], *rows[:kept]]
     assert table.pages == ([1, 2] if kept else [1])
+
+
+def test_a_section_row_read_at_the_column_edges_is_body_when_another_page_says_so() -> None:
+    rows = [["South", "", "", "", ""], ["9", "2025-01-09", "South", "9.50", "27"]]
+    more = [[str(i), f"2025-01-{i:02d}", "North", f"{i}.50", str(i * 3)] for i in range(10, 13)]
+    # After a page that starts with body: the pages carry no running title, so a section row.
+    (table,) = pdf_reader._merge([_found(1, LEDGER), _found(2, more), _spill(3, rows)])
+    assert table.rows == [*LEDGER[1:], *more, *rows]
+    assert table.pages == [1, 2, 3]
+    # Round 4: on the last page of two it was body too, as a title printed there only would
+    # be. Nothing tells them apart, so that page splits off, reported as a second table
+    # ('found 2 tables') with its row kept, never dropped as rows read there that are no body.
+    tables = pdf_reader._merge([_found(1, LEDGER), _spill(2, rows)])
+    assert [(t.header, t.rows, t.pages) for t in tables] == [
+        (HEADER, LEDGER[1:], [1]),
+        (rows[0], rows[1:], [2]),
+    ]
 
 
 def test_rows_read_at_the_column_edges_never_start_a_table() -> None:

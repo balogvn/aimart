@@ -19,12 +19,15 @@ exact and cheap. Strategy:
    has no header row, and its columns are column_1, column_2, ... (``options.header`` decides
    when the caller knows better).
 4. A table that continues across pages is merged in page order: by its repeated header (the
-   repeats dropped), or, with no repeated header, when the next page's table has the same width
+   repeats dropped; a header of plain numbers, read as data, is one when it is printed atop
+   every page), or, with no repeated header, when the next page's table has the same width
    and starts with a row typed like the body (numbers where the body has numbers), down to a
-   single row spilled onto the next page; one line above such rows (a running title, 'Table 1
-   (continued)') is dropped and reported. A line that may be a new table's header splits the
-   page off instead, with the 'found N tables' warning: a split is a reported partial result,
-   a merged table is silent wrong data. The last one or two rows of a borderless table, too
+   single row spilled onto the next page. One line above such rows is dropped and reported
+   only on evidence that it is a title (it says 'continued', has the form of the title above
+   page 1, names its page, or recurs atop the pages), or kept when it is body. A line that may
+   be a new table's header, or that nothing settles, splits the page off instead, with the
+   'found N tables' warning: a split is a reported partial result, a merged table or a title
+   kept as a row is silent wrong data. The last one or two rows of a borderless table, too
    few for text alignment to see, are read at the previous page's column edges.
 5. The largest table wins unless the caller picks one (``pdf_table``); every table found is
    listed in the report, so nothing is chosen silently.
@@ -377,6 +380,9 @@ class _Table:
     pages: list[int] = field(default_factory=list)
     strategy: str = "ruling lines"
     captions: list[str] = field(default_factory=list)
+    # The header was printed again atop a later page: names, whatever they hold, so
+    # ``_settle_header`` does not offer to read it as data.
+    repeated: bool = False
     # Per column: cells holding a value, and how many of those are numbers or dates. Kept as
     # rows are added (``add``): recounting the body on every page made merging quadratic, and
     # a 300-page ledger of 40 rows a page, its header printed once, took 18 s (now 0.14 s).
@@ -396,9 +402,17 @@ class _Table:
         rows, self.rows = self.rows, []
         self._filled = [0] * len(self.header)
         self._typed = [0] * len(self.header)
+        self.shapes = set()
+        self.text_shapes = set()
         self.written = [set() for _ in self.header]
         self.texts = [set() for _ in self.header]
         self.add(rows)
+
+    def promote(self) -> None:
+        """Take the first row of a table read without a header row (``_headless``) as its
+        header, counting the body again without it: ``_merge`` found it atop a later page."""
+        self.header, self.rows = self.rows[0], self.rows[1:]
+        self.__post_init__()
 
     def add(self, rows: list[list[str]]) -> None:
         for row in rows:
@@ -530,12 +544,16 @@ def _year_names(row: list[str], typed: list[int], body: list[list[str]]) -> bool
 
     Found reviewing the first header and continuation fixes: a title above such a header became
     the column names again, and a second year-comparison table on the next page ('Department',
-    '2023', '2024') was merged into the first as a body row. Distinct years under every filled
-    typed column, where the body of each of those columns is not mostly years (a 'Year' column
-    holds data).
+    '2023', '2024') was merged into the first as a body row. Years under every filled typed
+    column, where the body of each of those columns is not mostly years (a 'Year' column holds
+    data). Repeats count: under a line grouping columns ('', 'Revenue', '', 'Income', '') the
+    years repeat ('Region', '2024', '2023', '2024', '2023'). While only distinct years did, that
+    line was a data row, so a different table on the next page under such a header merged into
+    the first one with its years as a row (51 rows for 30), and a table alone kept it as its
+    first row.
     """
     cells = {c: v for c in typed if (v := _cell(row, c))}
-    if not cells or len(set(cells.values())) != len(cells):
+    if not cells:
         return False
     if not all(_YEAR.fullmatch(v) for v in cells.values()):
         return False
@@ -801,12 +819,19 @@ def _spilled_rows(page: Page, number: int, edges: tuple[float, ...]) -> list[_Fo
     were lost with a 200 and no warning: 125 of 126 rows. ``_merge`` keeps only the leading
     rows that are more body for that table (``_spilled_body``), so prose, a footer or a lone
     date below them stays out.
+
+    The text strategy's row lines run from the page's first word to its last, so when the
+    last column's values here end left of its edge on the previous page (set there by a wider
+    value or the bold header), the line met no last edge: the rows came back a column short,
+    continued nothing, and were lost (found in round 4 of the review, at every version).
+    Every row line meets every column edge (``intersection_x_tolerance``).
     """
     settings = TableSettings.resolve(
         {
             "vertical_strategy": "explicit",
             "explicit_vertical_lines": list(edges),
             "horizontal_strategy": "text",
+            "intersection_x_tolerance": edges[-1] - edges[0],
         }
     )
     tables = page.find_tables(settings)  # topmost first
@@ -990,23 +1015,86 @@ def _pending(table: _Table, row: list[str], typed: list[int]) -> bool:
     return valued
 
 
-def _continuation(table: _Table, rows: list[list[str]]) -> tuple[list[list[str]], str] | None:
-    """The part of ``rows``, the first table on the page after ``table``'s last, that is more
+def _top_lines(found: _Found | None) -> list[str]:
+    """The lines at the top of the page of ``found``, the first table on it: those dropped
+    above its header, and its first row unless that is the empty row of ``_headless``."""
+    if found is None:
+        return []
+    first = [_line(found.rows[0])] if found.rows and any(found.rows[0]) else []
+    return [*found.captions, *first]
+
+
+def _page_title(line: list[str], page: int, tops: dict[int, _Found]) -> bool:
+    """Is ``line``, at the top of ``page``, a running title: it names its page ('Page 2',
+    'Sheet 2 of 4', 'Ledger, page 2'), or a line written as it is (``_form``) is at the top of
+    the page before or after ('Brought forward' on each, 'Sales ledger p3' after 'p2')?
+
+    Found reviewing 9e46d7e: a short title printed on continuation pages only, with no
+    'continued' and no page-1 caption of its form, was kept as a data row whenever it fell in
+    the column of the section rows (or of a footer read into it): 127 rows for 124, warned
+    only as a merge. A running title is printed atop every continuation page, so the page
+    before or after has it too; a page named by number needs no second page.
+    """
+    text = _squashed(_line(line))
+    if str(page) in _DIGITS.findall(text):
+        return True
+    form = _form(text)
+    near = (tops.get(page - 1), tops.get(page + 1))
+    return any(_form(_squashed(top)) == form for found in near for top in _top_lines(found))
+
+
+def _starts_with_body(table: _Table, found: _Found | None) -> bool:
+    """Does the page of ``found`` start with ``table``'s body, no line above it?"""
+    if found is None or found.captions or not found.rows:
+        return False
+    rows = found.rows if any(found.rows[0]) else found.rows[1:]
+    return bool(rows) and _continues(table, rows)
+
+
+def _untitled(table: _Table, page: int, tops: dict[int, _Found]) -> bool:
+    """Does a continuation page of ``table`` other than ``page`` (one merged already, or the
+    next page) start with its body? Then the table's pages carry no running title, and a line
+    shaped like a section row atop ``page`` is one ('South'). With no such page (the last page
+    of two) nothing tells it from a title printed there only ('Brought forward'), which was a
+    data row: the page splits instead, warned, as it did at 07fa450.
+    """
+    pages = {p for p in table.pages if p != table.pages[0]} | {page + 1}
+    return any(_starts_with_body(table, tops.get(p)) for p in pages - {page})
+
+
+def _continuation(
+    table: _Table, rows: list[list[str]], page: int, tops: dict[int, _Found]
+) -> tuple[list[list[str]], str] | None:
+    """The part of ``rows``, the first table on ``page`` after ``table``'s last, that is more
     body for ``table``, and the line dropped above it ('' for none). None: a new table.
+    ``tops`` holds the first table found on each page (``_top_lines``, ``_untitled``).
 
     The page starts with body (``_continues``), with no header row (``_headless``), or with one
     line above body. That line was the page's header, so the page neither repeated page 1's
     header nor continued its body: a ledger split into one table per page and the largest was
     returned with a 200, 41 of 120 rows under 'Ledger p2', 79 under 'Table 1 (continued)'.
 
-    A header of years starts a new table. A running title (``_running_title``) is dropped as a
-    caption. The line is body when it is a 'pending' row (``_pending``) or a section row
-    (``_section_row``, 'South'). It starts a new table when it names every typed column or
-    fills more than half the cells: a new table's header with a blank corner ('', 'Shipped',
-    'Carrier', ...) over a body typed like this one's was dropped as a title and the two tables
-    merged. Anything else (a title, in one or two cells) is dropped as a caption. Each body
-    rule is narrow on purpose: a page split off is a reported partial result ('found 2
-    tables'), a different table merged in is silent wrong data.
+    The line merges the page only on evidence that it is no header of any kind; when nothing
+    settles it the page splits, as every such page did at 07fa450: a page split off is a
+    reported partial result ('found 2 tables'), a different table merged in, or a title kept
+    as a row, is silent wrong data. A header of years (repeated or not) starts a new table. A
+    running title (``_running_title``) is dropped as a caption, and a 'pending' row
+    (``_pending``) is body. The line starts a new table when it names every typed column or
+    fills more than half the cells (a new table's header with a blank corner, ('', 'Shipped',
+    'Carrier', ...), over a body typed like this one's was dropped as a title and the two
+    tables merged), and when the row under it is not written and filled like a body row
+    (``_typed_like``, a shape of the body's): '1', '2' over amounts like '1,234.56' are a
+    header of numbers, with a line grouping its columns above it. It splits too when page 1
+    had no header over the typed columns either (``_headless``, or a short title kept as the
+    header): a page without one is then no sign that the table goes on, and two tables titled
+    'Table 1' and 'Table 2' were one. A line naming its page or repeated atop the next or
+    previous page (``_page_title``) is a caption. A line shaped like a section row
+    (``_section_row``) is body when another page of the table starts with body
+    (``_untitled``), else the page splits. Any other line is a caption only when its text is
+    all outside the typed columns (a title in the label column): text over a typed column
+    ('', 'Revenue', '', 'Income', ''; 'Region', '', 'Total', '', '') is a new table's header.
+    Found reviewing 9e46d7e: both were dropped as titles and a different table merged in, 51
+    rows for 30, and a title on continuation pages only was a data row on each (127 for 124).
     """
     if not any(rows[0]):
         return (rows[1:], "") if len(rows) > 1 and _continues(table, rows[1:]) else None
@@ -1020,9 +1108,21 @@ def _continuation(table: _Table, rows: list[list[str]]) -> tuple[list[list[str]]
         return None
     if _running_title(line, table.captions):
         return rows[1:], _line(line)
-    if _pending(table, line, typed) or _section_row(table, line):
+    if _pending(table, line, typed):
         return rows, ""
-    if _names(line, typed, table.rows) >= len(typed) or 2 * len(_shape(line)) > len(line):
+    if (
+        _names(line, typed, table.rows) >= len(typed)
+        or 2 * len(_shape(line)) > len(line)
+        or not _typed_like(rows[1], table.forms(typed))
+        or _shape(rows[1]) not in table.shapes
+        or not any(_cell(table.header, c) for c in typed)
+    ):
+        return None
+    if _page_title(line, page, tops):
+        return rows[1:], _line(line)
+    if _section_row(table, line):
+        return (rows, "") if _untitled(table, page, tops) else None
+    if any(_cell(line, c) for c in typed):
         return None
     return rows[1:], _line(line)
 
@@ -1080,10 +1180,40 @@ def _span(pages: list[int]) -> str:
     return ",".join(parts)
 
 
+def _repeated(tables: list[_Table], row: list[str], page: int) -> _Table | None:
+    """The table whose header ``row``, the first row on ``page``, repeats.
+
+    A header of plain numbers over integer columns ('Question', '1', ..., '5'; 'Store', '1',
+    ..., '4') reads as data (``_headless``), and an empty header row matches nothing, so a
+    header printed atop every page (fpdf2's default, and most report writers') was a data row
+    on each: 123 rows for 120, and header=true took only the first copy away. A row atop a
+    later page that is the first row of a table read without a header is that table's header
+    (``_Table.promote``), and its copies are dropped as any repeated header's are.
+    """
+    if not any(row):  # an empty header row is no header, never a repeat of another table's
+        return None
+    same = next((t for t in tables if t.header == row), None)
+    if same is None:
+        same = next(
+            (
+                t
+                for t in tables
+                if not any(t.header) and t.rows and t.rows[0] == row and page > t.pages[-1]
+            ),
+            None,
+        )
+        if same is not None:
+            same.promote()
+    return same
+
+
 def _merge(found: list[_Found]) -> list[_Table]:
     tables: list[_Table] = []
     last: _Table | None = None  # the table that took the previous found item
     last_page = 0
+    tops: dict[int, _Found] = {}  # the first table found on each page
+    for item in found:
+        tops.setdefault(item.page, item)
     for item in found:
         if last is not None and item.page > last.pages[-1] and _repeats_caption(item, last):
             # The title already dropped above this table's header, repeated at the top of a
@@ -1091,26 +1221,37 @@ def _merge(found: list[_Found]) -> list[_Table]:
             item.captions.append(_line(item.rows[0]))
             item.rows = item.rows[1:]
         header = item.rows[0]
-        # An empty header row is no header (``_headless``), never a repeat of another table's.
-        same = next((t for t in tables if t.header == header), None) if any(header) else None
+        top = next((r for r in item.rows if any(r)), header)
+        same = _repeated(tables, top, item.page)
         taken = None
         if same is None and last is not None and last_page == item.page - 1:
             # The first table on this page, right after the last one on the previous page.
-            taken = _continuation(last, item.rows)
+            taken = _continuation(last, item.rows, item.page, tops)
         if same is not None:  # a repeated header: the table continues on this page
-            target, body = same, [r for r in item.rows[1:] if r != header]
+            target, body = same, [r for r in item.rows if any(r) and r != same.header]
+            same.repeated = True
         elif last is not None and taken is not None:
             target, (body, line) = last, taken
             item.captions.extend([line] if line else [])
-        elif item.spill or not _usable(item.rows):
+        elif not _usable(item.rows):
             # A 1-row box that continues nothing (a note, a signature block) is not a table,
             # nor the first table on its page. Dropping such pieces before merging lost the
             # last row of a table whenever it alone spilled onto the next page.
             continue
         else:
+            rows = item.rows[1:]
+            if item.spill:
+                # Rows read at the previous table's column edges are no table of their own,
+                # except its body under a line ``_continuation`` cannot place (a section row,
+                # or a title printed on the last page of two only): that page splits off, and
+                # is reported ('found 2 tables') as any other page's split, not dropped.
+                if last is None or last_page != item.page - 1:
+                    continue
+                if not (rows := _spilled_body(last, rows)):
+                    continue
             last = _Table(
                 header=header,
-                rows=list(item.rows[1:]),
+                rows=list(rows),
                 pages=[item.page],
                 strategy=item.strategy,
                 captions=list(item.captions),
@@ -1175,12 +1316,15 @@ def _settle_header(table: _Table, header: bool | None) -> list[str]:
     Whether the first row holds names is judged from how it is written (``_headless``), as
     for a CSV: a header of plain numbers ('Region', '1', '2', '3') reads as data, and a first
     data row written unlike the rest ('1,204.50' above no other thousands) as the header.
-    Either way the warning names the option that settles it.
+    Either way the warning names the option that settles it, unless the header was printed
+    atop a later page too (``_Table.repeated``): that is names, so header=false is no remedy.
     """
     width = len(table.header)
     if not any(table.header):
         if header and table.rows:  # the caller says the first row holds the names
             table.header = table.rows.pop(0)
+            # Its copies are the header printed again (``_repeated`` takes those atop a page).
+            table.rows = [r for r in table.rows if r != table.header]
         elif header is None:
             return [
                 f"no header row: the first row is data, so the columns are named column_1 to "
@@ -1190,7 +1334,12 @@ def _settle_header(table: _Table, header: bool | None) -> list[str]:
     if header is False:  # the caller says the first row is data
         table.rows.insert(0, table.header)
         table.header = [""] * width
-    elif header is None and (typed := table.typed()) and _data_row(table.header, typed, table.rows):
+    elif (
+        header is None
+        and not table.repeated
+        and (typed := table.typed())
+        and _data_row(table.header, typed, table.rows)
+    ):
         shown = ", ".join(repr(c[:20]) for c in table.header[:6])
         return [
             f"the header row ({shown}) holds numbers or dates as the data does; pass "
