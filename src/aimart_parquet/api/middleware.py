@@ -236,6 +236,16 @@ class RateLimitMiddleware:
 
 # ---------------------------------------------------------------------------------- form peek
 FORM_TYPES = ("multipart/form-data", "application/x-www-form-urlencoded")
+# What Starlette's form parser refuses (``Request.form()``'s defaults, as FastAPI calls it):
+# its 400 {"detail": "Part exceeded maximum size of 1024KB."} had no code or hint, and came
+# after the payment middleware had quoted the upload and, paid, verified it.
+MAX_FIELD_BYTES = 1024 * 1024
+MAX_FIELDS = 1000
+MAX_FILES = 1000
+
+
+class _Refused(Exception):
+    """Raised from a parser callback: the form breaks one of Starlette's limits."""
 
 
 @dataclass
@@ -260,7 +270,8 @@ class _FormReader:
     """Feeds a form body to python-multipart (Starlette's own parser) and records what it sees.
 
     File parts are noted by name and their data skipped; field values are kept, as Starlette
-    keeps them. Only ever sees the first ``FormPeekMiddleware.peek_bytes`` of a body.
+    keeps them, and refused past Starlette's limits. Only ever sees the start of a body (see
+    ``FormPeekMiddleware``).
     """
 
     def __init__(self, content_type: str) -> None:
@@ -273,8 +284,13 @@ class _FormReader:
         self._name = b""
         self._value = bytearray()
         self._is_file = False
+        self._in_field = False  # reading a field's value (not a file's, not headers)
+        self._parts = 0
+        self._fields = 0
+        self._files = 0
+        self._multipart = kind == b"multipart/form-data"
         self._parser: MultipartParser | QuerystringParser | None = None
-        if kind == b"multipart/form-data":
+        if self._multipart:
             boundary = params.get(b"boundary")
             if not boundary:
                 return  # an error once there is a body; an empty one is still a price probe
@@ -308,6 +324,8 @@ class _FormReader:
             return
         try:
             self._parser.write(chunk)
+        except _Refused as exc:
+            self.peek.error = str(exc)
         except FormParserError as exc:
             self.peek.error = str(exc) or "The form body is malformed."
 
@@ -315,9 +333,16 @@ class _FormReader:
         if self._parser is not None and self.peek.error is None:
             try:
                 self._parser.finalize()
+            except _Refused as exc:
+                self.peek.error = str(exc)
             except FormParserError as exc:
                 self.peek.error = str(exc) or "The form body is malformed."
         self.peek.complete = self.peek.error is None
+
+    @property
+    def open_field(self) -> int | None:
+        """The number of the field whose value is being read, if one is."""
+        return self._parts if self._in_field and self.peek.error is None else None
 
     # ---------------------------------------------------------------- parser callbacks
     def _part_begin(self) -> None:
@@ -327,6 +352,8 @@ class _FormReader:
         self._name = b""
         self._value = bytearray()
         self._is_file = False
+        self._parts += 1
+        self._in_field = not self._multipart  # a multipart part is a field once its headers say
 
     def _header_field(self, data: bytes, start: int, end: int) -> None:
         self._header_name += data[start:end]
@@ -348,12 +375,38 @@ class _FormReader:
             return
         self._name = options[b"name"]
         self._is_file = b"filename" in options
+        if self._is_file:
+            self._files += 1
+            if self._files > MAX_FILES:
+                raise _Refused(f"The form has more than {MAX_FILES} files.")
+        else:
+            self._fields += 1
+            if self._fields > MAX_FIELDS:
+                raise _Refused(f"The form has more than {MAX_FIELDS} fields.")
+            self._in_field = True
 
     def _data(self, data: bytes, start: int, end: int) -> None:
-        if not self._is_file:
-            self._value += data[start:end]
+        if self._is_file:
+            return
+        self._value += data[start:end]
+        self._check_size()
+
+    def _check_size(self) -> None:
+        # As Starlette counts: a multipart field's value; a urlencoded field's name and value.
+        size = len(self._value) + (0 if self._multipart else len(self._name))
+        if size > MAX_FIELD_BYTES:
+            name = (
+                _decode(self._name, self._charset)
+                if self._multipart
+                else unquote_plus(self._name[:256].decode("latin-1"))
+            )
+            raise _Refused(
+                f"Form field {name[:64]!r} is larger than {MAX_FIELD_BYTES // 1024} KB, the most "
+                "one field may hold."
+            )
 
     def _part_end(self) -> None:
+        self._in_field = False
         if self.peek.error is not None:
             return
         name = _decode(self._name, self._charset)
@@ -364,8 +417,13 @@ class _FormReader:
 
     def _field_name(self, data: bytes, start: int, end: int) -> None:
         self._name += data[start:end]
+        self._check_size()
 
     def _field_end(self) -> None:
+        self._in_field = False
+        self._fields += 1
+        if self._fields > MAX_FIELDS:
+            raise _Refused(f"The form has more than {MAX_FIELDS} fields.")
         name = unquote_plus(self._name.decode("latin-1"))
         self.peek.fields[name] = unquote_plus(bytes(self._value).decode("latin-1"))
 
@@ -379,6 +437,8 @@ class FormPeekMiddleware:
     paid retry a facilitator verify, before the route's 400. This reads the body until it ends
     or ``peek_bytes`` have arrived (clients send fields before the file, so ``options`` comes
     early), then replays every message it read, unchanged, to the app: the file still streams.
+    A field still open at ``peek_bytes`` is read to its end, at most ``MAX_FIELD_BYTES`` more:
+    cut off there, an ``options`` over Starlette's 1 MiB was quoted and only then refused.
     """
 
     def __init__(
@@ -410,7 +470,12 @@ class FormPeekMiddleware:
         buffered: list[Message] = []
         read = 0
         disconnected = False
-        while reader.peek.error is None and read < self.peek_bytes:
+        last: int | None = None  # the field open when peek_bytes had been read
+        while reader.peek.error is None:
+            if read >= self.peek_bytes:
+                last = reader.open_field if last is None else last
+                if last is None or reader.open_field != last:
+                    break
             message = await receive()
             buffered.append(message)
             if message["type"] != "http.request":

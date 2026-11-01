@@ -167,6 +167,10 @@ decided from the request alone:
   not contain a NUL character (\x00)") or a lone surrogate such as `\ud800`. Over MCP the same
   arguments get the SDK's "Error executing tool <name>: ..." text, and on `/v1/convert/upload`
   invalid `options` get "options is not valid ConvertOptions JSON.".
+- An upload form past the form parser's limits: 400 `invalid_request`, "The request body is
+  invalid.", with the problem "Form field 'options' is larger than 1024 KB, the most one field
+  may hold.", "The form has more than 1000 fields." or "The form has more than 1000 files.".
+  Send long `options` to `POST /v1/convert` as JSON, with a `url` or `content_base64`.
 - Not exactly one input: 400 `invalid_request`, "Provide exactly one input; got 0 (none)." or
   "Provide exactly one input; got 2 (url, artifact_id).". For a query, also "No tables to
   query.", "Table name 'data' is used twice." (`data` is the top-level input) and "Table 't':
@@ -194,8 +198,8 @@ decided from the request alone:
 An unpaid empty body (or `{}`), an unpaid upload form without its file, and an unpaid MCP call
 with no arguments still get the price quote. Sent with a payment, they are refused like any
 other request that can only fail. A tool this deployment does not serve is a free "Unknown
-tool" error. For `/v1/convert/upload`, put the `options` part before the `file` part: only the
-first 1 MiB of the form is checked before the quote.
+tool" error. For `/v1/convert/upload`, put the `options` part before the `file` part: only
+the fields that start in the first 1 MiB of the form are checked before the quote.
 
 | code | HTTP | what to do |
 |---|---:|---|

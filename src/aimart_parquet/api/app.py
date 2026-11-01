@@ -34,11 +34,13 @@ import anyio
 import anyio.to_thread
 from fastapi import FastAPI, File, Form, Query, Request, UploadFile
 from fastapi import params as fastapi_params
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import HTTPException, RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.routing import APIRoute
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, ValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Receive, Send
 
@@ -76,6 +78,7 @@ from aimart_parquet.service import Service, internal_error
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 
+    from starlette.responses import Response
     from starlette.types import Scope
 
     from aimart_parquet.payments import Payments
@@ -411,6 +414,15 @@ def create_app(
     @app.exception_handler(RequestValidationError)
     async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
         return _invalid_body(exc.errors())
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, exc: StarletteHTTPException) -> Response:
+        if exc.status_code != 400:
+            return await http_exception_handler(request, exc)
+        # A body the framework could not parse: Starlette's form parser past one of its limits,
+        # or FastAPI's "There was an error parsing the body". It came as {"detail": ...} with no
+        # code or hint; FormPeek refuses what it can before the quote, this types the rest.
+        return _invalid_body([{"loc": (), "msg": str(exc.detail)}])
 
     # ------------------------------------------------------------------ free routes
     networks = pay.networks() if pay else []
