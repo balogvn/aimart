@@ -254,6 +254,8 @@ class FormPeek:
 
     fields: dict[str, str] = field(default_factory=dict)  # non-file parts; the last one wins
     files: set[str] = field(default_factory=set)  # names of finished parts with a filename
+    # Names whose last finished file part held no bytes: an empty upload, which can only fail.
+    empty_files: set[str] = field(default_factory=set)
     complete: bool = False  # the whole body was read: no other part follows
     error: str | None = None  # not a well-formed form: the route could only answer 400
 
@@ -269,9 +271,9 @@ def _decode(raw: bytes, charset: str) -> str:
 class _FormReader:
     """Feeds a form body to python-multipart (Starlette's own parser) and records what it sees.
 
-    File parts are noted by name and their data skipped; field values are kept, as Starlette
-    keeps them, and refused past Starlette's limits. Only ever sees the start of a body (see
-    ``FormPeekMiddleware``).
+    File parts are noted by name and whether they held any bytes, their data skipped; field
+    values are kept, as Starlette keeps them, and refused past Starlette's limits. Only ever
+    sees the start of a body (see ``FormPeekMiddleware``).
     """
 
     def __init__(self, content_type: str) -> None:
@@ -284,6 +286,7 @@ class _FormReader:
         self._name = b""
         self._value = bytearray()
         self._is_file = False
+        self._file_bytes = 0  # of the file part being read
         self._in_field = False  # reading a field's value (not a file's, not headers)
         self._parts = 0
         self._fields = 0
@@ -352,6 +355,7 @@ class _FormReader:
         self._name = b""
         self._value = bytearray()
         self._is_file = False
+        self._file_bytes = 0
         self._parts += 1
         self._in_field = not self._multipart  # a multipart part is a field once its headers say
 
@@ -387,6 +391,7 @@ class _FormReader:
 
     def _data(self, data: bytes, start: int, end: int) -> None:
         if self._is_file:
+            self._file_bytes += end - start
             return
         self._value += data[start:end]
         self._check_size()
@@ -412,6 +417,10 @@ class _FormReader:
         name = _decode(self._name, self._charset)
         if self._is_file:
             self.peek.files.add(name)
+            if self._file_bytes:  # the last part of a name is the one the route reads
+                self.peek.empty_files.discard(name)
+            else:
+                self.peek.empty_files.add(name)
         else:
             self.peek.fields[name] = _decode(bytes(self._value), self._charset)
 

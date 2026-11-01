@@ -73,7 +73,7 @@ from aimart_parquet.mcp.server import argument_checker, build_mcp
 from aimart_parquet.payments.pricing import BY_KEY, quantum_enabled
 from aimart_parquet.provenance import Signer
 from aimart_parquet.quantum.models import PortfolioResult, QuantumCompressResult
-from aimart_parquet.service import Service, internal_error
+from aimart_parquet.service import Service, empty_upload, internal_error
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
@@ -173,9 +173,10 @@ def _form_check(
 
     Without it every upload reached the payment middleware unread: invalid ``options`` or no
     ``file`` part was quoted (402), and the paid retry verified, before the route's 400. An
-    invalid field or a malformed body is refused for anyone. A missing part only for a paid
-    request whose whole body was read: an unpaid form without its file is how catalogs replay
-    the advertised example to learn the price, so it still gets its 402.
+    invalid field, a malformed body or a finished file part with no bytes in it (as an empty
+    ``content_base64`` is) is refused for anyone. A missing part only for a paid request whose
+    whole body was read: an unpaid form without its file is how catalogs replay the advertised
+    example to learn the price, so it still gets its 402.
     """
     forms = _form_routes(app)
 
@@ -187,10 +188,12 @@ def _form_check(
                 parse(peek.fields.get(name))
             except AimartError as exc:
                 return JSONResponse(exc.to_dict(), status_code=exc.http_status)
+        parts = forms.get((scope["method"], scope["path"]), [])
+        if any(is_file and name in peek.empty_files for name, is_file in parts):
+            error = empty_upload()
+            return JSONResponse(error.to_dict(), status_code=error.http_status)
         missing = [
-            name
-            for name, is_file in forms.get((scope["method"], scope["path"]), [])
-            if name not in (peek.files if is_file else peek.fields)
+            name for name, is_file in parts if name not in (peek.files if is_file else peek.fields)
         ]
         if missing and peek.complete and paying(scope):
             return _invalid_body({"loc": (name,), "msg": "Field required"} for name in missing)

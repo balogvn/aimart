@@ -138,3 +138,27 @@ async def test_urlencoded_field_count_is_starlettes() -> None:
         b"&".join([b"a=1"] * 1001), chunk=4096, peek_bytes=10**6, content_type=form
     )
     assert peek.error == "The form has more than 1000 fields."
+
+
+async def test_a_finished_file_part_records_whether_it_held_bytes() -> None:
+    # Integration review: an empty file part was quoted, then refused after the payment.
+    body = multipart(part("empty", b"", "e.csv"), part("full", b"a\n1\n", "f.csv"))
+    peek, _, received = await peek_at(body, chunk=7, peek_bytes=1024)
+    assert peek.files == {"empty", "full"}
+    assert peek.empty_files == {"empty"}
+    assert received == body
+
+
+async def test_the_last_file_part_of_a_name_decides_whether_it_is_empty() -> None:
+    full_then_empty = multipart(part("file", b"a", "a.csv"), part("file", b"", "b.csv"))
+    peek, _, _ = await peek_at(full_then_empty, chunk=1024, peek_bytes=1024)
+    assert peek.empty_files == {"file"}
+    empty_then_full = multipart(part("file", b"", "a.csv"), part("file", b"a", "b.csv"))
+    peek, _, _ = await peek_at(empty_then_full, chunk=1024, peek_bytes=1024)
+    assert peek.empty_files == set()
+
+
+async def test_a_file_part_not_finished_in_the_peek_is_not_empty() -> None:
+    body = multipart(part("options", b"{}"), part("file", b"x" * 500_000, "a.csv"))
+    peek, _, _ = await peek_at(body, chunk=10_000, peek_bytes=50_000)
+    assert peek.empty_files == set()

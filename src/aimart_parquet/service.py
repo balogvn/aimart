@@ -202,6 +202,14 @@ def internal_error(exc: BaseException, **context: Any) -> InternalError:
     return InternalError.of(type(exc).__name__)
 
 
+def empty_upload() -> InvalidRequest:
+    """An upload with no bytes: refused before the quote (``_form_check``) and by the route."""
+    return InvalidRequest(
+        "The uploaded file is empty.",
+        hint="Upload the bytes of a non-empty file; you were not charged.",
+    )
+
+
 class Service:
     def __init__(
         self,
@@ -483,6 +491,8 @@ class Service:
                                 hint="Split the file or pass a url.",
                             )
                         out.write(chunk)
+                if not size:  # it was a 422 "The file contains no rows." after the payment
+                    raise empty_upload()
                 # Into the directory the convert works in, so the upload is on the job's disk
                 # once. In a directory of its own it was outside the engine's, which copies such
                 # an input in (DuckDB reads nothing else), and the job cap counted both copies:
