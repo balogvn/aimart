@@ -21,7 +21,6 @@ import pytest
 from x402 import SettleResponse, parse_payment_required
 
 import aimart_testkit as kit
-from aimart_parquet import artifacts
 from aimart_parquet.engine.models import ConvertOptions
 from aimart_parquet.service import SourceRef
 
@@ -103,8 +102,8 @@ async def test_output_that_fits_is_stored_and_downloadable(
     make_settings: Callable[..., Settings],
 ) -> None:
     # The budget holds one. Round 1 let the second output evict the first right away, so the
-    # first caller's paid link was dead: now a just-delivered output stays, and the second
-    # caller is refused (503, not charged) until the first is old enough to make room.
+    # first caller's paid link was dead: now a delivered output stays until its expires_at, and
+    # later callers are refused (503, not charged) until the first has expired.
     settings = make_settings(artifact_max_total_bytes=12_000)
     fake = kit.FakeFacilitator()
     async with kit.running_app(settings, facilitator=fake) as h:
@@ -117,8 +116,18 @@ async def test_output_that_fits_is_stored_and_downloadable(
         assert len(fake.settled) == 1
         assert await download_status(h, first["artifact"]) == 200
 
-        then = time.time() - artifacts.MIN_RESIDENCY_S - 60
-        os.utime(settings.artifact_dir / first["artifact"]["id"], (then, then))
+        # Old is not enough (it was once 600 s, about 49 minutes before its expires_at).
+        then = time.time() - 601
+        folder = settings.artifact_dir / first["artifact"]["id"]
+        os.utime(folder, (then, then))
+        again = await h.paying.post("/v1/convert", **convert_body(name="2b.csv"))
+        assert again.status_code == 503, again.text
+        assert "minute" in again.json()["error"]["hint"]  # when to retry, not "a few minutes"
+        assert await download_status(h, first["artifact"]) == 200
+        # Expired, it is unreachable anyway and makes room.
+        meta = json.loads((folder / "meta.json").read_text())
+        (folder / "meta.json").write_text(json.dumps({**meta, "expires_at": then + 1}))
+        os.utime(folder, (then, then))
         third = (await h.paying.post("/v1/convert", **convert_body(name="3.csv"))).json()
         assert await download_status(h, third["artifact"]) == 200
         # The older paid artifact made room; the new one never does.

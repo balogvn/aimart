@@ -4,8 +4,9 @@ whose payment has not settled yet are never evicted, and they all count.
 RV1: on GCS, rehydrating a query's second table evicted the cached copy of its first, so a
 join of artifacts that together exceed the local budget always failed (FileNotFoundError).
 RV2: a new output evicted one delivered milliseconds earlier: a charged 200 whose
-download_url already 404'd. Delivered outputs now stay at least MIN_RESIDENCY_S, and an output
-that cannot fit without evicting one sooner is refused (503 busy, not charged).
+download_url already 404'd. Delivered outputs then stayed at least 600 s; since the final review
+a local one stays until its expires_at (the folder is the artifact), and an output that cannot fit
+without evicting one sooner is refused (503 busy, not charged).
 RV3: unsettled outputs were left out of the count, so the RAM-backed disk held the budget plus
 every output waiting for settlement.
 """
@@ -88,8 +89,12 @@ def test_a_delivered_output_is_not_evicted_for_a_newer_one(
     assert set(on_disk(store)) == {first.id}
     store.get(first.id)
 
-    clock[0] += artifacts.MIN_RESIDENCY_S + 1  # delivered long enough ago: it may make room
-    second = store.put(src_file(tmp_path, "3"), "3.parquet")
+    clock[0] += store.ttl_s - 1  # long delivered, but its caller paid for it until expires_at
+    with pytest.raises(Busy):
+        store.put(src_file(tmp_path, "3"), "3.parquet")
+    assert set(on_disk(store)) == {first.id}
+    clock[0] += 2  # expired: unreachable anyway, so it may make room
+    second = store.put(src_file(tmp_path, "4"), "4.parquet")
     assert set(on_disk(store)) == {second.id}
 
 
@@ -105,7 +110,7 @@ def test_a_refused_output_evicts_nothing(tmp_path: Path, clock: list[float]) -> 
     # Evicting the old artifact would not have made room either: nothing may go for nothing.
     store = store_at(tmp_path / "store", max_total_bytes=2500)
     old = store.put(src_file(tmp_path, "old"), "old.parquet")
-    clock[0] += artifacts.MIN_RESIDENCY_S + 1
+    clock[0] += store.ttl_s + 1  # expired: evictable
     young = store.put(src_file(tmp_path, "young"), "young.parquet")
     os.utime(store.root / young.id, (clock[0], clock[0]))  # stored "now" on the moved clock
     with pytest.raises(Busy):
@@ -131,11 +136,11 @@ def test_unsettled_outputs_are_never_evicted(tmp_path: Path, clock: list[float])
     store = store_at(tmp_path / "store")
     with track_puts() as produced:
         pending = store.put(src_file(tmp_path, "p"), "p.parquet")
-    clock[0] += artifacts.MIN_RESIDENCY_S + 1  # old enough, but its call has not settled
+    clock[0] += store.ttl_s + 1  # expired, but its call has not settled
     with pytest.raises(Busy):
         store.put(src_file(tmp_path, "l"), "l.parquet")
     assert set(on_disk(store)) == {pending.id}
-    store.commit(produced)  # settled: from now on an old artifact like any other
+    store.commit(produced)  # settled: from now on an expired artifact like any other
     later = store.put(src_file(tmp_path, "l2"), "l2.parquet")
     assert set(on_disk(store)) == {later.id}
 
@@ -144,7 +149,7 @@ def test_an_output_makes_room_before_it_is_stored(tmp_path: Path, clock: list[fl
     # The disk never holds more than the budget, not even between storing and evicting.
     store = store_at(tmp_path / "store")
     old = store.put(src_file(tmp_path, "old"), "old.parquet")
-    clock[0] += artifacts.MIN_RESIDENCY_S + 1
+    clock[0] += store.ttl_s + 1
     peaks: list[int] = []
     real = store._store_local
 

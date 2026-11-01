@@ -20,10 +20,12 @@ listing at most every six hours; the bucket's 1-day lifecycle rule is the final 
 Money: ``put`` raising an ``AimartError`` is what keeps a caller from paying for an output
 that could not be kept. The budget (``max_total_bytes``) counts every stored output, and three
 kinds are never evicted to make room: an output whose paid call has not settled yet
-(provisional, inside ``track_puts``; the payment layer then commits or deletes it), an output
-delivered less than ``MIN_RESIDENCY_S`` ago, and an artifact a running call is reading
-(``hold``). An output that cannot fit without evicting one of those is refused before it is
-stored (503 busy), so nobody pays for a link that dies a moment later.
+(provisional, inside ``track_puts``; the payment layer then commits or deletes it), an
+artifact a running call is reading (``hold``), and, on the local disk, any output that has not
+expired: there the folder is the artifact, and its response promised it until ``expires_at``.
+(On GCS eviction drops only the cached copy; the blob and its link stay valid.) An output that
+cannot fit without evicting one of those is refused before it is stored (503 busy, with a hint
+saying when room frees up), so nobody pays for a link that dies before its time.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import re
 import secrets
 import shutil
@@ -58,10 +61,6 @@ if TYPE_CHECKING:
 log = logging.getLogger("aimart.artifacts")
 
 _ID = re.compile(r"^[A-Za-z0-9_-]{22,64}$")
-# How long a delivered output is safe from capacity eviction. Two concurrent paid converts
-# that each fit the budget, but not together: the second one's commit evicted the first, whose
-# caller had been charged a moment earlier for a download_url that now 404'd.
-MIN_RESIDENCY_S = 600
 # Listing is a class-A GCS operation (free tier: 5,000 a month, shared with every upload), so
 # the sweep for orphaned blobs is rationed across all instances by a marker in the bucket.
 LISTING_INTERVAL_S = 6 * 3600
@@ -161,9 +160,6 @@ def _human(n: int) -> str:
 
 
 class LocalArtifactStore:
-    # Evicting a local artifact deletes it for good (see MIN_RESIDENCY_S).
-    min_residency_s: float = MIN_RESIDENCY_S
-
     def __init__(self, root: Path, *, ttl_s: int, max_total_bytes: int, secret: bytes) -> None:
         self.root = root
         self.ttl_s = ttl_s
@@ -211,13 +207,7 @@ class LocalArtifactStore:
         # Room is made before the file lands, and counting every output (unsettled ones too):
         # leaving those out let concurrent paid calls hold a multiple of the RAM disk's budget.
         if not self._make_room(size, strict=True):
-            raise Busy(
-                "The server's output storage is full right now: recent outputs, and outputs "
-                "of calls still settling, are kept for their callers.",
-                hint="Retry in a few minutes, or send a smaller extract; you were not charged.",
-                output_bytes=size,
-                limit_bytes=self.max_total_bytes,
-            )
+            raise self._full(size)
         art = self._store_local(src, filename)
         self._persist(art)
         if _record(art.id):
@@ -348,25 +338,87 @@ class LocalArtifactStore:
         removed = 0
         now = time.time()
         for folder in self._folders():
-            try:
-                expires = json.loads((folder / "meta.json").read_text())["expires_at"]
-            except (OSError, ValueError, KeyError):
-                try:
-                    expires = folder.stat().st_mtime + self.ttl_s  # half-written: by mtime
-                except OSError:  # removed meanwhile: the other sweeper (threads) or a delete
-                    continue
+            expires = self._expiry(folder)
+            if expires is None:  # removed meanwhile: the other sweeper (threads) or a delete
+                continue
             if expires < now and not self._pins.get(folder.name):  # held: the next sweep
                 self.delete(folder.name)
                 removed += 1
         return removed
 
+    def _expiry(self, folder: Path) -> float | None:
+        """When the artifact in ``folder`` expires: its record's ``expires_at``, or for a
+        half-written one its folder's mtime plus the TTL. None once the folder is gone."""
+        try:
+            return float(json.loads((folder / "meta.json").read_text())["expires_at"])
+        except (OSError, ValueError, KeyError, TypeError):
+            try:
+                return folder.stat().st_mtime + self.ttl_s
+            except OSError:
+                return None
+
     def enforce_capacity(self, *, keep: str | Iterable[str] = ()) -> None:
         """Evict oldest artifacts until total size fits the budget (free disks are small).
 
-        Never evicts ``keep``, an unsettled output, a running call's input, or an output
-        delivered less than ``min_residency_s`` ago, so it may leave the total over budget.
+        Never evicts ``keep``, an unsettled output, a running call's input, or (here) an
+        output that has not expired, so it may leave the total over budget.
         """
         self._make_room(0, keep={keep} if isinstance(keep, str) else set(keep), strict=False)
+
+    def _evictable(self, folder: Path, now: float) -> bool:
+        """Whether capacity may take this artifact's space now (unsettled and held ones aside).
+
+        Here the folder is the artifact, so only an expired one, which no lookup serves any
+        more. A committed output used to go once it was 600 s old: a paid convert's link and
+        artifact_id 404'd about 49 minutes before the expires_at its response advertised.
+        """
+        expires = self._expiry(folder)
+        return expires is not None and expires <= now
+
+    def _free_at(self, folder: Path, now: float) -> float | None:
+        """When this artifact's space frees up by itself; None when nobody can say (an
+        unsettled output goes or stays when its payment settles)."""
+        if folder.name in self._provisional:
+            return None
+        return self._expiry(folder)
+
+    def _full(self, need: int) -> Busy:
+        """The refusal for an output that cannot fit now, saying when it would."""
+        now = time.time()
+        frees: list[tuple[float, int]] = []
+        for folder in self._folders():
+            try:
+                size = (folder / "data.parquet").stat().st_size
+            except OSError:
+                continue
+            at = self._free_at(folder, now)
+            frees.append((math.inf if at is None else at, size))
+        total = need + sum(size for _, size in frees)
+        wait: int | None = None
+        for at, size in sorted(frees):
+            if at == math.inf:
+                break
+            total -= size
+            if total <= self.max_total_bytes:
+                wait = max(1, round(at - now))
+                break
+        details: dict[str, int] = {"output_bytes": need, "limit_bytes": self.max_total_bytes}
+        if wait is None:
+            hint = "Retry in a minute, or send a smaller extract; you were not charged."
+        else:
+            minutes = math.ceil(wait / 60)
+            plural = "" if minutes == 1 else "s"
+            hint = (
+                f"Retry in about {minutes} minute{plural}, when enough stored outputs have "
+                "expired, or send a smaller extract; you were not charged."
+            )
+            details["retry_after_s"] = wait
+        return Busy(
+            "The server's output storage is full right now: stored outputs are kept until "
+            "they expire, and outputs of calls still settling until they settle.",
+            hint=hint,
+            **details,
+        )
 
     def _make_room(self, need: int, *, keep: set[str] | None = None, strict: bool) -> bool:
         """Evict the oldest evictable artifacts until ``need`` more bytes fit the budget.
@@ -393,7 +445,7 @@ class LocalArtifactStore:
             if artifact_id not in spared
             and artifact_id not in self._provisional
             and not self._pins.get(artifact_id)
-            and now - stamp >= min(self.min_residency_s, self.ttl_s)
+            and self._evictable(self.root / artifact_id, now)
         )
         if strict and total - sum(size for _, size, _ in victims) > self.max_total_bytes:
             return False
@@ -421,9 +473,12 @@ class LocalArtifactStore:
         return hmac.new(self._secret, msg, hashlib.sha256).hexdigest()[:32]
 
     def verify(self, artifact_id: str, expires_at: int, signature: str) -> bool:
-        if expires_at < time.time():
+        if expires_at < time.time() or not _ID.match(artifact_id):
             return False
-        return hmac.compare_digest(self.sign(artifact_id, expires_at), signature)
+        # Bytes, not str: compare_digest raises TypeError for a str with non-ASCII characters,
+        # and a link with sig=%C3%A9 was a bare 500 on the free download route.
+        given = signature.encode("utf-8", "surrogatepass")
+        return hmac.compare_digest(self.sign(artifact_id, expires_at).encode(), given)
 
     def download_url(self, base_url: str, art: Artifact) -> str:
         exp = int(art.expires_at)
@@ -439,9 +494,6 @@ class GcsArtifactStore(LocalArtifactStore):
     operations, so expired blobs are deleted as soon as a sweep sees them, including blobs whose
     cached copy was evicted (remembered in ``_uncached``, as no folder is left to find them by).
     """
-
-    # Evicting drops only the cached copy: the blob, and so the download link, stays valid.
-    min_residency_s: float = 0
 
     def __init__(
         self,
@@ -543,6 +595,15 @@ class GcsArtifactStore(LocalArtifactStore):
             self._uncached.pop(artifact_id, None)
             super().delete(artifact_id)
             self._delete_blob(self._key(artifact_id))
+
+    def _evictable(self, folder: Path, now: float) -> bool:
+        # Evicting drops only the cached copy: the blob, and so the download link, stays valid.
+        return True
+
+    def _free_at(self, folder: Path, now: float) -> float | None:
+        if folder.name in self._provisional or self._pins.get(folder.name):
+            return None  # goes when its payment settles, or when the call reading it ends
+        return now
 
     def _evict(self, folder: Path) -> None:
         # Only the cached copy goes; the blob stays downloadable until its TTL, when the sweep

@@ -67,13 +67,19 @@ flowchart LR
 4. **Isolated job.** Every engine call (convert, inspect, preview, query and the quantum
    tools; with the default `AIMART_ISOLATE_JOBS=true`) runs in a child forked from a `forkserver` that has already imported the engine, so
    a job costs a fork, not a fresh interpreter. The parent kills the child at its deadline
-   (504 `timeout`) or when its resident memory passes `AIMART_JOB_MEMORY_LIMIT_MB` (700 MB by
-   default; 413 `input_too_large`), and deletes the job's own temporary directory either way.
-   A crash becomes `InvalidInput`; any other unexpected exception is logged and reported by
-   its type only. All of these are unpaid. The cap is an RSS watchdog, not `RLIMIT_AS`: a
-   Linux child starts at about 2 GB of virtual memory. Its cost: a CSV converts at about 3.5
-   times its decompressed size, so on the default 2 GiB instance CSVs above roughly 180-200 MB
-   are refused. See [ADR 0005](adr/0005-job-isolation-forkserver.md).
+   (504 `timeout`) or when its resident memory plus its temporary files (under its own temp
+   directory and the call's work directory: RAM on Cloud Run) pass
+   `AIMART_JOB_MEMORY_LIMIT_MB` (700 MB by default; 413 `input_too_large`), and deletes the
+   job's own temporary directory either way. A crash becomes `InvalidInput`; any other
+   unexpected exception is reported by its type only, and logged by its type and traceback
+   frames, never its text. All of these are unpaid. The cap is an RSS-plus-files watchdog, not
+   `RLIMIT_AS`: a Linux child starts at about 2 GB of virtual memory. Its cost: a CSV converts
+   at about 3.5 times its decompressed size in memory, plus the decompressed file itself, so on
+   the default 2 GiB instance CSVs above roughly 120-150 MB decompressed are refused. A
+   convert's input is on that disk once: an upload is written into the work directory, and a
+   stored artifact is hard-linked there, not copied. `max_decompressed_bytes` (512 MB) is a
+   bomb cap, not this budget: it also caps the XML of every sheet of a workbook, of which only
+   one is parsed. See [ADR 0005](adr/0005-job-isolation-forkserver.md).
 5. **Engine** (`engine/`). Detection by magic bytes (`detect.py`) is followed by bomb-safe
    decompression (`safety.py`) and UTF-8 transcoding (`text.py`). A reader (`readers/`)
    produces a raw table in a locked-down DuckDB connection (`duck.py`). Next come type
@@ -84,8 +90,9 @@ flowchart LR
    or `GcsArtifactStore` (V4 signed URLs). The caller gets a reference (`artifact_id` and
    `download_url`), not the bytes ([ADR 0007](adr/0007-artifact-references-not-bytes.md)).
    Room is made before an output is stored, never by evicting an unsettled output, a local
-   one delivered in the last 10 minutes, or one a running call reads: an output that cannot
-   fit is refused (413 over the whole budget, 503 `busy` otherwise), unpaid.
+   one that has not expired (its response promised it until `expires_at`; on GCS eviction
+   drops only the cached copy), or one a running call reads: an output that cannot fit is
+   refused (413 over the whole budget, 503 `busy` with when to retry otherwise), unpaid.
    At the TTL an artifact becomes unreachable; a sweep on the request path deletes it soon
    after ([privacy.md](privacy.md) has the retention promise and its worst case).
 7. **Provenance.** `Service._publish`, the single place every output passes through, signs a

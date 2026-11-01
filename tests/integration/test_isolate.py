@@ -44,9 +44,12 @@ def test_unexpected_exception_is_an_internal_error(caplog: pytest.LogCaptureFixt
         run_isolated(helpers.raise_value_error, timeout_s=30)
     assert type(info.value) is errors.AimartError
     assert info.value.http_status == 500
-    # The exception's text can carry server paths: it is logged, and the caller sees its type.
+    # The exception's text can carry server paths and caller data: the caller sees its type,
+    # and the log its type and frames (test_final_isolate_logs.py), never its text.
     assert info.value.message == "Internal error (ValueError)."
-    assert "unexpected bug" in caplog.text
+    assert "ValueError" in caplog.text
+    assert "raise_value_error" in caplog.text
+    assert "unexpected bug" not in caplog.text
 
 
 def test_the_job_temp_directory_is_removed_even_when_the_child_is_killed(
@@ -143,7 +146,9 @@ def test_memory_cap_kills_a_job_that_keeps_allocating() -> None:
     assert time.monotonic() - started < 40  # killed while it holds the memory, not at the end
     assert info.value.http_status == 413
     assert "not charged" in (info.value.hint or "")
-    assert info.value.details == {"limit_bytes": cap * _MB}
+    details = info.value.details
+    assert details["limit_bytes"] == cap * _MB
+    assert details["memory_bytes"] + details["temp_file_bytes"] > cap * _MB  # what it measured
     assert run_isolated(helpers.allocate, 40, timeout_s=60, memory_limit_mb=cap) == 2  # under it
 
 

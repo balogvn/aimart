@@ -28,7 +28,6 @@ import decimal
 import io
 import json
 import os
-import re
 import shutil
 import tempfile
 import threading
@@ -52,6 +51,7 @@ from aimart_parquet.errors import (
     QueryFailed,
     QueryRejected,
     Timeout,
+    without_paths,
 )
 
 if TYPE_CHECKING:
@@ -60,8 +60,6 @@ if TYPE_CHECKING:
 OutputFormat = Literal["json", "markdown", "csv"]
 TABLE_NAME_PATTERN = r"^[a-z_][a-z0-9_]{0,62}$"
 _MAX_SAFE_INT = 2**53
-# A quoted absolute path, as DuckDB ("...") and Arrow ('...') put them in error messages.
-_PATH_IN_MESSAGE = re.compile(r"""(["'])/[^"']*\1""")
 # A preview or query result larger than this (after long cells are cut) is refused, unpaid.
 # 1000 rows of 30 full-length text columns still fit; nothing that big is readable by an agent.
 MAX_RESULT_BYTES = 64 * 1024 * 1024
@@ -410,9 +408,8 @@ def preview(
         pf = pq.ParquetFile(path)
         names = pf.schema_arrow.names
     except (pa.ArrowException, OSError) as exc:
-        message = _PATH_IN_MESSAGE.sub('"<file>"', str(exc).splitlines()[0])
         raise InvalidInput(
-            f"Not a readable Parquet file: {message}", hint="Convert the file first."
+            f"Not a readable Parquet file: {without_paths(exc)}", hint="Convert the file first."
         ) from exc
     if columns:
         columns = _pick_columns(names, columns)
@@ -423,9 +420,8 @@ def preview(
         schema = pf.read_row_groups([], columns=columns).schema  # the types the file declares
         batches = _collect(rows, stop - offset, max_chars, schema)
     except (pa.ArrowException, OSError) as exc:
-        message = _PATH_IN_MESSAGE.sub('"<file>"', str(exc).splitlines()[0])
         raise InvalidInput(
-            f"The Parquet file is corrupt: {message}",
+            f"The Parquet file is corrupt: {without_paths(exc)}",
             hint="Re-create the file, or convert the original again.",
         ) from exc
     finally:
@@ -627,7 +623,7 @@ def _register(con: duckdb.DuckDBPyConnection, name: str, path: Path, local: Path
         bad = _unreadable_columns(con, dataset.schema)
         raise InvalidInput(
             f"Table {name!r} has columns of a type SQL queries cannot read: "
-            + (", ".join(bad) if bad else _PATH_IN_MESSAGE.sub('"<file>"', str(exc)[:200]))
+            + (", ".join(bad) if bad else without_paths(exc)[:200])
             + ".",
             hint="Cast them to a common type (float16 to float32, decimal256 to decimal128 or "
             "string) and send the file again; you were not charged.",
@@ -781,7 +777,7 @@ def query(
                 hint="Add filters or aggregations, or reduce joins.",
             ) from exc
         except duckdb.Error as exc:
-            message = _without_paths(exc, spill)
+            message = without_paths(exc, spill)
             # DuckDB's reader refuses text that is not UTF-8 ('... is not valid UTF8!').
             raise QueryFailed(
                 f"Query failed: {message}",
@@ -793,7 +789,7 @@ def query(
             # Arrow refusing what DuckDB hands back, e.g. text that is not valid UTF-8 in an
             # input's string column ('Invalid UTF8 sequence in input'): it was a bare 500.
             raise QueryFailed(
-                f"Query failed: {_without_paths(exc, spill)}", hint=_BAD_VALUES_HINT
+                f"Query failed: {without_paths(exc, spill)}", hint=_BAD_VALUES_HINT
             ) from exc
     finally:
         timer.cancel()
@@ -807,14 +803,6 @@ _BAD_VALUES_HINT = (
     "An input holds values that cannot be read back (such as text that is not valid UTF-8): "
     "leave those columns out, or convert the original file again with /v1/convert."
 )
-
-
-def _without_paths(exc: Exception, spill: Path) -> str:
-    """The first line of ``exc`` with no server path: quoted ones, and the query's directory."""
-    message = (str(exc).splitlines() or [type(exc).__name__])[0]
-    for directory in {str(spill.resolve()), str(spill)}:
-        message = message.replace(directory, "<tmp>")
-    return _PATH_IN_MESSAGE.sub('"<file>"', message)
 
 
 def _clipped(con: duckdb.DuckDBPyConnection, text: str, max_chars: int) -> str:

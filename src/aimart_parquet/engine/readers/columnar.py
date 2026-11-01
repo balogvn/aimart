@@ -10,7 +10,7 @@ import pyarrow.parquet as pq
 from aimart_parquet.engine.duck import ident
 from aimart_parquet.engine.models import InputFormat
 from aimart_parquet.engine.readers import RAW_TABLE, RawColumn, RawTable
-from aimart_parquet.errors import InvalidInput
+from aimart_parquet.errors import InvalidInput, without_paths
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -33,7 +33,7 @@ def read_parquet_input(
         table = pq.read_table(path)
     except (pa.ArrowInvalid, OSError) as exc:
         raise InvalidInput(
-            f"Not a readable Parquet file: {exc}", hint="Re-export the file."
+            f"Not a readable Parquet file: {without_paths(exc)}", hint="Re-export the file."
         ) from exc
     columns: list[RawColumn] = []
     renamed: dict[str, pa.ChunkedArray] = {}

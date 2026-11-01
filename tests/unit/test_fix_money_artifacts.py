@@ -3,6 +3,7 @@ deleting expired GCS blobs at the TTL (G1), against a fake bucket that records e
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import os
 import time
@@ -38,10 +39,15 @@ def folders(store: LocalArtifactStore) -> set[str]:
 
 
 def delivered_long_ago(store: LocalArtifactStore, *ids: str) -> None:
-    """Age artifacts past the minimum residency, so capacity may evict them."""
-    then = time.time() - artifacts.MIN_RESIDENCY_S - 60
+    """Age artifacts past their expiry, so capacity may evict them: on the local disk a live
+    output never is (it was once 600 s old, before the expires_at its caller paid for)."""
+    then = time.time() - store.ttl_s - 60
     for artifact_id in ids:
-        os.utime(store.root / artifact_id, (then, then))
+        folder = store.root / artifact_id
+        art = store._local_record(artifact_id)
+        assert art is not None
+        store._write_meta(folder, dataclasses.replace(art, created_at=then, expires_at=then + 1))
+        os.utime(folder, (then, then))
 
 
 # ------------------------------------------------------------------------------ M1: the budget

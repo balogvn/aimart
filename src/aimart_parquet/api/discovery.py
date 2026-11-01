@@ -87,7 +87,10 @@ def retention_policy(settings: Settings) -> dict[str, Any]:
     return {
         "inputs": "deleted when the call finishes (each call works in its own temporary directory)",
         "outputs": outputs,
-        "logs": "request method, path, status and duration; never file contents",
+        "logs": (
+            "request method, path, status and duration, and for a job that failed unexpectedly "
+            "its error type and code location; never file contents"
+        ),
         "training": "your data is never used to train models",
         "sharing": "none; the payment facilitator sees the payment, never the data",
         "local_mode": "the free local server never sends files anywhere",

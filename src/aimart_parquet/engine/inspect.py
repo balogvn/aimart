@@ -15,7 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from aimart_parquet.engine.models import ColumnStats, InspectResult
-from aimart_parquet.errors import InvalidInput
+from aimart_parquet.errors import InvalidInput, without_paths
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -50,7 +50,7 @@ def inspect_parquet(path: Path) -> InspectResult:
         pf = pq.ParquetFile(path)
     except (pa.ArrowInvalid, OSError) as exc:
         raise InvalidInput(
-            f"Not a readable Parquet file: {exc}", hint="Convert the file first."
+            f"Not a readable Parquet file: {without_paths(exc)}", hint="Convert the file first."
         ) from exc
     md = pf.metadata
     schema = pf.schema_arrow
