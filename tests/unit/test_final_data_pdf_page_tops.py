@@ -25,6 +25,14 @@ numbers ('Region' / '', '1', '2', '3', '4') merged, the numbers a data row; a he
 every page that holds numbers was offered as data ('pass header=false'); and a row spilled onto
 the last page lost when its last value ended left of the column's edge on page 1.
 
+Round 4b, probing the first round-4 fix (d4d0ad0) the same way: a different table without a
+header row, under a title of its own, was merged into the one above, wherever a title cut into
+the columns was dropped above a page (any such title merged), the title had the form of page
+1's ('Table 2' after 'Table 1'), named a number that was the page's ('Table 2' on page 2), or
+was printed atop the next page too (a second table over two pages). Only 'continued', the line
+dropped above page 1, or a page label ('Page 2', 'Ledger p2', 'Sheet 2 of 4') now tie a line to
+the table above; 'Brought forward' atop continuation pages only splits, as at 07fa450.
+
 A split keeps the 'found N tables' warning and every table reachable with pdf_table; a merge
 of a different table, or a title kept as a row, is silent wrong data. Where nothing tells the
 cases apart, the page splits, as at 07fa450.
@@ -331,10 +339,9 @@ def _ledger(
     [
         (lambda p: "" if p == 1 else f"Page {p}", "'Page 2'; 'Page 3'; 'Page 4'"),
         (lambda p: "" if p == 1 else f"Sheet {p} of 4", "'Sheet 2 of 4'; 'Sheet 3 of 4';"),
-        (lambda p: "" if p == 1 else "Brought forward", "'Brought forward'"),
         (lambda p: "Sales ledger" if p == 1 else f"Sales ledger p{p}", "'Sales ledger';"),
     ],
-    ids=["page-n", "sheet-n-of-m", "brought-forward", "page-1-title-differs"],
+    ids=["page-n", "sheet-n-of-m", "page-1-title-differs"],
 )
 def test_a_title_on_continuation_pages_only_is_not_a_section_row(
     tmp_path: Path, title: Callable[[int], str], dropped: str
@@ -363,11 +370,14 @@ def test_a_title_under_a_footer_read_as_a_row_is_not_a_data_row(tmp_path: Path) 
     assert not any(w.startswith("found ") for w in result.report.warnings)
 
 
-def test_a_title_on_the_last_page_of_two_that_names_nothing_splits(tmp_path: Path) -> None:
-    # Printed on page 2 only, 'Brought forward' names no page and repeats nowhere: in the
-    # column of the section rows nothing tells it from one, so the page splits, warned (as at
-    # 07fa450), rather than adding it as a data row.
-    data = _ledger(55, title=lambda p: "" if p == 1 else "Brought forward")
+@pytest.mark.parametrize("rows", [55, 120], ids=["2-pages", "4-pages"])
+def test_a_title_on_continuation_pages_that_names_nothing_splits(tmp_path: Path, rows: int) -> None:
+    # 'Brought forward' atop pages 2.. only names no page and was never dropped above page 1:
+    # nothing ties it to the table on page 1 rather than to a new one (a title printed atop
+    # the pages of a second table looks the same), and in the column of the section rows it
+    # is shaped like one. The page splits, warned (as at 07fa450), rather than adding it as a
+    # data row. d4d0ad0 took a line atop the next page as well as a running title.
+    data = _ledger(rows, title=lambda p: "" if p == 1 else "Brought forward")
     result = kit.convert_bytes(tmp_path, "ledger.pdf", data)
     assert any(w.startswith("found 2 tables") for w in result.report.warnings)
     assert "Brought forward" not in result.rows[result.report.columns[0].name]
@@ -408,24 +418,31 @@ def test_merge_a_section_row_at_a_page_top_is_body_when_another_page_has_no_titl
     assert [t.header for t in tables][:2] == [SECTIONED[0], south]
 
 
-def test_merge_a_line_that_names_its_page_or_recurs_is_a_title() -> None:
-    for line, page in [("Page 2", 2), ("Sheet 2 of 4", 2), ("p12", 12)]:
+def test_merge_a_line_that_names_its_page_is_a_title() -> None:
+    lines = [("Page 2", 2), ("Sheet 2 of 4", 2), ("p12", 12), ("Ledger, pa ge 3", 3), ("2", 2)]
+    for line, page in lines:
         pages = [_found(n, _more(3 * n)) for n in range(2, page)]
         (table,) = pdf_reader._merge(
             [_found(1, SECTIONED), *pages, _found(page, [[line, "", ""], *_more(50)])]
         )
         assert table.captions == [line]
         assert [line, "", ""] not in table.rows
-    # 'Page 12' on page 2 names another page: like a section row, and nothing else says.
-    tables = pdf_reader._merge([_found(1, SECTIONED), _found(2, [["Page 12", "", ""], *_more(6)])])
-    assert len(tables) == 2
-    # The same line at the top of the next page, or of the page before, is a running title.
+    # 'Page 12' on page 2 names another page, and a number that is the page's names no page
+    # ('Table 2', 'Zone 2' on page 2): like a section row, and nothing else says, so a split.
+    for line in ["Page 12", "Table 2", "Zone 2"]:
+        tables = pdf_reader._merge([_found(1, SECTIONED), _found(2, [[line, "", ""], *_more(6)])])
+        assert [t.header for t in tables] == [SECTIONED[0], [line, "", ""]]
+    # The same line atop the next page only shows it is that page's title too, whichever
+    # table that is: d4d0ad0 took it as a running title of the table above. Now a split, as
+    # at 07fa450, the line the header of the second table (pages 2-3), never a data row.
     top = ["Brought forward", "", ""]
-    (table,) = pdf_reader._merge(
+    tables = pdf_reader._merge(
         [_found(1, SECTIONED), _found(2, [top, *_more(6)]), _found(3, [top, *_more(9)])]
     )
-    assert table.rows == [*SECTIONED[1:], *_more(6), *_more(9)]
-    assert table.captions == ["Brought forward", "Brought forward"]
+    assert [(t.header, t.rows) for t in tables] == [
+        (SECTIONED[0], SECTIONED[1:]),
+        (top, [*_more(6), *_more(9)]),
+    ]
 
 
 # ---------------------------------------------------------------- found while fixing round 4
@@ -539,3 +556,177 @@ def test_spilled_rows_under_a_section_row_on_the_last_page_of_two_split(tmp_path
     other = kit.convert_bytes(tmp_path, "spill.pdf", data, pdf_table=1)
     assert other.report.rows == 1
     assert other.rows[other.report.columns[0].name] == ["Area36"]
+
+
+# ------------------------------------------- round 4b: a title nothing ties to the table above
+
+WIDE_SALES = "Table 1. Sales by region for the fiscal year, all business units, in US dollars"
+WIDE_COSTS = "Table 2. Operating costs by region for the fiscal year, every cost centre, in euros"
+STATIC = "Regional sales ledger, all business units, fiscal year, amounts in US dollars"
+
+
+def _titled(*pages: tuple[str, Rows, bool], wide: bool) -> bytes:
+    """``_pages``, the title in a cell as wide as the page (cut into the columns) or 30 mm."""
+    pdf = FPDF()
+    pdf.set_auto_page_break(True, margin=18)
+    for title, rows, heading in pages:
+        pdf.add_page()
+        if title:
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.cell(0 if wide else 30, 8, title, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", size=9)
+        head: dict[str, Any] = (
+            {"headings_style": FontFace(emphasis="BOLD")}
+            if heading
+            else {"first_row_as_headings": False}
+        )
+        with pdf.table(borders_layout="NONE", **head) as table:
+            for values in rows:
+                row = table.row()
+                for value in values:
+                    row.cell(value)
+    return bytes(pdf.output())
+
+
+def _labelled(label: str, start: int, n: int = 30) -> Rows:
+    return [[f"{label}{i}", *_seq_row(i)[1:]] for i in range(start, start + n)]
+
+
+SALES, COSTS, MORE_COSTS = _labelled("Area", 1), _labelled("Cost", 1), _labelled("Cost", 31)
+
+
+@pytest.mark.parametrize(
+    ("pages", "wide"),
+    [
+        (((WIDE_SALES, SALES, False), (WIDE_COSTS, COSTS, False)), True),
+        (
+            (
+                (WIDE_SALES.replace("year", "year 2023"), SALES, False),
+                (
+                    WIDE_SALES.replace("Table 1", "Table 2").replace("year", "year 2024"),
+                    COSTS,
+                    False,
+                ),
+            ),
+            True,
+        ),
+        (((WIDE_SALES, [SEQ, *SALES], True), (WIDE_COSTS, COSTS, False)), True),
+        ((("", [SEQ, *SALES], True), ("Costs", COSTS, False)), False),
+        ((("Table 1", [SEQ, *SALES], True), ("Table 2", COSTS, False)), False),
+        (
+            (
+                (WIDE_SALES, [SEQ, *SALES], True),
+                (WIDE_COSTS, COSTS, False),
+                (WIDE_COSTS, MORE_COSTS, False),
+            ),
+            True,
+        ),
+        ((("", SALES, False), (STATIC, COSTS, False)), True),
+    ],
+    ids=[
+        "no-header-rows-two-titles",
+        "no-header-rows-titles-differing-in-digits",
+        "headed-then-no-header-row",
+        "headed-then-short-title",
+        "table-1-then-table-2",
+        "second-table-over-two-pages",
+        "title-on-page-2-only",
+    ],
+)
+def test_a_table_without_a_header_row_under_its_own_title_is_not_merged(
+    tmp_path: Path, pages: tuple[tuple[str, Rows, bool], ...], wide: bool
+) -> None:
+    # d4d0ad0, each a 200 for one table of 60 (90) rows, the second table's rows under the
+    # first one's names, warned only as 'merged' and 'dropped N line(s)': a title cut into the
+    # columns was dropped above any page, and 'Table 2' on page 2 named its page. Nothing ties
+    # such a title to the table above, so the page splits, as at 07fa450.
+    data = _titled(*pages, wide=wide)
+    result = kit.convert_bytes(tmp_path, "two.pdf", data)
+    assert any(w.startswith("found 2 tables") for w in result.report.warnings)
+    first = kit.convert_bytes(tmp_path, "two.pdf", data, pdf_table=0)
+    assert first.rows[first.report.columns[0].name] == [r[0] for r in SALES]
+    second = kit.convert_bytes(tmp_path, "two.pdf", data, pdf_table=1)
+    labels = second.rows[second.report.columns[0].name]
+    assert labels[-1] == pages[-1][1][-1][0]
+    assert not any(str(v).startswith("Area") for v in labels)
+
+
+def test_a_title_atop_continuation_pages_only_splits(tmp_path: Path) -> None:
+    # The same table, its title printed atop pages 2 and 3 only: the layout of
+    # 'second-table-over-two-pages' above, so nothing tells them apart and the page splits,
+    # warned, with every row reachable (as at 07fa450; d4d0ad0 merged both).
+    data = _titled(
+        ("", [SEQ, *SALES], True),
+        (STATIC, _labelled("Area", 31), False),
+        (STATIC, _labelled("Area", 61), False),
+        wide=True,
+    )
+    result = kit.convert_bytes(tmp_path, "ledger.pdf", data)
+    assert any(w.startswith("found 2 tables") for w in result.report.warnings)
+    first = kit.convert_bytes(tmp_path, "ledger.pdf", data, pdf_table=0)
+    assert first.rows["area"] == [r[0] for r in SALES]
+
+
+def test_a_report_header_atop_every_page_does_not_split_the_table(tmp_path: Path) -> None:
+    # 07fa450: 80 of 120 rows, named after the header line. The same line was dropped above
+    # page 1, so it is a running title of the table.
+    line = "ACME Corporation - annual report 2024 - section 4, regional sales ledger"
+    rows = _labelled("Area", 1, 120)
+
+    class Doc(FPDF):
+        def header(self) -> None:
+            self.set_font("Helvetica", "B", 10)
+            self.cell(0, 8, line, new_x="LMARGIN", new_y="NEXT")
+            self.set_font("Helvetica", size=9)
+
+    pdf = Doc()
+    pdf.set_auto_page_break(True, margin=18)
+    pdf.add_page()
+    with pdf.table(borders_layout="NONE", headings_style=FontFace(emphasis="BOLD")) as table:
+        for values in [SEQ, *rows]:
+            row = table.row()
+            for value in values:
+                row.cell(value)
+    result = kit.convert_bytes(tmp_path, "report.pdf", bytes(pdf.output()))
+    assert result.rows["area"] == [r[0] for r in rows]
+    assert "merged a table that continues across 3 pages" in result.report.warnings
+    assert not any(w.startswith("found ") for w in result.report.warnings)
+
+
+def test_a_section_row_with_the_page_number_in_it_stays_a_section_row(tmp_path: Path) -> None:
+    # d4d0ad0 dropped 'Zone 2' atop page 2 as a title naming its page; 'Zone' names no page,
+    # and page 3 starts with body, so the pages carry no title and it is a section row.
+    blank = ["", "", "", ""]
+    data = _pages(
+        ("", [SEQ, ["Zone 1", *blank], *_labelled("Area", 1, 35)], True),
+        ("", [["Zone 2", *blank], *_labelled("Area", 36)], False),
+        ("", _labelled("Area", 66), False),
+    )
+    result = kit.convert_bytes(tmp_path, "zones.pdf", data)
+    labels = [a for a in result.rows["area"] if not a.startswith("Area")]
+    assert labels == ["Zone 1", "Zone 2"]
+    assert [s for s in result.rows["seq"] if s is not None] == list(range(1, 96))
+    assert not any("above the header" in w for w in result.report.warnings)
+
+
+def test_merge_a_title_over_a_header_of_numbers_splits() -> None:
+    # A page label ties a line to the table above only over rows filled like its body: under
+    # it, a row with no label ('', '1', '2', '3') is a new table's header of numbers, which
+    # would be a data row once the title was dropped. Whether the alignment pass cut the title
+    # into the columns (a caption above an empty header row) or kept it in one cell.
+    shops = [["Shop", "Q1", "Q2", "Q3"]] + [
+        [f"Shop{i}", str(i), str(2 * i), str(3 * i)] for i in range(8)
+    ]
+    weeks = ["", "1", "2", "3"]
+    more = [[f"Region{i}", str(i), str(4 * i), str(5 * i)] for i in range(5)]
+    for page in (
+        _found(2, [["Page 2", "", "", ""], weeks, *more]),
+        _found(2, [["", "", "", ""], weeks, *more], ["Page 2"]),
+    ):
+        tables = pdf_reader._merge([_found(1, shops), page])
+        assert tables[0].rows == shops[1:]
+        assert len(tables) == 2
+    # Over body, the same title is dropped.
+    (table,) = pdf_reader._merge([_found(1, shops), _found(2, [["Page 2", "", "", ""], *more])])
+    assert table.rows == [*shops[1:], *more]
+    assert table.captions == ["Page 2"]
