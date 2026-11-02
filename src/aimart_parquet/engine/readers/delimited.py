@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 import duckdb
 
 from aimart_parquet.engine.duck import ident, literal
-from aimart_parquet.engine.models import InputFormat
+from aimart_parquet.engine.models import InputFormat, delimiter_refusal
 from aimart_parquet.engine.readers import RAW_TABLE, RawColumn, RawTable
 from aimart_parquet.engine.text import to_utf8
 from aimart_parquet.errors import InputTooLarge, InvalidInput, without_paths
@@ -158,6 +158,12 @@ def read_delimited(
     fmt: InputFormat,
     limits: Limits,
 ) -> RawTable:
+    if options.delimiter is not None:
+        # csv.reader refuses these ("bad delimiter or quotechar value", a bare 500 after the
+        # payment). Refused before the quote only when the request names a delimited format.
+        refusal = delimiter_refusal(options.delimiter)
+        if refusal is not None:
+            raise refusal
     info = to_utf8(path, workdir, options.encoding)
     warnings: list[str] = []
     if info.replaced_chars:

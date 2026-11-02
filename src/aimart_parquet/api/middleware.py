@@ -254,6 +254,9 @@ class FormPeek:
 
     fields: dict[str, str] = field(default_factory=dict)  # non-file parts; the last one wins
     files: set[str] = field(default_factory=set)  # names of finished parts with a filename
+    # The filename of each file part whose headers were read, by part name (the last one):
+    # what the route's UploadFile.filename will be, which names the upload's format.
+    filenames: dict[str, str] = field(default_factory=dict)
     # Names whose last finished file part held no bytes: an empty upload, which can only fail.
     empty_files: set[str] = field(default_factory=set)
     complete: bool = False  # the whole body was read: no other part follows
@@ -383,6 +386,8 @@ class _FormReader:
             self._files += 1
             if self._files > MAX_FILES:
                 raise _Refused(f"The form has more than {MAX_FILES} files.")
+            name = _decode(self._name, self._charset)
+            self.peek.filenames[name] = _decode(options[b"filename"], self._charset)
         else:
             self._fields += 1
             if self._fields > MAX_FIELDS:

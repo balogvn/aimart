@@ -160,24 +160,37 @@ REST: list[tuple[str, dict[str, Any], int, str, str | None]] = [
         "The URL's host is not ASCII.",
     ),
 ]
+# Options the schema refuses for any file.
 OPTIONS: list[dict[str, Any]] = [
-    {"pdf_pages": "0"},
-    {"pdf_pages": "5-2"},
-    {"pdf_pages": "1,,2"},
-    {"encoding": "no-such-codec"},
-    {"encoding": "rot13"},
-    {"encoding": "base64"},
-    {"encoding": "idna"},
-    {"delimiter": '"'},
-    {"delimiter": "\n"},
-    {"delimiter": "\r"},
-    {"delimiter": "\x00"},
     {"expected_schema": [{"name": "a", "type": "int64"}, {"name": "a", "type": "string"}]},
     {"expected_schema": [{"name": "a", "type": "int64"}, {"name": "A", "type": "string"}]},
     {"expected_schema": [{"name": "z", "type": "int64"}, {"name": "z", "type": "string"}]},
     {"expected_schema": [{"name": "", "type": "int64"}]},
     {"expected_schema": [{"name": "a\x00", "type": "int64"}]},
     {"null_values": ["\x00"]},
+]
+_RANGE = "pdf_pages range {!r} is invalid: pages start at 1, and a range runs low to high."
+_DELIMITER = "delimiter {!r} cannot separate fields: it is {}. Omit delimiter to detect it."
+# (filename, options, message): a value only the named format's reader reads. These were in
+# OPTIONS, refused by the schema for any file, so a CSV with pdf_pages '0' (which it never
+# reads) was refused too; they are now refused for a file named as the format that reads them,
+# with the error that reader raises (test_final_integrate_option_formats.py).
+READER_OPTIONS: list[tuple[str, dict[str, Any], str]] = [
+    ("x.pdf", {"pdf_pages": "0"}, _RANGE.format("0")),
+    ("x.pdf", {"pdf_pages": "5-2"}, _RANGE.format("5-2")),
+    (
+        "x.pdf",
+        {"pdf_pages": "1,,2"},
+        "pdf_pages '1,,2' is not a page list. Use a form like '1-3,7'.",
+    ),
+    ("x.csv", {"encoding": "no-such-codec"}, "Unknown encoding 'no-such-codec'."),
+    ("x.csv", {"encoding": "rot13"}, "'rot13' is not a text encoding."),
+    ("x.csv", {"encoding": "base64"}, "'base64' is not a text encoding."),
+    ("x.csv", {"encoding": "idna"}, "'idna' cannot decode a file."),
+    ("x.csv", {"delimiter": '"'}, _DELIMITER.format('"', "the quote character")),
+    ("x.csv", {"delimiter": "\n"}, _DELIMITER.format("\n", "a line break")),
+    ("x.csv", {"delimiter": "\r"}, _DELIMITER.format("\r", "a line break")),
+    ("x.csv", {"delimiter": "\x00"}, _DELIMITER.format("\x00", "NUL")),
 ]
 REST += [
     (
@@ -188,6 +201,16 @@ REST += [
         None,
     )
     for o in OPTIONS
+]
+REST += [
+    (
+        "/v1/convert",
+        {"content_base64": B64, "filename": name, "options": o},
+        400,
+        "invalid_request",
+        message,
+    )
+    for name, o, message in READER_OPTIONS
 ]
 
 
@@ -416,6 +439,25 @@ async def test_upload_form_options_are_refused_before_the_quote(
     assert facilitator.verified == []
 
 
+@pytest.mark.parametrize(("name", "options", "message"), READER_OPTIONS, ids=_id)
+async def test_upload_form_options_its_reader_refuses_are_refused_before_the_quote(
+    name: str,
+    options: dict[str, Any],
+    message: str,
+    paid_app: kit.AppHarness,
+    facilitator: kit.FakeFacilitator,
+) -> None:
+    r = await paid_app.http.post(
+        "/v1/convert/upload",
+        data={"options": json.dumps(options)},
+        files={"file": (name, CSV, "application/octet-stream")},
+    )
+    assert r.status_code == 400, r.text
+    assert "payment-required" not in r.headers
+    assert r.json()["error"]["message"] == message
+    assert facilitator.verified == []
+
+
 # ------------------------------------------------------------------------------ MCP
 MCP: list[tuple[str, dict[str, Any], str | None, str | None]] = [
     # (tool, arguments, error code (None: the SDK's validation text), message)
@@ -474,6 +516,15 @@ MCP: list[tuple[str, dict[str, Any], str | None, str | None]] = [
     ),
 ]
 MCP += [("convert_to_parquet", {"content_base64": B64, "options": o}, None, None) for o in OPTIONS]
+MCP += [
+    (
+        "convert_to_parquet",
+        {"content_base64": B64, "filename": n, "options": o},
+        "invalid_request",
+        m,
+    )
+    for n, o, m in READER_OPTIONS
+]
 MCP_GOOD: dict[str, dict[str, Any]] = {
     "inspect_parquet": {"artifact_id": A},
     "preview_parquet": {"artifact_id": A},

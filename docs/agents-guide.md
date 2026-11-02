@@ -178,17 +178,23 @@ decided from the request alone:
   from has one problem: "JSON decode error", "JSON nested too deeply", "JSON body is not valid
   UTF-8" or "JSON integer longer than 4300 digits". Besides types and ranges, the schema covers
   an `artifact_id` that is not one `convert` issues ("String should match pattern
-  '^[A-Za-z0-9_-]{22,64}$'") and these `options`: `pdf_pages` that no PDF has ("pdf_pages range
-  '5-2' is invalid: pages start at 1, and a range runs low to high."), an `encoding` that is
-  unknown or not a text codec ("Unknown encoding 'utf-9'.", "'rot13' is not a text
-  encoding.") or longer than 64 characters, a `delimiter` of `"`, a line break or NUL
-  ("delimiter '"' cannot separate fields: it is the quote character. Omit delimiter to detect
-  it."), and an `expected_schema` that names one column twice ("expected_schema names column
-  'a' twice."). Names are case-insensitive, so `a` and `A` are one column. Text that DuckDB
-  reads (`sql`, `null_values`, `sort_by`, `expected_schema` names) must not hold a NUL ("must
-  not contain a NUL character (\x00)") or a lone surrogate such as `\ud800`. Over MCP the same
-  arguments get the SDK's "Error executing tool <name>: ..." text, and on `/v1/convert/upload`
-  invalid `options` get "options is not valid ConvertOptions JSON.".
+  '^[A-Za-z0-9_-]{22,64}$'"), an `encoding` longer than 64 characters, and an `expected_schema`
+  that names one column twice ("expected_schema names column 'a' twice."). Names are
+  case-insensitive, so `a` and `A` are one column. Text that DuckDB reads (`sql`,
+  `null_values`, `sort_by`, `expected_schema` names) must not hold a NUL ("must not contain a
+  NUL character (\x00)") or a lone surrogate such as `\ud800`. Over MCP the same arguments get
+  the SDK's "Error executing tool <name>: ..." text, and on `/v1/convert/upload` invalid
+  `options` get "options is not valid ConvertOptions JSON.".
+- An option the file's format reads and can never use, when the request names that format
+  (`options.format`, else the extension of `filename` or of the uploaded file's name, else of
+  the `url`'s path): 400 `invalid_request`, on REST, the upload form and MCP alike. For a PDF,
+  `pdf_pages` that no PDF has ("pdf_pages range '5-2' is invalid: pages start at 1, and a range
+  runs low to high."); for CSV, TSV, JSON or NDJSON, an `encoding` that is unknown or not a
+  text codec ("Unknown encoding 'utf-9'.", "'rot13' is not a text encoding."); for CSV or TSV,
+  a `delimiter` of `"`, a line break or NUL ("delimiter '"' cannot separate fields: it is the
+  quote character. Omit delimiter to detect it."). Other formats never read these options, so
+  any value converts. A request that names no format gets the same error once the file is
+  read, after the payment is verified, and is not charged.
 - An upload form past the form parser's limits: 400 `invalid_request`, "The request body is
   invalid.", with the problem "Form field 'options' is larger than 1024 KB, the most one field
   may hold.", "The form has more than 1000 fields." or "The form has more than 1000 files.".

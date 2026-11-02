@@ -10,9 +10,10 @@ import re
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
-from aimart_parquet.engine.text import encoding_problem
+from aimart_parquet.engine.text import encoding_refusal
+from aimart_parquet.errors import InvalidRequest
 
 
 class InputFormat(StrEnum):
@@ -81,6 +82,10 @@ _UNUSABLE_DELIMITERS = {
     "\r": "a line break",
     "\x00": "NUL",
 }
+# The formats whose readers read ``encoding`` (through text.to_utf8) and ``delimiter``.
+# SPSS/Stata/SAS pass ``encoding`` to pyreadstat, which names codecs as iconv does, not Python.
+_TEXT = frozenset({InputFormat.CSV, InputFormat.TSV, InputFormat.JSON, InputFormat.NDJSON})
+_DELIMITED = frozenset({InputFormat.CSV, InputFormat.TSV})
 # One part of pdf_pages, as the PDF reader parses it: '3' or '1-5', spaces allowed.
 _PAGE_RANGE = re.compile(r"^\s*(\d+)\s*(?:-\s*(\d+))?\s*$")
 
@@ -106,6 +111,27 @@ def pdf_page_ranges(spec: str) -> list[tuple[int, int]]:
             raise ValueError(msg)
         ranges.append((start, end))
     return ranges
+
+
+def pages_refusal(spec: str) -> InvalidRequest | None:
+    """The error the PDF reader raises for ``pdf_pages`` no PDF has, or None."""
+    try:
+        pdf_page_ranges(spec)
+    except ValueError as exc:
+        return InvalidRequest(str(exc), hint="Use a form like '1-3,7'; pages start at 1.")
+    return None
+
+
+def delimiter_refusal(delimiter: str) -> InvalidRequest | None:
+    """The error the delimited reader raises for a ``delimiter`` that cannot separate fields."""
+    why = _UNUSABLE_DELIMITERS.get(delimiter)
+    if why is None:
+        return None
+    return InvalidRequest(
+        f"delimiter {delimiter!r} cannot separate fields: it is {why}. Omit delimiter to "
+        "detect it.",
+        hint="Pass the one character between fields, such as ',', ';', '|' or a tab.",
+    )
 
 
 class ExpectedColumn(BaseModel):
@@ -161,9 +187,10 @@ class ConvertOptions(BaseModel):
     header: bool | None = Field(
         default=None, description="Whether the first row is a header. Omit to auto-detect."
     )
-    # max_length is checked before _text_encoding: codecs.lookup caches every unknown name for
-    # good, so unpaid requests with megabyte-long names grew the API process by their size (and
-    # each took ~1 s of the event loop). The longest stdlib codec name has 24 characters.
+    # max_length holds for every format, before any codec lookup (``refusal``, the readers):
+    # codecs.lookup caches every unknown name for good, so unpaid requests with megabyte-long
+    # names grew the API process by their size (and each took ~1 s of the event loop). The
+    # longest stdlib codec name has 24 characters.
     encoding: str | None = Field(
         default=None,
         max_length=64,
@@ -232,33 +259,29 @@ class ConvertOptions(BaseModel):
     compression: Literal["zstd", "snappy", "gzip", "none"] = "zstd"
     row_group_size: int = Field(default=122_880, ge=1_000, le=10_000_000)
 
-    # The rules below are decided by the request alone, so the request schema refuses them
-    # before any price is quoted. Each used to be found only after the payment was verified.
-    @field_validator("delimiter")
-    @classmethod
-    def _usable_delimiter(cls, value: str | None) -> str | None:
-        if value is not None and value in _UNUSABLE_DELIMITERS:
-            msg = (
-                f"delimiter {value!r} cannot separate fields: it is "
-                f"{_UNUSABLE_DELIMITERS[value]}. Omit delimiter to detect it."
-            )
-            raise ValueError(msg)
-        return value
+    def refusal(self, fmt: InputFormat | None) -> InvalidRequest | None:
+        """The error the reader of ``fmt`` raises for an option value it can never use.
 
-    @field_validator("encoding")
-    @classmethod
-    def _text_encoding(cls, value: str | None) -> str | None:
-        problem = encoding_problem(value) if value is not None else None
-        if problem is not None:
-            raise ValueError(problem)
-        return value
-
-    @field_validator("pdf_pages")
-    @classmethod
-    def _page_list(cls, value: str | None) -> str | None:
-        if value is not None:
-            pdf_page_ranges(value)
-        return value
+        REST, the upload form and MCP raise it before the quote, with ``fmt`` the format the
+        request names (``Service.check_options``); each was found only after the payment was
+        verified, and some crashed into a bare 500 ('rot13', '"'). Only an option that format
+        reads: the PDF reader reads ``pdf_pages``, the text readers ``encoding``, the delimited
+        reader ``delimiter``. These were field validators, so they refused every format, and a
+        CSV with pdf_pages '0', or an xlsx with encoding 'binary', which converted and settled
+        at 07fa450, became a 400: a lost sale on a value that format never reads. With ``fmt``
+        None, nothing is refused here; the reader that reads the value refuses it, unpaid.
+        """
+        if fmt in _DELIMITED and self.delimiter is not None:
+            refusal = delimiter_refusal(self.delimiter)
+            if refusal is not None:
+                return refusal
+        if fmt in _TEXT and self.encoding is not None:
+            refusal = encoding_refusal(self.encoding)
+            if refusal is not None:
+                return refusal
+        if fmt is InputFormat.PDF and self.pdf_pages is not None:
+            return pages_refusal(self.pdf_pages)
+        return None
 
     @model_validator(mode="after")
     def _unique_expected_names(self) -> ConvertOptions:

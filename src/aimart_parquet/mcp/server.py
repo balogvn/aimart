@@ -178,19 +178,24 @@ def _precheck(service: Service, args: Mapping[str, Any], takes: tuple[str, ...])
     """What a paid tool would refuse about its validated arguments, from the arguments alone.
 
     Every paid tool names its input as url / content_base64 / artifact_id (path, locally), and
-    query_parquet alone takes `sql` and `tables`: the tools build their SourceRefs the same way.
-    ``takes`` is the tool's inputs, which a refusal's hint names.
+    query_parquet alone takes `sql` and `tables`, convert_to_parquet alone `ConvertOptions`:
+    the tools build their SourceRefs the same way. ``takes`` is the tool's inputs, which a
+    refusal's hint names.
     """
     src = SourceRef(
         url=args.get("url"),
         content_base64=args.get("content_base64"),
         artifact_id=args.get("artifact_id"),
         path=args.get("path"),
+        filename=args.get("filename"),
         takes=takes,
     )
+    options = args.get("options")
     if "sql" in args:
         tables = _tables(src, args.get("tables"), local=service.local_mode)
         service.check_query(tables, args["sql"])
+    elif isinstance(options, ConvertOptions):
+        service.check_convert(src, options)
     else:
         service.check_input(src)
 

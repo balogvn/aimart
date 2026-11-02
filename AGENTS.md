@@ -121,7 +121,9 @@ Module docstrings explain the why; read the one you are about to change.
   too) in the child, its work directory counted toward the cap. `query` takes a map of table
   names (`data` + up to 7 joined artifacts) for one query price. Before the quote:
   `check_input`, `check_parquet_input` (inline bytes that cannot be Parquet, for inspect and
-  preview), `check_query` (with `check_tables`, which `query` runs too).
+  preview), `check_query` (with `check_tables`, which `query` runs too), `check_convert` (with
+  `check_options`: `pdf_pages`, `encoding` or `delimiter` the reader of the format the request
+  names can never use, as `ConvertOptions.refusal`; any other format ignores them).
 - `payments/`: `pricing.py` (`OPERATIONS`, the single source of prices, routes and tool names;
   `usd_to_atomic`), `__init__.py` (`Payments`: x402 resource server, REST route configs with the
   Bazaar extension, lazy facilitator init, price-floor check; `http_middleware(prevalidate=,

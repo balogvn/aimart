@@ -49,6 +49,10 @@ def _convert(**options: Any) -> tuple[str, dict[str, Any]]:
     return "/v1/convert", {"content_base64": B64, "options": options}
 
 
+def _named(filename: str, **options: Any) -> tuple[str, dict[str, Any]]:
+    return "/v1/convert", {"content_base64": B64, "filename": filename, "options": options}
+
+
 # (path, body, status, code, the message the guide quotes)
 MESSAGES: list[tuple[str, dict[str, Any], int, str, str]] = [
     (
@@ -161,6 +165,26 @@ MESSAGES: list[tuple[str, dict[str, Any], int, str, str]] = [
         "invalid_input",
         "Table 'data' is not a readable Parquet file.",
     ),
+    (
+        *_named("x.pdf", pdf_pages="5-2"),
+        400,
+        "invalid_request",
+        "pdf_pages range '5-2' is invalid: pages start at 1, and a range runs low to high.",
+    ),
+    (*_named("x.csv", encoding="utf-9"), 400, "invalid_request", "Unknown encoding 'utf-9'."),
+    (
+        *_named("x.json", encoding="rot13"),
+        400,
+        "invalid_request",
+        "'rot13' is not a text encoding.",
+    ),
+    (
+        *_named("x.tsv", delimiter='"'),
+        400,
+        "invalid_request",
+        "delimiter '\"' cannot separate fields: it is the quote character. Omit delimiter to "
+        "detect it.",
+    ),
 ]
 # Bodies JSON cannot be read from, and the one problem the guide quotes for each.
 UNREADABLE: list[tuple[bytes, str]] = [
@@ -176,17 +200,8 @@ PROBLEMS: list[tuple[str, dict[str, Any], str]] = [
         {"artifact_id": "not valid!"},
         "String should match pattern '^[A-Za-z0-9_-]{22,64}$'",
     ),
-    (
-        *_convert(pdf_pages="5-2"),
-        "pdf_pages range '5-2' is invalid: pages start at 1, and a range runs low to high.",
-    ),
-    (*_convert(encoding="utf-9"), "Unknown encoding 'utf-9'."),
-    (*_convert(encoding="rot13"), "'rot13' is not a text encoding."),
-    (
-        *_convert(delimiter='"'),
-        "delimiter '\"' cannot separate fields: it is the quote character. Omit delimiter to "
-        "detect it.",
-    ),
+    # pdf_pages, encoding and delimiter were schema problems here, refused for any file; they
+    # are now the reader's own error, for a file named as its format (in MESSAGES).
     (
         *_convert(
             expected_schema=[{"name": "a", "type": "int64"}, {"name": "a", "type": "string"}]
@@ -272,7 +287,8 @@ async def test_the_guide_quotes_the_upload_form_refusal(paid_app: kit.AppHarness
     r = await paid_app.http.post(
         "/v1/convert/upload",
         files={"file": ("a.csv", b"a\n1\n", "text/csv")},
-        data={"options": json.dumps({"encoding": "rot13"})},
+        # {"encoding": "rot13"} was the example; the schema no longer refuses it for any file.
+        data={"options": json.dumps({"row_group_size": 1})},
     )
     message = _refused(r, 400, "invalid_request")["message"]
     assert f'"{message}"' in GUIDE

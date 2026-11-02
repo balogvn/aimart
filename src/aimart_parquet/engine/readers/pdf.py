@@ -73,7 +73,7 @@ from pdfplumber.utils.exceptions import PdfminerException
 
 from aimart_parquet.engine.duck import ident
 from aimart_parquet.engine.infer import DEFAULT_NULL_TOKENS
-from aimart_parquet.engine.models import InputFormat, pdf_page_ranges
+from aimart_parquet.engine.models import InputFormat, pages_refusal, pdf_page_ranges
 from aimart_parquet.engine.readers import RAW_TABLE, RawColumn, RawTable
 from aimart_parquet.engine.readers.delimited import _cell_kind
 from aimart_parquet.errors import AimartError, InputTooLarge, InvalidInput, InvalidRequest
@@ -464,15 +464,15 @@ class _Table:
 def parse_pages(spec: str | None, total: int) -> list[int]:
     """'1-3,7' -> [1, 2, 3, 7] (1-based, in range). None -> every page up to MAX_PAGES.
 
-    The syntax is ``pdf_page_ranges``'s, which ``ConvertOptions`` applies before the price
-    quote; what a range selects depends on the document, so only that is checked here.
+    The syntax is ``pdf_page_ranges``'s, refused before the price quote when the request names
+    a PDF (``ConvertOptions.refusal``); what a range selects depends on the document.
     """
     if not spec:
         return list(range(1, min(total, MAX_PAGES) + 1))
-    try:
-        ranges = pdf_page_ranges(spec)
-    except ValueError as exc:  # refused before the quote through ConvertOptions
-        raise InvalidRequest(str(exc), hint="Use a form like '1-3,7'; pages start at 1.") from None
+    refusal = pages_refusal(spec)  # a file with no name or format may still be a PDF
+    if refusal is not None:
+        raise refusal
+    ranges = pdf_page_ranges(spec)
     pages: set[int] = set()
     for start, end in ranges:
         # Clamp before iterating: '1-99999999999' once walked 1e11 numbers to keep three,

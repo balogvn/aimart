@@ -119,6 +119,20 @@ def encoding_problem(name: str) -> str | None:
     return None
 
 
+def encoding_refusal(name: str) -> InvalidRequest | None:
+    """The error the text readers raise for an ``encoding`` they can never use, or None.
+
+    Raised by ``to_utf8``, and before the quote for a request whose format is text
+    (``ConvertOptions.refusal``): one error, wherever it is found.
+    """
+    problem = encoding_problem(name)
+    if problem is None:
+        return None
+    return InvalidRequest(
+        problem, hint="Use a Python codec name such as 'utf-8', 'latin-1' or 'cp1252', or omit it."
+    )
+
+
 def _transcode(src: Path, dst: Path, encoding: str) -> int:
     """Transcode to UTF-8; returns how many undecodable characters became U+FFFD.
 
@@ -157,14 +171,11 @@ def _undecodable(encoding: str, exc: UnicodeError) -> InvalidInput:
 def to_utf8(path: Path, workdir: Path, forced_encoding: str | None = None) -> TextInfo:
     """Return a UTF-8 version of ``path`` (the same path when it already is UTF-8)."""
     if forced_encoding:
-        # ConvertOptions refuses these before the quote; repeated for callers that build the
-        # options without validation.
-        problem = encoding_problem(forced_encoding)
-        if problem is not None:
-            raise InvalidRequest(
-                problem,
-                hint="Use a Python codec name such as 'utf-8', 'latin-1' or 'cp1252', or omit it.",
-            )
+        # Refused before the quote only when the request names a text format (a file with no
+        # name or format may not be text), so a request can reach here with one.
+        refusal = encoding_refusal(forced_encoding)
+        if refusal is not None:
+            raise refusal
         if codecs.lookup(forced_encoding).name == "utf-8":
             return TextInfo(path, "utf-8", 0)
         encoding = forced_encoding

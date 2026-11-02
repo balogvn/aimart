@@ -97,6 +97,9 @@ class SourceBody(BaseModel):
 class ConvertBody(SourceBody):
     options: ConvertOptions = Field(default_factory=ConvertOptions)
 
+    def precheck(self, service: Service) -> None:
+        service.check_convert(self.source(), self.options)
+
 
 class InspectBody(SourceBody):
     """inspect and preview read their input as Parquet: ``content_base64`` that cannot be one

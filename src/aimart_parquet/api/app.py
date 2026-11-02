@@ -160,9 +160,16 @@ def _convert_options(options: str | None) -> ConvertOptions:
         ) from exc
 
 
-# Form fields a route parses itself (to FastAPI they are plain strings), by route path.
-_FORM_FIELDS: dict[str, dict[str, Callable[[str | None], object]]] = {
-    BY_KEY["convert_upload"].path: {"options": _convert_options},
+def _upload_check(peek: FormPeek) -> None:
+    """The upload route's ``options`` as it parses them, then what the reader of the format the
+    upload names (``options.format``, else its filename) would refuse about them."""
+    options = _convert_options(peek.fields.get("options"))
+    Service.check_options(options, peek.filenames.get("file"))
+
+
+# What a form route would refuse from its fields (to FastAPI they are plain strings), by path.
+_FORM_CHECKS: dict[str, Callable[[FormPeek], None]] = {
+    BY_KEY["convert_upload"].path: _upload_check,
 }
 
 
@@ -183,9 +190,10 @@ def _form_check(
     def check(scope: Scope, peek: FormPeek) -> JSONResponse | None:
         if peek.error is not None:
             return _invalid_body([{"loc": (), "msg": peek.error}])
-        for name, parse in _FORM_FIELDS.get(scope["path"], {}).items():
+        field_check = _FORM_CHECKS.get(scope["path"])
+        if field_check is not None:
             try:
-                parse(peek.fields.get(name))
+                field_check(peek)
             except AimartError as exc:
                 return JSONResponse(exc.to_dict(), status_code=exc.http_status)
         parts = forms.get((scope["method"], scope["path"]), [])

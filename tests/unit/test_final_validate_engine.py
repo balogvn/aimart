@@ -15,7 +15,7 @@ import pytest
 from pydantic import ValidationError
 
 import aimart_testkit as kit
-from aimart_parquet.engine.models import ConvertOptions, ExpectedColumn
+from aimart_parquet.engine.models import ConvertOptions, ExpectedColumn, InputFormat
 from aimart_parquet.engine.text import encoding_problem, to_utf8
 from aimart_parquet.errors import InvalidInput, InvalidRequest
 
@@ -30,6 +30,24 @@ def _problem(**options: Any) -> str:
         ConvertOptions(**options)
     [error] = info.value.errors()
     return str(error["msg"])
+
+
+def _refused(fmt: InputFormat, unread: tuple[InputFormat, ...], **values: Any) -> str:
+    """The message ``fmt``'s reader refuses ``values`` with, once a format that never reads
+    them has been shown to take them.
+
+    These rules were ConvertOptions field validators, and these tests asserted a
+    ValidationError for every format. That refused a CSV with pdf_pages '0', or an xlsx with
+    encoding 'binary', which convert fine: only the format that reads a value refuses it now.
+    """
+    options = ConvertOptions(**values)  # valid as options: no format is known yet
+    for other in unread:
+        assert options.refusal(other) is None, other
+    assert options.refusal(None) is None
+    refusal = options.refusal(fmt)
+    assert isinstance(refusal, InvalidRequest)
+    assert refusal.hint
+    return refusal.message
 
 
 # ------------------------------------------------------------------------------ expected_schema
@@ -85,10 +103,20 @@ def test_report_is_built_by_position_not_by_name(tmp_path: Path) -> None:
     [('"', "the quote character"), ("\n", "a line break"), ("\r", "a line break"), ("\x00", "NUL")],
 )
 def test_delimiters_that_cannot_work_are_refused(delimiter: str, why: str) -> None:
-    assert _problem(delimiter=delimiter) == (
-        f"Value error, delimiter {delimiter!r} cannot separate fields: it is {why}. "
-        "Omit delimiter to detect it."
+    message = (
+        f"delimiter {delimiter!r} cannot separate fields: it is {why}. Omit delimiter to detect it."
     )
+    unread = (InputFormat.XLSX, InputFormat.JSON, InputFormat.PDF)
+    assert _refused(InputFormat.CSV, unread, delimiter=delimiter) == message
+    assert _refused(InputFormat.TSV, unread, delimiter=delimiter) == message
+
+
+@pytest.mark.parametrize("delimiter", ['"', "\n"])
+def test_the_delimited_reader_refuses_them_typed(delimiter: str, tmp_path: Path) -> None:
+    # Before: csv.reader's ValueError ("bad delimiter or quotechar value"), a bare 500, for a
+    # file whose request named no format, so nothing refused the value before the quote.
+    with pytest.raises(InvalidRequest, match="cannot separate fields"):
+        kit.convert_bytes(tmp_path, "upload", CSV, delimiter=delimiter)
 
 
 @pytest.mark.parametrize("delimiter", [",", ";", "\t", "|", " ", "'", "\\", "#"])
@@ -112,7 +140,9 @@ def test_ordinary_delimiters_still_convert(delimiter: str, tmp_path: Path) -> No
 )
 def test_encodings_that_cannot_decode_text_are_refused(encoding: str, message: str) -> None:
     assert encoding_problem(encoding) == message
-    assert _problem(encoding=encoding) == f"Value error, {message}"
+    unread = (InputFormat.XLSX, InputFormat.PDF, InputFormat.PARQUET, InputFormat.SAV)
+    for fmt in (InputFormat.CSV, InputFormat.TSV, InputFormat.JSON, InputFormat.NDJSON):
+        assert _refused(fmt, unread, encoding=encoding) == message
 
 
 @pytest.mark.parametrize(
@@ -172,7 +202,8 @@ def test_a_bom_file_still_decodes_with_the_generic_name(tmp_path: Path) -> None:
     ],
 )
 def test_impossible_pdf_pages_are_refused(pages: str, message: str) -> None:
-    assert _problem(pdf_pages=pages) == f"Value error, {message}"
+    unread = (InputFormat.CSV, InputFormat.XLSX, InputFormat.JSON)
+    assert _refused(InputFormat.PDF, unread, pdf_pages=pages) == message
 
 
 @pytest.mark.parametrize("pages", ["1", "1-3,7", " 2 - 4 , 9 ", "3-3", "1-99999999999"])

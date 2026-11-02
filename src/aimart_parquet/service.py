@@ -33,6 +33,7 @@ import anyio.to_thread
 from aimart_parquet.artifacts import discard_withheld
 from aimart_parquet.demand import DemandSignals
 from aimart_parquet.engine.convert import convert_file
+from aimart_parquet.engine.detect import format_from_name
 from aimart_parquet.engine.inspect import inspect_parquet
 from aimart_parquet.engine.isolate import run_isolated
 from aimart_parquet.engine.limits import Limits
@@ -63,6 +64,7 @@ from aimart_parquet.sources import (
     downloads_deadline,
     fetch_url,
     safe_filename,
+    url_filename,
     validate_url,
 )
 
@@ -337,6 +339,29 @@ class Service:
             # _materialize decodes it.
             return check_base64(src.content_base64, max_bytes=self.settings.max_input_bytes)
         return None
+
+    def check_convert(self, src: SourceRef, options: ConvertOptions) -> None:
+        """``check_input`` for convert, then ``check_options`` for the format its input names."""
+        self.check_input(src)
+        name = src.filename  # the name _materialize gives the engine, where it has one
+        if name is None and src.url is not None:
+            name = url_filename(src.url)
+        if name is None and src.path is not None:
+            name = Path(src.path).name
+        self.check_options(options, name)
+
+    @staticmethod
+    def check_options(options: ConvertOptions, filename: str | None) -> None:
+        """An option value the reader of the request's format can never use, as it refuses it.
+
+        The format is the one the request names: ``options.format``, else the extension of the
+        caller's filename (of a url's path when there is none). Bytes win over names in
+        ``detect``, so a mislabelled file may still read otherwise; with neither, the format is
+        not known before the file is, and the reader refuses the value, unpaid.
+        """
+        refusal = options.refusal(options.format or format_from_name(filename))
+        if refusal is not None:
+            raise refusal
 
     def _takes(self, src: SourceRef) -> tuple[str, ...]:
         """The inputs a refusal's hint may name: what the calling route or tool accepts."""

@@ -176,6 +176,14 @@ def _filename_from(url: str, disposition: str | None) -> str | None:
     return safe_filename(name) if name else None
 
 
+def url_filename(url: str) -> str | None:
+    """The file name a URL's path ends in, as a download without a Content-Disposition gets."""
+    try:
+        return _filename_from(url, None)
+    except ValueError:  # urlsplit: a malformed bracketed host, refused by validate_url
+        return None
+
+
 def safe_filename(name: str) -> str:
     """Keep only the final path component, in a conservative alphabet."""
     base = PurePosixPath(name.replace("\\", "/")).name
@@ -349,8 +357,8 @@ def _redirect_target(current: str, location: bytes) -> str:
     """Where a Location header points, as ASCII: raw non-ASCII bytes (servers send UTF-8 there)
     are percent-encoded byte for byte, so the next request names exactly what the server sent.
     So are spaces and control characters, which h11 refuses in the next request's target."""
-    escaped = _UNTARGETABLE_BYTE.sub(lambda m: b"%%%02X" % m[0][0], location.strip())
-    escaped = escaped.decode("ascii")
+    raw = _UNTARGETABLE_BYTE.sub(lambda m: b"%%%02X" % m[0][0], location.strip())
+    escaped = raw.decode("ascii")
     try:
         return urljoin(current, escaped)
     except ValueError as exc:  # a malformed bracketed host, as in validate_url

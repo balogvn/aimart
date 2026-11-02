@@ -109,7 +109,9 @@ def read_statistical(
 ) -> RawTable:
     reader = _READERS[fmt]
     kwargs: dict[str, Any] = {"output_format": "dict"}
-    if options.encoding and fmt is not InputFormat.XPT:
+    # pyreadstat's read_por takes no encoding: any options.encoding with a .por file was a
+    # TypeError, the typed 500 after the payment was verified.
+    if options.encoding and fmt not in {InputFormat.XPT, InputFormat.POR}:
         kwargs["encoding"] = options.encoding
     chunks: dict[str, list[pa.Array]] = {}
     meta: Any = None
