@@ -272,7 +272,7 @@ MCP error result; the full list is in the
 | preview and query results | 500 preview rows, 1,000 query rows, cells cut to 2,000 characters, 64 MB in all | `AIMART_MAX_PREVIEW_ROWS`, `AIMART_MAX_QUERY_ROWS`, `AIMART_MAX_CELL_CHARS` | more rows: `truncated: true`; over 64 MB: 413 |
 | time | 120 s to convert, 15 s to inspect, preview or query | `AIMART_CONVERT_TIMEOUT_S`, `AIMART_QUERY_TIMEOUT_S` | 504 `timeout` |
 | downloads | 60 s of downloading for all of a call's `url` inputs together | `AIMART_FETCH_TIMEOUT_S` | 422 `fetch_failed` |
-| concurrency | 2 jobs; a call waits up to 10 s for a free one, with up to 4 calls per job waiting | `AIMART_MAX_CONCURRENT_JOBS`, `AIMART_QUEUE_WAIT_S` | 503 `busy` |
+| concurrency | 2 jobs; a call waits for a free one as long as its payment window leaves it (60 s to convert, 165 s to inspect or preview, 160 s to query), with up to 4 calls per job waiting | `AIMART_MAX_CONCURRENT_JOBS`, `AIMART_QUEUE_WAIT_S` | 503 `busy` |
 
 **CSV memory no longer grows with the file.** The text is staged as compressed Parquet instead
 of loaded into a table, so a conversion's process stays at about 150-330 MiB whatever the

@@ -226,7 +226,7 @@ async def test_the_queue_is_not_download_time_and_the_allowance_ends_with_the_ca
     monkeypatch.setattr("aimart_parquet.service.fetch_url", fake_fetch)
 
     async def hold_the_slot(waited: anyio.Event) -> None:
-        async with service._job():
+        async with service._job(1):
             waited.set()
             await anyio.sleep(1.0)
 

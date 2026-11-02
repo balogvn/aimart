@@ -33,7 +33,7 @@ from x402.schemas import ResourceInfo
 from x402.schemas.config import ResourceConfig
 
 from aimart_parquet.artifacts import discard_withheld, outputs_of
-from aimart_parquet.config import NetworkMode, Settings
+from aimart_parquet.config import PAYMENT_WINDOW_S, SETTLE_MARGIN_S, NetworkMode, Settings
 from aimart_parquet.payments.bazaar import EXAMPLES
 from aimart_parquet.payments.mcp_gate import X402McpGate, payments_unavailable
 from aimart_parquet.payments.pricing import Operation, active_operations, usd_to_atomic
@@ -70,13 +70,6 @@ PAYMENT_HEADERS = ("payment-signature", "x-payment")
 
 SERVICE_NAME = "AImart Parquet"  # <= 32 ASCII chars, or facilitator catalogs drop it
 TAGS = ["data", "parquet", "etl", "csv", "mcp"]  # <= 5 tags
-
-# How long a caller's signed authorization stays valid (``maxTimeoutSeconds``; EIP-3009
-# validBefore). Waiting for a job slot, downloading the input and running the job all happen
-# inside it, and settlement after them: past it, the work is done and cannot be paid for.
-PAYMENT_WINDOW_S = 300
-# Kept free in the window for the upload, verify and settle around the work.
-SETTLE_MARGIN_S = 60
 
 
 def carries_payment(request: Request) -> bool:
@@ -127,7 +120,9 @@ class Payments:
         after the authorization expired: unsettleable, so served for free. ``fetch_timeout_s``
         counts once because it bounds all of a call's downloads together
         (``sources.downloads_deadline``, opened by ``Service._job``): a query over `data` and 7
-        URL tables used to get one each, 480 s at the defaults.
+        URL tables used to get one each, 480 s at the defaults. Unset, the queue wait is what
+        the window leaves each operation (``Settings.queue_wait_for``), so only the job
+        timeouts and the download allowance can fail this; set, it must fit the longest job.
         """
         s = self.settings
         longest = max(
@@ -135,7 +130,7 @@ class Payments:
             s.query_timeout_s + 5,  # Service.query's outer deadline
             s.quantum_timeout_s if s.enable_quantum else 0.0,
         )
-        needed = s.queue_wait_s + s.fetch_timeout_s + longest
+        needed = s.queue_wait_for(longest) + s.fetch_timeout_s + longest
         if needed + SETTLE_MARGIN_S > PAYMENT_WINDOW_S:
             msg = (
                 f"queue_wait_s + fetch_timeout_s + the longest operation timeout is {needed:g} s; "

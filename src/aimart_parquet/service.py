@@ -235,14 +235,15 @@ class Service:
         return Path(tempfile.mkdtemp(dir=self._workroot))
 
     @contextlib.asynccontextmanager
-    async def _job(self) -> AsyncIterator[None]:
+    async def _job(self, work_s: float) -> AsyncIterator[None]:
         """Hold one job slot for a whole operation: fetching inputs, the engine, the output.
 
         Taken before any input is materialized. The slot used to be taken only around the
         engine call, so a query naming 8 URLs downloaded up to 400 MB onto the RAM disk and
         only then learned the server was busy. The stored artifacts the operation reads stay on
         disk until it ends (``store.hold``): on GCS, fetching a query's second table evicted
-        the cached copy of its first, and the join failed on a missing file.
+        the cached copy of its first, and the join failed on a missing file. ``work_s`` is the
+        timeout the operation's engine call gets, which decides how long it may queue.
         """
         busy = Busy(
             "The server is at capacity.", hint="Retry in a few seconds; you were not charged."
@@ -253,22 +254,25 @@ class Service:
             and stats.tasks_waiting >= _QUEUE_FACTOR * stats.total_tokens
         ):
             raise busy
-        # A paid call's signed authorization expires (payments.PAYMENT_WINDOW_S): waiting for a
+        # A paid call's signed authorization expires (config.PAYMENT_WINDOW_S): waiting for a
         # slot as long as the calls ahead took (up to 4 x 180 s) ran work that could no longer
-        # settle. queue_wait_s bounds the wait; a free slot is taken even when it is 0.
+        # settle. The wait is bounded by what the window leaves this operation, not a fixed
+        # 10 s: that turned away, after verifying its payment, a convert queued 14 s behind a
+        # slow download that would have settled well inside the window. A free slot is taken
+        # even when the bound is 0.
         acquired = False
         try:
             self._limiter.acquire_nowait()
             acquired = True
         except anyio.WouldBlock:
-            with anyio.move_on_after(self.settings.queue_wait_s):
+            with anyio.move_on_after(self.settings.queue_wait_for(work_s)):
                 await self._limiter.acquire()
                 acquired = True
         if not acquired:
             raise busy
         try:
             # One download allowance for all of the call's URL inputs, as the payment-window
-            # check at startup counts queue_wait_s, then one fetch_timeout_s, per call. Only
+            # check at startup counts the queue wait, then one fetch_timeout_s, per call. Only
             # time spent downloading draws on it (not the sweep, nor stored artifacts fetched).
             with self.store.hold(), downloads_deadline(self.settings.fetch_timeout_s):
                 yield
@@ -284,7 +288,7 @@ class Service:
         job_dirs: tuple[Path, ...] = (),
         **kwargs: Any,
     ) -> T:
-        """Run one engine call. Callers hold the job slot (``async with self._job()``).
+        """Run one engine call. Callers hold the job slot (``async with self._job(timeout_s)``).
 
         ``job_dirs`` are the call's work directories: the isolated job's memory cap counts the
         bytes in them, because on Cloud Run they are RAM too. A 1.5 MB gzip CSV decompressed to
@@ -462,7 +466,7 @@ class Service:
     async def convert(
         self, src: SourceRef, options: ConvertOptions, *, output_path: str | None = None
     ) -> ConvertResult:
-        async with self._job():
+        async with self._job(self.settings.convert_timeout_s):
             return await self._convert(src, options, output_path)
 
     async def convert_upload(
@@ -476,7 +480,7 @@ class Service:
         The route used to copy all 50 MB onto the RAM-backed artifact disk first and only then
         ask for a slot, so a busy server still took the copy before answering "busy".
         """
-        async with self._job():
+        async with self._job(self.settings.convert_timeout_s):
             workdir = self._workdir()
             try:
                 dest = workdir / "upload"
@@ -634,7 +638,7 @@ class Service:
     # Thrift plus a loop over every row group). They ran in-process, so a 258-byte dictionary
     # bomb took /v1/preview's server past 2 GB with limit=1: they run in the child like query.
     async def inspect(self, src: SourceRef) -> InspectResult:
-        async with self._job():
+        async with self._job(self.settings.query_timeout_s):
             workdir = self._workdir()
             try:
                 path = await self._parquet_path(src, workdir, self._budget())
@@ -658,7 +662,7 @@ class Service:
         fmt: OutputFormat,
     ) -> TabularResult:
         limit = max(0, min(limit, self.settings.max_preview_rows))
-        async with self._job():
+        async with self._job(self.settings.query_timeout_s):
             workdir = self._workdir()
             try:
                 path = await self._parquet_path(src, workdir, self._budget())
@@ -682,7 +686,7 @@ class Service:
     ) -> TabularResult:
         self.check_tables(tables)
         limit = max(1, min(limit, self.settings.max_query_rows))
-        async with self._job():
+        async with self._job(self.settings.query_timeout_s + 5):
             workdir = self._workdir()
             try:
                 budget = self._budget()
@@ -730,7 +734,7 @@ class Service:
         self, src: SourceRef, options: QuantumCompressOptions, *, output_path: str | None = None
     ) -> QuantumCompressResult:
         self._require_quantum()
-        async with self._job():
+        async with self._job(self.settings.quantum_timeout_s):
             return await self._quantum_compress(src, options, output_path)
 
     async def _quantum_compress(
@@ -769,7 +773,7 @@ class Service:
         from aimart_parquet.quantum.models import SIMULATOR_NOTE, PortfolioResult
         from aimart_parquet.quantum.portfolio import optimize
 
-        async with self._job():
+        async with self._job(self.settings.quantum_timeout_s):
             workdir = self._workdir()
             try:
                 path, _ = await self._materialize(src, workdir, self._budget())

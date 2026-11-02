@@ -21,6 +21,13 @@ _EVM_ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _SOLANA_ADDRESS = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 _PRICE = re.compile(r"^\$\d+(\.\d{1,6})?$")
 
+# How long a caller's signed authorization stays valid (``maxTimeoutSeconds``; EIP-3009
+# validBefore). Waiting for a job slot, downloading the input and running the job all happen
+# inside it, and settlement after them: past it, the work is done and cannot be paid for.
+PAYMENT_WINDOW_S = 300
+# Kept free in the window for the upload, verify and settle around the work.
+SETTLE_MARGIN_S = 60
+
 
 class NetworkMode(StrEnum):
     TESTNET = "testnet"
@@ -125,7 +132,18 @@ class Settings(BaseSettings):
             "(the parent polls the child's RSS and files)."
         ),
     )
-    queue_wait_s: float = 10.0
+    queue_wait_s: float | None = Field(
+        default=None,
+        description=(
+            "Seconds a call waits for a job slot before it is answered 503 busy, unpaid. Unset: "
+            "what the payment window leaves the call's operation, the 300 s an authorization is "
+            "valid for minus 60 s to verify and settle, fetch_timeout_s and the operation's own "
+            "timeout: 60 s to convert, 165 s to inspect or preview and 160 s to query at the "
+            "defaults (queue_wait_for). A fixed 10 s turned a paid convert queued 14 s behind a "
+            "slow download into a 503 after its payment was verified, though it would have run "
+            "and settled well inside the window."
+        ),
+    )
     duckdb_memory_limit: str = "1GB"
     duckdb_threads: int = 2
     rate_limit_per_minute: int = 120
@@ -190,6 +208,18 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------- ops
     log_level: str = "INFO"
     log_json: bool = True
+
+    def queue_wait_for(self, work_s: float) -> float:
+        """How long a call whose job may run ``work_s`` seconds waits for a job slot.
+
+        The wait, all of the call's downloads (one ``fetch_timeout_s``) and the job happen
+        inside the caller's payment authorization, with ``SETTLE_MARGIN_S`` left to settle:
+        a call that waited longer would run work that can no longer be paid for. 0 means a
+        free slot only; ``Payments`` refuses to start when even that does not fit.
+        """
+        if self.queue_wait_s is not None:
+            return self.queue_wait_s
+        return max(0.0, PAYMENT_WINDOW_S - SETTLE_MARGIN_S - self.fetch_timeout_s - work_s)
 
     @model_validator(mode="after")
     def _validate(self) -> Self:

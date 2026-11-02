@@ -274,9 +274,18 @@ async def test_the_guide_quotes_the_upload_form_refusal(paid_app: kit.AppHarness
 def test_the_docs_state_the_limits_the_code_applies() -> None:
     for text in (GUIDE, README):
         assert f"SQL of up to {PRECHECK_SQL_CHARS} characters" in text
-    wait = f"{Settings().queue_wait_s:g} s"
-    assert f"for the {wait} a call waits for one" in GUIDE
-    assert f"a call waits up to {wait} for a free one" in README
+    # This compared both texts with a fixed queue_wait_s (10 s). The wait is now what the
+    # payment window leaves each operation (Settings.queue_wait_for), so each is compared.
+    s = Settings()
+    waits = (
+        f"{s.queue_wait_for(s.convert_timeout_s):g} s to convert, "
+        f"{s.queue_wait_for(s.query_timeout_s):g} s to inspect or preview, "
+        f"{s.queue_wait_for(s.query_timeout_s + 5):g} s to query"
+    )
+    assert f"as long as a call waits for one (what its payment window leaves it: {waits})" in GUIDE
+    assert (
+        f"a call waits for a free one as long as its payment window leaves it ({waits})" in README
+    )
     assert f"{sys.get_int_max_str_digits()} digits" in GUIDE
     assert f"the request body may be {JSON_BODY_LIMIT // 2**20} MB" in GUIDE
     longest = ConvertOptions.model_json_schema()["properties"]["encoding"]["anyOf"][0]["maxLength"]

@@ -247,10 +247,10 @@ async def test_a_failed_call_gives_its_job_slot_back(
         await service.query({"data": SourceRef(url=url)}, "SELECT 1", limit=1, fmt="json")
     finish = threading.Event()
     with pytest.raises(Timeout):
-        async with service._job():
+        async with service._job(0.05):
             await service._execute(finish.wait, 5, timeout_s=0.05, isolate=False)
     with anyio.fail_after(2):
-        async with service._job():
+        async with service._job(1):
             assert await service._execute(lambda: 7, timeout_s=1, isolate=False) == 7
     finish.set()
     assert service._limiter.statistics().borrowed_tokens == 0

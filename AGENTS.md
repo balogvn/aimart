@@ -112,8 +112,10 @@ Module docstrings explain the why; read the one you are about to change.
   (`MIN_RESIDENCY_S` is gone). On GCS eviction drops only the cache.
 - `service.py`: `Service`, the **one** implementation of every operation, used by REST and MCP.
   `_job()` holds a job slot and `store.hold()` from before any input is fetched; all URL and
-  base64 inputs of a call share one `max_input_bytes` budget; a queued call gives up after
-  `queue_wait_s`; `convert_upload` copies an upload into the convert's own work directory, inside
+  base64 inputs of a call share one `max_input_bytes` budget; a queued call gives up when
+  its payment window would not fit the wait (`Settings.queue_wait_for`: the 300 s window minus
+  60 s to settle, `fetch_timeout_s` and the operation's timeout; or `queue_wait_s` when set);
+  `convert_upload` copies an upload into the convert's own work directory, inside
   the slot (an empty one is refused); `_execute` runs every engine call (inspect and preview
   too) in the child, its work directory counted toward the cap. `query` takes a map of table
   names (`data` + up to 7 joined artifacts) for one query price. Before the quote:
