@@ -114,7 +114,7 @@ def unwrap(
         src = local
     kind = safety.sniff_compression(safety.read_magic(src, 8))
     if kind in {"gzip", "bz2"}:
-        dst = workdir / "decompressed"
+        dst = workdir / safety.DECOMPRESSED
         safety.decompress_stream(src, dst, kind, limits.max_decompressed_bytes)
         name = filename
         if name:

@@ -280,7 +280,11 @@ file's size (it took about 3.5 times the file, and CSVs over about 120 MB were r
 job's files still grow with it, and they count toward the 700 MB a job may use because `/tmp`
 is RAM on Cloud Run: the decompressed text, its staged copy and the output, up to about 1.6
 times the CSV. Measured with the defaults, the input caps bind first: a 255 MiB CSV sent as 39 MB
-of gzip converted at 481 MiB in all. With the input caps raised, a 200 MB CSV converts (430
+of gzip converted at 481 MiB in all. A CSV that is not UTF-8 also holds its UTF-8 copy while it
+is transcoded (the decompressed text is deleted once the copy is written), about twice its text
+in files at that moment: 230 MiB of orders in cp1252, sent as 45 MB of gzip, converted at 659
+MiB (501 MiB of files at the peak), close to the cap, where the same data in UTF-8 took 475 MiB.
+With the input caps raised, a 200 MB CSV converts (430
 MiB), a 40-column 135 MiB one too (535 MiB), and a 450 MB one is stopped at the job cap (153 MiB
 in memory plus 547 MiB of files). `sort_by` sorts the whole file and spills to disk past 400 MiB;
 the spill counts too, and DuckDB may spill only the 300 MiB the cap leaves it: a 100 MB CSV

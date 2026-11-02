@@ -68,24 +68,24 @@ Module docstrings explain the why; read the one you are about to change.
   built from a library's exception text.
 - `engine/`: the pure conversion engine. `detect.py` (magic bytes over extensions; a `%PDF-`
   header anywhere in the first 1 KB), `safety.py` (gzip/zip bomb caps), `text.py` (UTF-8
-  transcoding), `duck.py` (sandboxed DuckDB; `NOWHERE` for every `$HOME`-derived setting),
-  `readers/` (delimited, jsonish, excel, statistical, columnar, pdf; the `READERS` map is in
-  `convert.py`), `infer.py` (type ladder in SQL; the number convention is decided per column,
-  then by the file's other number columns when they agree, then by the dialect; text with a zone only ever
-  becomes TIMESTAMPTZ; constant lists go through `_one_of`, never `IN`), `names.py`,
-  `convert.py` (pipeline, `expected_schema`, report; CSV/TSV jobs run DuckDB on one thread),
-  `writer.py` (DuckDB `COPY` by default, pyarrow when labels exist), `inspect.py` (footer-only
-  stats), `tabular.py` (preview and SELECT-only query: inputs are views over DuckDB's own
-  Parquet reader (`_native_view`), long cells are cut inside DuckDB, rows are built by
-  position, results over `MAX_RESULT_BYTES` are refused), `isolate.py` (forkserver child per
-  job: deadline, a watchdog on RSS plus the job's temporary files (its temp directory and the
-  `job_dirs` the service passes) for `job_memory_limit_mb`, a per-job temp directory the
-  parent deletes; a crash is logged by type and frames, never its text), `limits.py` (per-job
-  limits; under the watchdog DuckDB's memory limit is the cap minus 300 MB and its spill cap
-  the rest of the cap, `within_job_cap`), `models.py` (the pydantic contract agents read).
-  Delimited text is staged once as zstd Parquet and `raw` is a view over it. DuckDB running out
-  of memory is a 413 (`read_csv` in `delimited.py`; any other step in `convert_file`), never a
-  500 that says retry.
+  transcoding; a decompressed stream is deleted once its UTF-8 copy is written), `duck.py`
+  (sandboxed DuckDB; `NOWHERE` for every `$HOME`-derived setting), `readers/` (delimited, jsonish,
+  excel, statistical, columnar, pdf; the `READERS` map is in `convert.py`), `infer.py` (type
+  ladder in SQL; the number convention is decided per column, then by the file's other number
+  columns when they agree, then by the dialect; text with a zone only ever becomes TIMESTAMPTZ;
+  constant lists go through `_one_of`, never `IN`), `names.py`, `convert.py` (pipeline,
+  `expected_schema`, report; CSV/TSV jobs run DuckDB on one thread), `writer.py` (DuckDB `COPY` by
+  default, pyarrow when labels exist), `inspect.py` (footer-only stats), `tabular.py` (preview and
+  SELECT-only query: inputs are views over DuckDB's own Parquet reader (`_native_view`), long
+  cells are cut inside DuckDB, rows are built by position, results over `MAX_RESULT_BYTES` are
+  refused), `isolate.py` (forkserver child per job: deadline, a watchdog on RSS plus the job's
+  temporary files (its temp directory and the `job_dirs` the service passes) for
+  `job_memory_limit_mb`, a per-job temp directory the parent deletes; a crash is logged by type
+  and frames, never its text), `limits.py` (per-job limits; under the watchdog DuckDB's memory
+  limit is the cap minus 300 MB and its spill cap the rest of the cap, `within_job_cap`),
+  `models.py` (the pydantic contract agents read). Delimited text is staged once as zstd Parquet
+  and `raw` is a view over it. DuckDB running out of memory is a 413 (`read_csv` in
+  `delimited.py`; any other step in `convert_file`), never a 500 that says retry.
 - `quantum/`: premium tools (`kernel_pca.py`, `portfolio.py`, `data.py`, `models.py`). Served only
   when the `quantum` extra is installed AND `AIMART_ENABLE_QUANTUM=true` (off by default; a buyer
   panel valued them at $0). `pricing.active_operations(settings)` decides. Spec:
@@ -374,14 +374,17 @@ each test's docstring has the incident.
   delete their outputs (invariant 8). (`unit/test_fix_money_artifacts.py`,
   `{unit,integration}/test_fix_money_capacity.py`, `integration/test_fix_money_withheld.py`)
 - **Quoting what cannot succeed** (invariant 7), and **capacity spent before the job slot** (the
-  slot is taken before any download or upload copy; one input budget per call). Refused before
-  the quote: undecodable or empty `content_base64`, inline bytes that cannot be Parquet sent to
+  slot is taken before any download or upload copy; one input budget per call). Refused before the
+  quote: undecodable or empty `content_base64`, inline bytes that cannot be Parquet sent to
   inspect, preview or query, URLs that can never be fetched, short SQL that is not one SELECT,
-  forms past Starlette's limits or with an empty file part, MCP arguments a tool does not
-  declare (but `filename`), an option value the named format's reader can never use. (`integration/test_fix_money_gate.py`, `integration/test_fix_money_upload_check.py`,
+  forms past Starlette's limits or with an empty file part, MCP arguments a tool does not declare
+  (but `filename`), an option value the named format's reader can never use.
+  (`integration/test_fix_money_gate.py`, `integration/test_fix_money_upload_check.py`,
   `unit/test_fix_money_form_peek.py`, `unit/test_fix_money_service.py`,
   `integration/test_final_validate_*.py`, `integration/test_final_integrate_empty_upload.py`,
-  `integration/test_final_integrate_mcp_unknown_args.py`)
+  `integration/test_final_integrate_mcp_unknown_args.py`,
+  `integration/test_final_integrate_option_formats.py`,
+  `integration/test_final_integrate_url_spaces.py`)
 - **Host paths readable from SQL** through DuckDB settings. (`unit/test_fix_money_duck.py`)
 - **Numbers in the wrong convention** ('1.5' as 15 in an EU column, '1.234' as 1.234 in a
   semicolon file). Casts are gated on the style's own pattern (`_style_fit`; never `TRY_CAST` an
@@ -456,18 +459,21 @@ each test's docstring has the incident.
   kept out of responses. (`integration/test_isolate.py`) The cap counts the job's temporary
   files: a 1.5 MB gzip CSV wrote 500 MB into the work directory while RSS alone stayed under it.
   (`integration/test_final_isolate_disk.py`, `integration/test_final_integrate_stream_cap.py`)
+  A non-UTF-8 text's decompressed copy is deleted once its UTF-8 copy is written
+  (`unit/test_final_integrate_transcode_files.py`).
 
 Known gaps: ISO date formats accept 1-digit years ('1/2/3' becomes 0001-02-03); JSON timestamps
-that all carry offsets become naive UTC with no note. In PDFs, a different table after a
-table's last row on a continuation page is appended to it (strict xfail
+that all carry offsets become naive UTC with no note. In PDFs, a different table after a table's
+last row on a continuation page is appended to it (strict xfail
 `unit/test_final_data_pdf_next_page.py::test_a_different_table_after_the_last_row_is_not_appended`:
 its only sign, a row naming every typed column, is also what a first suppressed row such as
 'Area5', 'x', 'x' looks like), and a short one-cell title above a numeric header printed atop
-every page is taken as the header, the numeric header then a data row on each page (123 rows
-for 120; at 07fa450 too). A page whose table text alignment cannot read (its first column
-wraps, as long survey statements do) is not converted, and no warning names it (07fa450 too). (The 422 for a time past 9999 in preview and query and the 413 for
-`read_csv` running out of memory are tested in `integration/test_final_isolate_gaps.py`;
-DuckDB's `memory_limit` no longer sits above the job cap, `unit/test_fix_csv_memory.py`.)
+every page is taken as the header, the numeric header then a data row on each page (123 rows for
+120; at 07fa450 too). A page whose table text alignment cannot read (its first column wraps, as
+long survey statements do) is not converted, and no warning names it (07fa450 too). (The 422 for a
+time past 9999 in preview and query and the 413 for `read_csv` running out of memory are tested in
+`integration/test_final_isolate_gaps.py`; DuckDB's `memory_limit` no longer sits above the job
+cap, `unit/test_fix_csv_memory.py`.)
 
 ## Agent tooling
 

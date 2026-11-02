@@ -118,6 +118,18 @@ def data_members(infos: list[zipfile.ZipInfo]) -> list[zipfile.ZipInfo]:
     ]
 
 
+# What ``convert.unwrap`` writes into a job's work directory: a decompressed gzip/bz2 stream
+# and a zip's one member. The readers read them once; ``text.to_utf8`` deletes one once its
+# UTF-8 copy is written, as nothing reads it again (``unwrapped``).
+DECOMPRESSED = "decompressed"
+UNZIPPED = "unzipped"
+
+
+def unwrapped(path: Path, workdir: Path) -> bool:
+    """Is ``path`` a file ``convert.unwrap`` made in ``workdir``, never the caller's input?"""
+    return path.parent == workdir and path.name.startswith((DECOMPRESSED, UNZIPPED))
+
+
 def extract_single_member(path: Path, dst_dir: Path, cap: int) -> tuple[Path, str]:
     """Extract the only data file in a zip. Returns (extracted path, member name)."""
     members = data_members(check_zip(path, cap))
@@ -131,7 +143,7 @@ def extract_single_member(path: Path, dst_dir: Path, cap: int) -> tuple[Path, st
     member = members[0]
     name = Path(member.filename).name
     # Never trust the member path: write to a fixed name inside our own temp directory.
-    dst = dst_dir / ("unzipped" + "".join(Path(name).suffixes[-2:]))
+    dst = dst_dir / (UNZIPPED + "".join(Path(name).suffixes[-2:]))
     with zipfile.ZipFile(path) as zf, zf.open(member) as src, dst.open("wb") as out:
         copy_capped(src, out, cap)
     return dst, name

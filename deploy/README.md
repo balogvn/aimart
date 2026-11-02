@@ -352,7 +352,7 @@ polls every 0.1 s, so a job allocating fast passes the cap by what it gains in o
 | a job, process and files together | ≤ 700 MB (`AIMART_JOB_MEMORY_LIMIT_MB`) |
 | a job's process | a CSV conversion measured 150-330 MiB whatever the file size; with `sort_by`, up to ~550 MiB |
 | DuckDB inside a job | limit = the job cap minus 300 MB (400 MiB), so sorts spill instead of being killed; spill cap = the rest of the job cap (300 MiB), so DuckDB's memory and its spill together never pass the cap |
-| a job's files in `/tmp` | the upload (≤ 50 MB) + the decompressed text (≤ 256 MB, `AIMART_MAX_DECOMPRESSED_BYTES`) + a second, UTF-8 copy when the input was not UTF-8 + the staged text (18-31% of the CSV) + the output (20-33%) + spill (`sort_by` only, ≤ 300 MiB) |
+| a job's files in `/tmp` | the upload (≤ 50 MB) + the decompressed text (≤ 256 MB, `AIMART_MAX_DECOMPRESSED_BYTES`) + a second, UTF-8 copy when the input was not UTF-8 (the decompressed text is deleted once it is written) + the staged text (18-31% of the CSV) + the output (20-33%) + spill (`sort_by` only, ≤ 300 MiB) |
 | stored artifacts without a bucket | ≤ `AIMART_ARTIFACT_MAX_TOTAL_BYTES` (256 MiB) |
 
 Measured at 0348e94 in the isolated child with the defaults (macOS on Apple silicon; Linux,
@@ -380,7 +380,11 @@ What that means for the default deploy (1 vCPU, 2 GiB, `AIMART_MAX_CONCURRENT_JO
 
 - **The input caps bind first.** A CSV reaches the engine only if it is under 50 MB on the wire
   and 256 MB decompressed, and every such file measured converted: the 255 MiB one, which
-  compressed 7:1, used 481 MiB of the 700. The 6-column test CSV compressed 3.3:1, so as gzip
+  compressed 7:1, used 481 MiB of the 700. Text that is not UTF-8 needs more, as its
+  decompressed text and its UTF-8 copy are both on disk while it is transcoded: 230 MiB of
+  cp1252 CSV sent as 45 MB of gzip peaked at 659 MiB (501 MiB of files; its UTF-8 twin 475) and
+  converted, close to the cap. Until the decompressed text was deleted once its copy was
+  written, it stayed through the read and the same file was a 413 at 508 MiB of files. The 6-column test CSV compressed 3.3:1, so as gzip
   it is refused at the 50 MB cap from about 165 MB (the gzip of its 191 MiB, 61 MB, was).
 - **A job's files, not its process, decide what converts:** about 1.0-1.6 times the CSV (the
   input, its staged copy and the output). With the input caps raised, by those ratios (not

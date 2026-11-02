@@ -78,8 +78,10 @@ flowchart LR
    never pass the cap. A CSV conversion's process stays at about 150-330 MiB whatever the
    file's size; its files (the decompressed text, its staged copy, the output) grow with it, up
    to about 1.6 times the CSV. Measured with the defaults, the input caps bind before the job
-   cap: a 255 MiB CSV sent as 39 MB of gzip peaked at 481 MiB in all; with the caps raised, a
-   450 MB CSV reached the job cap (a 413). A convert's input is on that disk once: an upload
+   cap: a 255 MiB CSV sent as 39 MB of gzip peaked at 481 MiB in all; text that is not UTF-8
+   also holds its UTF-8 copy while it is transcoded (`text.to_utf8` then deletes the
+   decompressed text), so 230 MiB of cp1252 CSV sent as 45 MB of gzip peaked at 659 MiB; with
+   the caps raised, a 450 MB CSV reached the job cap (a 413). A convert's input is on that disk once: an upload
    is written into the work directory, and a stored artifact is hard-linked there, not copied.
    A gzip/bz2/zip stream also stops as it inflates past `max_decompressed_bytes` (256 MB), and
    a workbook's XML parts, every sheet counted though one is parsed, have their own

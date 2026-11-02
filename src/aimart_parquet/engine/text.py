@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from charset_normalizer import from_bytes
 
+from aimart_parquet.engine.safety import unwrapped
 from aimart_parquet.errors import InvalidInput, InvalidRequest
 
 if TYPE_CHECKING:
@@ -169,7 +170,14 @@ def _undecodable(encoding: str, exc: UnicodeError) -> InvalidInput:
 
 
 def to_utf8(path: Path, workdir: Path, forced_encoding: str | None = None) -> TextInfo:
-    """Return a UTF-8 version of ``path`` (the same path when it already is UTF-8)."""
+    """Return a UTF-8 version of ``path`` (the same path when it already is UTF-8).
+
+    A decompressed stream or zip member (``safety.unwrapped``) is deleted once its UTF-8 copy
+    is written: the job's files count toward its memory cap (on Cloud Run /tmp is RAM), and a
+    cp1252 CSV of 230 MiB sent as 44 MiB of gzip held its upload, the decompressed text and
+    the copy at once, 508 MB of files, and was stopped at the 700 MB cap (413) where its
+    UTF-8 twin converted.
+    """
     if forced_encoding:
         # Refused before the quote only when the request names a text format (a file with no
         # name or format may not be text), so a request can reach here with one.
@@ -185,4 +193,6 @@ def to_utf8(path: Path, workdir: Path, forced_encoding: str | None = None) -> Te
         encoding = _detect(path)
     dst = workdir / "utf8.txt"
     replaced = _transcode(path, dst, encoding)
+    if unwrapped(path, workdir):
+        path.unlink()
     return TextInfo(dst, codecs.lookup(encoding).name, replaced)
