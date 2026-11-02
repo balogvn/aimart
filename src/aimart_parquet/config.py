@@ -75,9 +75,10 @@ class Settings(BaseSettings):
             "input_too_large, unpaid (a zip from its directory, before anything is inflated, a "
             "gzip/bz2 stream as soon as the next byte would pass it). The decompressed file is "
             "written to the work directory, RAM on Cloud Run, and counts toward "
-            "job_memory_limit_mb; about 120-150 MB of decompressed CSV already reaches that "
-            "cap, so a stream is stopped here before it fills the instance. Workbooks have "
-            "their own cap, max_workbook_xml_bytes."
+            "job_memory_limit_mb with the CSV's staged copy and output, so a stream is stopped "
+            "here before it fills the instance: measured, a 255 MiB CSV sent as 39 MB of gzip "
+            "converted at 481 MiB of the 700 MB cap. Workbooks have their own cap, "
+            "max_workbook_xml_bytes."
         ),
     )
     max_workbook_xml_bytes: int = Field(
@@ -116,9 +117,12 @@ class Settings(BaseSettings):
             "and a 1.5 MB gzip CSV wrote 500 MB of temporary files. On Linux it includes the "
             "~160 MB of preloaded engine each child shares with the forkserver. Inside a job "
             "DuckDB is held at this minus 300 MB and its spill files at the rest, so the two "
-            "together stay under it. Ordinary inputs peak at 250-500 MB; a CSV conversion's "
-            "process at 210-370 MB whatever the file's size, plus its files. 0 disables it. "
-            "Needs isolate_jobs (the parent polls the child's RSS and files)."
+            "together stay under it. Ordinary inputs peak at 250-500 MB. A CSV conversion's "
+            "process stays at 150-330 MiB whatever the file's size (it was about 3.5 times the "
+            "file) and its files are 1.0-1.6 times the CSV: measured in the child, 191 MiB of "
+            "CSV converted at 430 MiB in all and 429 MiB reached the cap; with sort_by, 95 MiB "
+            "converted at 461 MiB and 191 MiB reached it. 0 disables it. Needs isolate_jobs "
+            "(the parent polls the child's RSS and files)."
         ),
     )
     queue_wait_s: float = 10.0

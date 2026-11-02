@@ -59,6 +59,9 @@ def within_job_cap(memory_limit: str, job_memory_limit_mb: int) -> tuple[str, st
     with its memory full and that memory is resident; DuckDB stopping itself is a 413 that
     names sort_by (``convert_file``), where the watchdog, polling every 0.1 s, can let a spill
     run hundreds of MB past the cap first. The 2 GB spill cap used before sat outside the cap.
+    In the isolated child at the defaults (0348e94), sort_by on 95 MiB of CSV converted at
+    329 MiB resident plus 132 MiB of files; on 191 MiB the watchdog stopped it at 539 + 257
+    MiB, its input and staged copy among the files. Either way a 413, never a 500.
     """
     budget = max(_MIN_DUCKDB_MB, job_memory_limit_mb - JOB_OVERHEAD_MB)
     configured = size_bytes(memory_limit)

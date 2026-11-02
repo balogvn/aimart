@@ -69,17 +69,17 @@ forkserver and two jobs, one such job took down every in-flight request. So:
 Consequences of the cap:
 
 - Good: one hostile input costs one failed, unpaid call, not the instance.
-- Bad: **large legitimate inputs are refused too.** CSV conversion peaks at about 3.5 times the
-  decompressed CSV size in resident memory alone (measured at e8d228e: a 200 MB CSV peaked at
-  about 706 MB resident, a 450 MB one at about 1.4 GB), and since the final review the
-  decompressed file counts too (next amendment): CSVs above roughly 120-150 MB decompressed are
-  refused with 413 (unpaid) on the default 2 GiB instance. Files with many short cells per row
-  peak higher: in one measurement a 141 MB CSV of 40 short columns peaked near 970 MB
-  in-process. Measure on Linux before raising the cap, `max_concurrent_jobs` or the instance
-  size.
+- Bad: **large legitimate inputs are refused too.** At e8d228e CSV conversion peaked at about
+  3.5 times the decompressed CSV size in resident memory alone (a 200 MB CSV at about 706 MB
+  resident, a 450 MB one at about 1.4 GB; a 141 MB CSV of 40 short columns near 970 MB
+  in-process), and once the decompressed file counted too (next amendment) CSVs above roughly
+  120-150 MB decompressed were refused with 413 (unpaid) on the default 2 GiB instance. CSV
+  memory is now flat and the input caps bind first (the last amendment has the numbers).
+  Measure on Linux before raising the cap, `max_concurrent_jobs` or the instance size.
 - Bad: a job allocating as fast as it can gains a few hundred MB between two polls; the default
-  leaves that headroom. DuckDB's own `memory_limit` (1 GB by default) is above the cap, so the
-  watchdog can stop a job before DuckDB would spill to disk.
+  leaves that headroom. DuckDB's own `memory_limit` (1 GB by default) was above the cap, so the
+  watchdog could stop a job before DuckDB would spill to disk; it is now held under the cap
+  (last amendment).
 - Tests of the cap must keep touching their allocation: on a loaded Mac, the pages of a child
   that allocated and stopped were paged out before the parent's poll saw them.
 
@@ -129,6 +129,39 @@ OOM-kill the instance and every other caller's request, and both ended in 413, u
 - **A crash's log carries no exception text.** The published retention policy says logs never
   hold file contents, and since e8d228e the child's unexpected exception was logged in full,
   which can quote a column name or a cell. The log now has its type and traceback frames only.
+
+**Amendment: CSV memory is flat, and DuckDB is held under the cap (perf/csv-memory, merged at
+integrate/final).** Profiling showed that all of a CSV's memory was DuckDB's: the text loaded
+into an uncompressed VARCHAR table, 256 MB of read buffers, batches a two-thread ordered COPY
+held back, and a hash join for each `IN` list of null tokens. Delimited text is now staged once
+as zstd Parquet, with `raw` a view over it, read through one line cap of buffers, on one DuckDB
+thread, with `list_contains` for constant lists. `Limits.from_settings` holds DuckDB's
+`memory_limit` at the cap minus 300 MB (400 MiB under 700) and its spill cap at the rest of the
+cap (300 MiB): spill files are in the directories the watchdog counts, so DuckDB's memory and
+its spill together never pass the cap (`within_job_cap`). Past either, DuckDB stops itself,
+which is a 413 whose hint names `sort_by` when it was passed, or the watchdog stops the job,
+also a 413: never a 500. Measured at 0348e94 in the isolated child with the defaults (macOS on
+Apple silicon; peaks of the watchdog's own readings, process and files, in MiB):
+
+| CSV (decompressed) | result | process | files | in all |
+|---|---|---|---|---|
+| 255 MiB, sent as 39 MB of gzip (the input caps as they are) | converted | 179 | 301 | 481 |
+| 48 MiB, 6 columns, 1.0 M rows | converted | 155 | 66 | 222 |
+| 191 MiB, 6 columns, 3.9 M rows | converted | 160 | 269 | 430 |
+| 135 MiB, 40 random columns, 1.3 M rows | converted | 324 | 211 | 535 |
+| 134 MiB, 40 short columns, 1.3 M rows | converted | 320 | 136 | 457 |
+| 429 MiB, 6 columns, 8.7 M rows | 413 at the cap | 153 | 547 | 700 |
+| 95 MiB with `sort_by` | converted | 329 | 132 | 461 |
+| 191 MiB with `sort_by` | 413 at the cap | 539 | 257 | 797 |
+
+All but the first ran with `max_input_bytes` and `max_decompressed_bytes` raised so the file
+reached the engine; with the defaults a CSV over 50 MB on the wire, or over 256 MB
+decompressed, is refused before. Without the cap the 429 MiB CSV peaked at 161 + 622 MiB and
+the sorted 191 MiB one at 546 + 430 MiB. A job's files, not its process, now decide what
+converts: about 1.0-1.6 times the CSV (the input, its staged copy and the output). Also at
+0348e94: 24 wide CSVs of 100-200 rows and 30-101 columns (dates, timestamps, offsets, zone
+names, EU decimals, 12-hour times; the review's repro) each converted with a 200 through REST,
+and a 226,303-row CSV, two row groups, read back with its ids 1..N in order.
 
 ### Consequences
 

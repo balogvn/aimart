@@ -275,14 +275,19 @@ MCP error result; the full list is in the
 | concurrency | 2 jobs; a call waits up to 10 s for a free one, with up to 4 calls per job waiting | `AIMART_MAX_CONCURRENT_JOBS`, `AIMART_QUEUE_WAIT_S` | 503 `busy` |
 
 **CSV memory no longer grows with the file.** The text is staged as compressed Parquet instead
-of loaded into a table, so a conversion's process stays at about 210-370 MB whatever the file's
-size (measured in process; a 446 MiB CSV took 1.2 GB, and CSVs over about 120 MB were refused).
-The job's files still grow with it, and they count toward the 700 MB a job may use because
-`/tmp` is RAM on Cloud Run: the decompressed text, its staged copy and the output. `sort_by`
-sorts the whole file and spills to disk past 400 MiB; the spill counts too, and DuckDB may
-spill only the 300 MiB the cap leaves it. Over the cap the call fails with 413, unpaid: split
-such files, or convert them with the free local server and `AIMART_JOB_MEMORY_LIMIT_MB` raised
-to suit your machine (the local server applies the same 700 MB cap by default).
+of loaded into a table, so a conversion's process stays at about 150-330 MiB whatever the
+file's size (it took about 3.5 times the file, and CSVs over about 120 MB were refused). The
+job's files still grow with it, and they count toward the 700 MB a job may use because `/tmp`
+is RAM on Cloud Run: the decompressed text, its staged copy and the output, up to about 1.6
+times the CSV. Measured with the defaults, the input caps bind first: a 255 MiB CSV sent as 39 MB
+of gzip converted at 481 MiB in all. With the input caps raised, a 200 MB CSV converts (430
+MiB), a 40-column 135 MiB one too (535 MiB), and a 450 MB one is stopped at the job cap (153 MiB
+in memory plus 547 MiB of files). `sort_by` sorts the whole file and spills to disk past 400 MiB;
+the spill counts too, and DuckDB may spill only the 300 MiB the cap leaves it: a 100 MB CSV
+sorts (461 MiB), a 200 MB one is refused. Over the cap the call fails with 413, unpaid: split
+such files, or convert them with the free local server, which applies the same defaults, with
+`AIMART_MAX_INPUT_BYTES`, `AIMART_MAX_DECOMPRESSED_BYTES` and `AIMART_JOB_MEMORY_LIMIT_MB`
+raised to suit your machine.
 [deploy/README.md](deploy/README.md#memory-capacity-what-one-2-gib-instance-converts) has the
 numbers.
 

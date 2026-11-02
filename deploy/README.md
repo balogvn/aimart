@@ -29,9 +29,9 @@ Each job is a child process that the parent kills once its resident memory plus 
 files pass `AIMART_JOB_MEMORY_LIMIT_MB` (700 by default; `0` disables the cap), and the call
 fails with 413 `input_too_large`, unpaid ([ADR 0005](../docs/adr/0005-job-isolation-forkserver.md)).
 The files count because `/tmp` is RAM here: a 1.5 MB gzip CSV once decompressed to 500 MB there
-while the job's resident memory alone stayed under the cap. The cost of that cap: CSV conversion
-peaks at about 3.5 times the decompressed CSV size in memory, plus the decompressed file, so CSVs
-above roughly 120-150 MB decompressed are refused on this instance. A gzip/bz2/zip stream is
+while the job's resident memory alone stayed under the cap. A CSV conversion's process stays at
+about 150-330 MiB whatever the file's size, and its files grow with it (see "Memory capacity"
+below), so with the defaults the input caps bind before the job cap. A gzip/bz2/zip stream is
 also stopped as it inflates past `AIMART_MAX_DECOMPRESSED_BYTES` (256 MB), before it fills
 `/tmp`; a workbook's XML parts are capped apart, by `AIMART_MAX_WORKBOOK_XML_BYTES` (512 MB),
 because every sheet is counted though only one is parsed. Raising the cap without more
@@ -350,35 +350,49 @@ polls every 0.1 s, so a job allocating fast passes the cap by what it gains in o
 |---|---|
 | API process, forkserver | ~250 MB each |
 | a job, process and files together | ≤ 700 MB (`AIMART_JOB_MEMORY_LIMIT_MB`) |
-| a job's process | a CSV conversion measured 210-370 MB whatever the file size; with `sort_by`, ~520 MB |
+| a job's process | a CSV conversion measured 150-330 MiB whatever the file size; with `sort_by`, up to ~550 MiB |
 | DuckDB inside a job | limit = the job cap minus 300 MB (400 MiB), so sorts spill instead of being killed; spill cap = the rest of the job cap (300 MiB), so DuckDB's memory and its spill together never pass the cap |
 | a job's files in `/tmp` | the upload (≤ 50 MB) + the decompressed text (≤ 256 MB, `AIMART_MAX_DECOMPRESSED_BYTES`) + a second, UTF-8 copy when the input was not UTF-8 + the staged text (18-31% of the CSV) + the output (20-33%) + spill (`sort_by` only, ≤ 300 MiB) |
 | stored artifacts without a bucket | ≤ `AIMART_ARTIFACT_MAX_TOTAL_BYTES` (256 MiB) |
 
-Measured in-process on macOS (Linux, where production runs, was not measured; files not
-counted), `main` at e8d228e against the staged reader, peak resident memory:
+Measured at 0348e94 in the isolated child with the defaults (macOS on Apple silicon; Linux,
+where production runs, was not measured): the watchdog's own peak readings, in MiB. All but the
+first ran with `AIMART_MAX_INPUT_BYTES` and `AIMART_MAX_DECOMPRESSED_BYTES` raised so the file
+reached the engine.
 
-| CSV (decompressed) | before | now | CPU seconds, before → now |
-|---|---|---|---|
-| 198 MiB, 11 mixed columns | 622-815 MiB | 215 MiB | 23.7 → 17.0 |
-| 446 MiB, 11 mixed columns | 1.17-1.19 GiB | 206-219 MiB | 53.0 → 39.3 |
-| 135 MiB, 40 short columns | 901-963 MiB | 353-368 MiB | 53.6 → 7.0 |
-| 446 MiB with `sort_by` | 1.16 GiB | 518 MiB (+ 418 MiB spill) | |
+| CSV (decompressed) | result | process | files | in all | seconds |
+|---|---|---|---|---|---|
+| 255 MiB, sent as 39 MB of gzip (the input caps as they are) | converted | 179 | 301 | 481 | 15.3 |
+| 48 MiB, 6 columns | converted | 155 | 66 | 222 | 5.1 |
+| 191 MiB, 6 columns | converted | 160 | 269 | 430 | 16.6 |
+| 135 MiB, 40 random columns | converted | 324 | 211 | 535 | 7.2 |
+| 134 MiB, 40 short columns | converted | 320 | 136 | 457 | 6.8 |
+| 429 MiB, 6 columns | 413 at the cap | 153 | 547 | 700 | 31.5 |
+| 95 MiB with `sort_by` | converted | 329 | 132 | 461 | 9.3 |
+| 191 MiB with `sort_by` | 413 at the cap | 539 | 257 | 797 | 16.8 |
 
-What that means for the default deploy (1 vCPU, 2 GiB, `AIMART_MAX_CONCURRENT_JOBS=2`); these
-are sums of the numbers above, not measurements of a live instance:
+Before the staged reader (`main` at e8d228e, in process, files not counted), the 191 MiB CSV
+peaked at 622-815 MiB resident, a 446 MiB one at 1.17-1.19 GiB and the 40-column one at
+901-963 MiB. Without the cap the 429 MiB CSV needs 161 MiB of process and 622 MiB of files, and
+the sorted 191 MiB one 546 + 430 MiB.
 
-- **The 50 MB upload cap binds first.** A file reaches the 256 MB stream cap only if it
-  compresses about 5:1; the test files above compressed 2-2.5:1.
-- **A job's files, not its process, decide what converts.** Near the 256 MB stream cap a CSV
-  holds about 210-370 MB of process plus 350-400 MB of files: at the edge of the 700 MB cap for
-  the widest files, refused (413, unpaid) past it, never an instance out of memory.
+What that means for the default deploy (1 vCPU, 2 GiB, `AIMART_MAX_CONCURRENT_JOBS=2`):
+
+- **The input caps bind first.** A CSV reaches the engine only if it is under 50 MB on the wire
+  and 256 MB decompressed, and every such file measured converted: the 255 MiB one, which
+  compressed 7:1, used 481 MiB of the 700. The 6-column test CSV compressed 3.3:1, so as gzip
+  it is refused at the 50 MB cap from about 165 MB (the gzip of its 191 MiB, 61 MB, was).
+- **A job's files, not its process, decide what converts:** about 1.0-1.6 times the CSV (the
+  input, its staged copy and the output). With the input caps raised, by those ratios (not
+  measured at the edge) about 380 MiB of the 6-column CSV, or 240 MiB of the 40-column one,
+  reaches the 700 MB cap; past it the call is a 413, unpaid, never an instance out of memory.
+- **`sort_by` is the worst case:** DuckDB fills its 400 MiB before it spills, so a sort holds
+  ~550 MiB of process; about 100 MB of CSV sorts, 200 MB is refused (413).
 - **Two jobs at the cap** hold 1.4 GB next to ~500 MB for the API and the forkserver. Stored
   artifacts in `/tmp` come on top, so without a bucket the instance can still run out.
-- **`sort_by` is the worst case:** DuckDB fills its 400 MiB before it spills, so a sort of a
-  large CSV reaches the cap with its input, staged text and spill, and is refused (413).
-- **Time is the next limit.** 39 CPU-seconds for 446 MiB on an Apple M-series core; Cloud Run's
-  vCPU was not measured, and conversions stop at `AIMART_CONVERT_TIMEOUT_S` (120 s, unpaid).
+- **Time is the next limit.** 16.6 s of wall time for 191 MiB on an Apple M-series core; Cloud
+  Run's vCPU was not measured, and conversions stop at `AIMART_CONVERT_TIMEOUT_S` (120 s,
+  unpaid).
 
 To convert bigger files concurrently, set `AIMART_MAX_CONCURRENT_JOBS=1` or give the service
 more memory, and set `AIMART_GCS_BUCKET` so stored artifacts leave the RAM disk.

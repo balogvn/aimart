@@ -140,10 +140,18 @@ def test_readme_and_security_describe_the_cap_as_memory_plus_files() -> None:
     # merge). What still grows with a CSV is its files, and the docs say so.
     for doc in (README, GUIDE):
         assert "roughly over 120 MB" not in doc
-        assert "3.5 times" not in doc
+        assert "takes about 3.5 times" not in doc
     assert "**CSV memory no longer grows with the file.**" in README
     assert "The job's files still grow with it, and they count toward the" in README
     assert "A CSV conversion's memory does not grow with the file, but its files do" in GUIDE
+    stated = [text(rel) for rel in ("docs/architecture.md", "deploy/README.md")] + [
+        str(Settings.model_fields[name].description)
+        for name in ("job_memory_limit_mb", "max_decompressed_bytes")
+    ]
+    for doc in stated:
+        assert "120-150 MB" not in doc
+        assert "3.5 times the decompressed" not in doc
+        assert "3.5 times its decompressed" not in doc
     security = text("SECURITY.md")
     assert "resident memory plus its temporary files" in security
     assert "logged by its type and traceback frames, never its text" in security

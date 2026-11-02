@@ -73,14 +73,17 @@ flowchart LR
    job's own temporary directory either way. A crash becomes `InvalidInput`; any other
    unexpected exception is reported by its type only, and logged by its type and traceback
    frames, never its text. All of these are unpaid. The cap is an RSS-plus-files watchdog, not
-   `RLIMIT_AS`: a Linux child starts at about 2 GB of virtual memory. Its cost: a CSV converts
-   at about 3.5 times its decompressed size in memory, plus the decompressed file itself, so on
-   the default 2 GiB instance CSVs above roughly 120-150 MB decompressed are refused. A
-   convert's input is on that disk once: an upload is written into the work directory, and a
-   stored artifact is hard-linked there, not copied. A gzip/bz2/zip stream also stops as it
-   inflates past `max_decompressed_bytes` (256 MB), and a workbook's XML parts, every sheet
-   counted though one is parsed, have their own `max_workbook_xml_bytes` (512 MB). See
-   [ADR 0005](adr/0005-job-isolation-forkserver.md).
+   `RLIMIT_AS`: a Linux child starts at about 2 GB of virtual memory. Inside it DuckDB is held
+   at the cap minus 300 MB (400 MiB) and may spill only the rest (300 MiB), so the two together
+   never pass the cap. A CSV conversion's process stays at about 150-330 MiB whatever the
+   file's size; its files (the decompressed text, its staged copy, the output) grow with it, up
+   to about 1.6 times the CSV. Measured with the defaults, the input caps bind before the job
+   cap: a 255 MiB CSV sent as 39 MB of gzip peaked at 481 MiB in all; with the caps raised, a
+   450 MB CSV reached the job cap (a 413). A convert's input is on that disk once: an upload
+   is written into the work directory, and a stored artifact is hard-linked there, not copied.
+   A gzip/bz2/zip stream also stops as it inflates past `max_decompressed_bytes` (256 MB), and
+   a workbook's XML parts, every sheet counted though one is parsed, have their own
+   `max_workbook_xml_bytes` (512 MB). See [ADR 0005](adr/0005-job-isolation-forkserver.md).
 5. **Engine** (`engine/`). Detection by magic bytes (`detect.py`) is followed by bomb-safe
    decompression (`safety.py`) and UTF-8 transcoding (`text.py`). A reader (`readers/`)
    produces a raw table in a locked-down DuckDB connection (`duck.py`); for delimited text

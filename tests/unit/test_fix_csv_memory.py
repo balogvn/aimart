@@ -4,7 +4,8 @@ Measured on e8d228e: a 200 MB CSV peaked at ~700 MB resident and a 450 MB one at
 of it DuckDB (Arrow and Python held almost nothing): the text loaded into an uncompressed
 VARCHAR table, 256 MB of CSV buffers, batches a 2-thread ordered COPY held back, and one hash
 join per null-token IN list. Each test here pins one of them. Fixed, the 450 MB file peaks at
-~350 MB, about the same as a 20 MB one.
+~350 MB in process, about the same as a 20 MB one; in the isolated child at 0348e94, 161 MiB
+resident (its files, 622 MiB, are what reach the job cap now).
 """
 
 from __future__ import annotations

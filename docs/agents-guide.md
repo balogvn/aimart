@@ -260,9 +260,11 @@ The `input_too_large` messages, and what to change (numbers are the defaults):
   `details.temp_file_bytes`: each job's memory is capped, and its temporary files count (on the
   hosted instance they are in RAM). A CSV conversion's memory does not grow with the file, but
   its files do: the decompressed text (a compressed file counts at its decompressed size), a
-  compressed copy of it and the output. `sort_by` sorts the whole file, and what DuckDB spills
-  to disk counts too. Split such files, or drop `sort_by`. For a PDF, read fewer pages with
-  `pdf_pages`; for a query, return less.
+  compressed copy of it and the output. With the defaults the input limits above bind first:
+  measured, a CSV of 255 MiB decompressed converted at 481 MiB of the 700. `sort_by` sorts the
+  whole file, and what DuckDB spills to disk counts too: sorting 100 MB of CSV peaked at
+  461 MiB, and 200 MB passed the budget. Split such files, or drop `sort_by`. For a PDF, read
+  fewer pages with `pdf_pages`; for a query, return less.
 - "The file needs more memory to read than this server allows." (a delimited file) or "The PDF
   needs more memory than this server allows.": send a smaller file, or fewer pages.
 - "The file needs more memory to convert than this server allows.": reading, typing every
