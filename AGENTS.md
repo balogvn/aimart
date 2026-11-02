@@ -71,7 +71,7 @@ Module docstrings explain the why; read the one you are about to change.
   transcoding), `duck.py` (sandboxed DuckDB; `NOWHERE` for every `$HOME`-derived setting),
   `readers/` (delimited, jsonish, excel, statistical, columnar, pdf; the `READERS` map is in
   `convert.py`), `infer.py` (type ladder in SQL; the number convention is decided per column,
-  then by the file's other number columns, then by the dialect; text with a zone only ever
+  then by the file's other number columns when they agree, then by the dialect; text with a zone only ever
   becomes TIMESTAMPTZ; constant lists go through `_one_of`, never `IN`), `names.py`,
   `convert.py` (pipeline, `expected_schema`, report; CSV/TSV jobs run DuckDB on one thread),
   `writer.py` (DuckDB `COPY` by default, pyarrow when labels exist), `inspect.py` (footer-only
@@ -388,8 +388,11 @@ each test's docstring has the incident.
   unmatched value: DuckDB reads '1_000' as 1000), the convention is decided per column
   (`TypeInferrer._text_style`), then by the file's other number columns
   (`TypeInferrer._decimal_comma`: '398.53' in a semicolon file is a decimal point, not 398,530),
-  then by the dialect, and every ambiguous choice adds a note. (`unit/test_fix_infer_numbers.py`,
-  `unit/test_roundtrip_property.py`, `unit/test_final_data_decimals.py`)
+  only when they agree: GPS columns ('54.565860') beside '1.093.086,46' make a mixed file, and
+  times of day ('10.15') are no evidence. Then by the dialect, and every ambiguous choice adds a
+  note. (`unit/test_fix_infer_numbers.py`,
+  `unit/test_roundtrip_property.py`, `unit/test_final_data_decimals.py`,
+  `unit/test_final_integrate_decimal_vote.py`)
 - **Offsets dropped, zones carried over.** DuckDB's TIMESTAMP cast drops offsets; its
   TIMESTAMPTZ cast carries a zone name ('09:00 EST') to later naive values in the same 2048-row
   vector. Zoned text is read only as TIMESTAMPTZ, in CASE branches no naive row takes
