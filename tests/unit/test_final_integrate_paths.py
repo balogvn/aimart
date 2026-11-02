@@ -3,9 +3,9 @@
 Incident (final-isolate review, defence in depth): convert answered pyarrow's "Could not open
 Parquet input source '/tmp/aimart-artifacts/.work/tmpX/inline'" with the server's work layout
 (test_final_isolate_paths.py), and the readers of compressed streams, zip archives, workbooks,
-SPSS/Stata/SAS files, nested JSON and URL downloads still put the library's text in their
-messages as it came. None was seen to leak a path, but each library names files in some of its
-errors. Each is forced here to name one.
+SPSS/Stata/SAS files, nested JSON, delimited text and URL downloads still put the library's text
+in their messages as it came. Each library names files in some of its errors; each is made to
+name one here (delimited text for real: a failed write of its staged copy did leak the path).
 """
 
 from __future__ import annotations
@@ -21,7 +21,10 @@ from python_calamine import CalamineError
 import aimart_testkit as kit
 from aimart_parquet import sources
 from aimart_parquet.engine import safety
-from aimart_parquet.engine.readers import excel, jsonish, statistical
+from aimart_parquet.engine.duck import connect
+from aimart_parquet.engine.limits import Limits
+from aimart_parquet.engine.models import ConvertOptions, InputFormat
+from aimart_parquet.engine.readers import delimited, excel, jsonish, statistical
 from aimart_parquet.errors import AimartError, FetchFailed, InvalidInput
 
 if TYPE_CHECKING:
@@ -115,3 +118,20 @@ async def test_a_download_that_fails_in_the_network_stack(
             "https://example.com/a.csv", tmp_path / "d", max_bytes=10**6, deadline_s=5
         )
     _assert_clean(info.value, "Could not download the URL: ")
+
+
+def test_delimited_text_duckdb_cannot_stage(tmp_path: Path) -> None:
+    # Not forced through a mock: DuckDB names the file it failed on in the first line of its
+    # error, which the message kept as it came. Since perf/csv-memory the text is also written
+    # (staged as Parquet in the work directory), and a write that fails, on a full RAM disk for
+    # one, names the server's work layout: 'IO Error: Cannot open file "/srv/.../raw_text...'.
+    work = tmp_path / "work"
+    (work / delimited._STAGE_FILE).mkdir(parents=True)
+    src = kit.write(work / "x.csv", "a,b\n1,2\n")
+    con = connect(memory_limit="64MB", threads=1, allowed_dirs=[work])
+    with pytest.raises(InvalidInput) as info:
+        delimited.read_delimited(con, src, work, ConvertOptions(), InputFormat.CSV, Limits())
+    message = info.value.message
+    assert message.startswith("Could not parse the file as delimited text: IO Error: "), message
+    assert str(tmp_path.name) not in message
+    assert '"<file>"' in message

@@ -25,7 +25,7 @@ from aimart_parquet.engine.duck import ident, literal
 from aimart_parquet.engine.models import InputFormat
 from aimart_parquet.engine.readers import RAW_TABLE, RawColumn, RawTable
 from aimart_parquet.engine.text import to_utf8
-from aimart_parquet.errors import InputTooLarge, InvalidInput
+from aimart_parquet.errors import InputTooLarge, InvalidInput, without_paths
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -211,8 +211,10 @@ def read_delimited(
             hint="Send a smaller file, or split it into parts; you were not charged.",
         ) from exc
     except Exception as exc:  # duckdb raises several unrelated exception types here
+        # DuckDB names the file it failed on, the input or the staged copy it writes:
+        # 'IO Error: Cannot open file "/tmp/aimart-artifacts/.work/<call>/raw_text.parquet"'.
         raise InvalidInput(
-            f"Could not parse the file as delimited text: {str(exc).splitlines()[0]}",
+            f"Could not parse the file as delimited text: {without_paths(exc)}",
             hint="Check options.delimiter, options.encoding and options.header.",
         ) from exc
     con.execute(
