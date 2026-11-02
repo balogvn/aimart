@@ -49,8 +49,13 @@ _IPV4_COMPATIBLE = ipaddress.ip_network("::/96")  # deprecated ::a.b.c.d form; i
 # SMTP, Redis or SSH on public addresses.
 ALLOWED_PORTS = frozenset({80, 443, 8080, 8443})
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
-_ASCII = "".join(map(chr, range(128)))  # quote(..., safe=_ASCII) escapes only non-ASCII
-_NON_ASCII_BYTE = re.compile(rb"[\x80-\xff]")
+# What h11 lets into a request target: visible ASCII, 0x21-0x7E. quote(..., safe=_TARGET)
+# escapes everything else (spaces, controls, DEL, non-ASCII as UTF-8) and keeps '%' escapes.
+_TARGET = "".join(map(chr, range(0x21, 0x7F)))
+_UNTARGETABLE = re.compile(r"[^\x21-\x7e]")
+_UNTARGETABLE_BYTE = re.compile(rb"[^\x21-\x7e]")
+_SPACE_OR_CONTROL = re.compile(r"[\x00-\x20\x7f]")
+_C0_OR_SPACE = "".join(map(chr, range(0x21)))  # stripped from both ends, as WHATWG does
 _URLSAFE_TO_STANDARD = bytes.maketrans(b"-_", b"+/")
 
 
@@ -188,9 +193,14 @@ def validate_url(url: str, *, allow_private: bool = False) -> str:
     Runs before a price is quoted, and again for every redirect hop. ``urlsplit`` raises
     ValueError on a malformed bracketed host ('http://[::1/a.csv', 'http://[zz]/') and httpcore
     TypeError on any non-ASCII character: both escaped as bare 500s after the payment was
-    verified. A non-ASCII path or query is percent-encoded as UTF-8, as a browser does. An IP
-    literal that is not public is refused here; a hostname is checked when it is resolved.
+    verified. A path, query or fragment is percent-encoded as a browser does: non-ASCII as
+    UTF-8, and spaces and control characters too, which h11 refuses in a request target
+    ("Illegal target characters", a 422 after the verify for 'http://host/my file.csv' or a
+    trailing space). Leading and trailing spaces and controls are stripped first. A host with a
+    space or control character can never resolve, so it is refused. An IP literal that is not
+    public is refused here; a hostname is checked when it is resolved.
     """
+    url = url.strip(_C0_OR_SPACE)
     try:
         parts = urlsplit(url)
     except ValueError as exc:
@@ -213,6 +223,10 @@ def validate_url(url: str, *, allow_private: bool = False) -> str:
         raise UrlNotAllowed(
             "The URL's host is not ASCII.", hint="Use the host's ASCII (xn--) form."
         )
+    if _SPACE_OR_CONTROL.search(parts.netloc):
+        raise UrlNotAllowed(
+            "The URL's host contains a space or a control character.", hint="Check the URL."
+        )
     try:
         ip = ipaddress.ip_address(host.split("%", 1)[0])
     except ValueError:
@@ -222,14 +236,14 @@ def validate_url(url: str, *, allow_private: bool = False) -> str:
             f"Host {host!r} resolves to a non-public address.",
             hint="Only publicly reachable http(s) URLs can be fetched.",
         )
-    if url.isascii():
+    if not _UNTARGETABLE.search(url):
         return url
     try:
         return urlunsplit(
             parts._replace(
-                path=quote(parts.path, safe=_ASCII),
-                query=quote(parts.query, safe=_ASCII),
-                fragment=quote(parts.fragment, safe=_ASCII),
+                path=quote(parts.path, safe=_TARGET),
+                query=quote(parts.query, safe=_TARGET),
+                fragment=quote(parts.fragment, safe=_TARGET),
             )
         )
     except UnicodeError as exc:  # a lone surrogate has no UTF-8 form
@@ -333,8 +347,10 @@ async def fetch_url(
 
 def _redirect_target(current: str, location: bytes) -> str:
     """Where a Location header points, as ASCII: raw non-ASCII bytes (servers send UTF-8 there)
-    are percent-encoded byte for byte, so the next request names exactly what the server sent."""
-    escaped = _NON_ASCII_BYTE.sub(lambda m: b"%%%02X" % m[0][0], location).decode("ascii")
+    are percent-encoded byte for byte, so the next request names exactly what the server sent.
+    So are spaces and control characters, which h11 refuses in the next request's target."""
+    escaped = _UNTARGETABLE_BYTE.sub(lambda m: b"%%%02X" % m[0][0], location.strip())
+    escaped = escaped.decode("ascii")
     try:
         return urljoin(current, escaped)
     except ValueError as exc:  # a malformed bracketed host, as in validate_url

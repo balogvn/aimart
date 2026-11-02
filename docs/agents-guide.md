@@ -217,9 +217,12 @@ decided from the request alone:
   file." (query). Convert the file first and pass its `artifact_id`.
 - A URL the server can never fetch: 422 `url_not_allowed`, with "Only http and https URLs are
   supported.", "The URL is malformed.", "The URL has no host.", "Port 22 is not allowed." (ports
-  80, 443, 8080 and 8443 are), "The URL's host is not ASCII." (use its `xn--` form), or, for an
-  IP address that is not public, "Host '127.0.0.1' resolves to a non-public address.". A host
-  name is resolved and checked when it is fetched, after the quote.
+  80, 443, 8080 and 8443 are), "The URL's host is not ASCII." (use its `xn--` form), "The
+  URL's host contains a space or a control character.", or, for an IP address that is not
+  public, "Host '127.0.0.1' resolves to a non-public address.". A host name is resolved and
+  checked when it is fetched, after the quote. Spaces around a URL are dropped, and spaces and
+  non-ASCII characters in its path or query are percent-encoded as a browser sends them
+  (`my file.csv` is fetched as `my%20file.csv`).
 - SQL of up to 256 characters that is not one read-only SELECT: 400 `query_rejected`, such as
   "Only read-only SELECT queries are allowed; got DROP.", "Send exactly one statement; got 2."
   or "SQL syntax error: ...". Longer SQL is checked where the query runs: a paid call is

@@ -105,6 +105,13 @@ MESSAGES: list[tuple[str, dict[str, Any], int, str, str]] = [
     ),
     (
         "/v1/convert",
+        {"url": "https://data.ex ample.com/a.csv"},
+        422,
+        "url_not_allowed",
+        "The URL's host contains a space or a control character.",
+    ),
+    (
+        "/v1/convert",
         {"url": "http://127.0.0.1/a.csv"},
         422,
         "url_not_allowed",

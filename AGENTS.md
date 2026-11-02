@@ -95,7 +95,8 @@ Module docstrings explain the why; read the one you are about to change.
   `demand_signal`; `GET /v1/demand` behind `AIMART_ADMIN_TOKEN`. This decides the roadmap.
 - `provenance.py`: ML-DSA-65 manifests and signatures for every hosted artifact.
 - `sources.py`: SSRF-safe URL fetch (validated IPs at connect time, re-checked redirects, port
-  allow-list, size cap; `downloads_deadline`, opened by `Service._job`, gives all of a call's
+  allow-list, size cap; spaces, controls and non-ASCII in a path, query or Location
+  percent-encoded, since h11 takes only 0x21-0x7E in a request target; `downloads_deadline`, opened by `Service._job`, gives all of a call's
   URL downloads one `fetch_timeout_s`), `check_base64` (exact: the standard or URL-safe alphabet,
   whitespace ignored, padding completed, a `data:` URL only with `;base64`, every other
   character, or an empty file, refused before the quote), `safe_filename`.
