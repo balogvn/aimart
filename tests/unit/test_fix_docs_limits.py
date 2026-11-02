@@ -66,7 +66,13 @@ def test_readme_limits_table_shows_the_defaults(make_settings: Callable[..., Set
         assert envs, default
         for env in envs:
             field = env.removeprefix("AIMART_").lower()
-            shown = _shown(field, getattr(settings, field))
+            if field == "queue_wait_s":
+                # A fixed 10 s before; unset, it is what the payment window leaves each
+                # operation (Settings.queue_wait_for), and the row shows the convert's wait.
+                assert settings.queue_wait_s is None
+                shown = (f"{settings.queue_wait_for(settings.convert_timeout_s):g} s to convert",)
+            else:
+                shown = _shown(field, getattr(settings, field))
             assert any(form in default for form in shown), (env, default)
 
 
