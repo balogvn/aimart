@@ -400,7 +400,8 @@ def check_base64(data: str, *, max_bytes: int) -> bytes:
     group shifted; when a multiple of 4 were dropped there was no error at all, and a 5-row CSV
     was converted, and charged for, as 1 row of garbage. Accepted besides strict base64 is only
     what has one reading: either alphabet (they differ in '-_' versus '+/' alone), missing '='
-    padding, ASCII whitespace (line-wrapped MIME base64) and a ``data:<type>;base64,`` prefix.
+    padding, ASCII whitespace (line-wrapped MIME base64) and a ``data:<type>;base64,`` prefix
+    (with ``base64`` among its parameters, spaced and cased as the sender likes).
     """
     # base64 inflates by 4/3 (line breaks a little more): refuse before copying the text.
     if len(data) > 2 * (max_bytes * 4 // 3 + 4):
@@ -408,7 +409,10 @@ def check_base64(data: str, *, max_bytes: int) -> bytes:
     payload = data
     if data[:5].lower() == "data:":  # ':' is in neither alphabet: base64 never starts so
         header, comma, payload = data[5:].partition(",")
-        if not comma or not header.lower().endswith(";base64"):
+        # Any parameter that says base64, however spaced or placed: 'text/csv; base64' and
+        # ';base64;charset=utf-8' decoded at 07fa450, and a header that had to end exactly in
+        # ';base64' refused them, lost sales. ('base64' is no media type, so it counts first.)
+        if not comma or "base64" not in {p.strip().lower() for p in header.split(";")}:
             # "data:text/csv," + encodeURIComponent(csv) is percent-encoded text: decoded as
             # base64 it was refused, or, sometimes, silently turned into other bytes.
             raise InvalidRequest(

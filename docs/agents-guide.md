@@ -207,8 +207,8 @@ decided from the request alone:
   input) and "Table 't': provide exactly one input; got 0 (none).".
 - `content_base64` that holds no file: 400 `invalid_request`, "content_base64 is not valid
   base64." (a character outside the base64 alphabets, or a length no padding completes),
-  "content_base64 is a data: URL that is not base64-encoded." (a `data:` URL without
-  `;base64`) or "content_base64 is empty.". Too large to send inline it is 413
+  "content_base64 is a data: URL that is not base64-encoded." (a `data:` URL without a
+  `base64` parameter, such as `data:text/csv,` with percent-encoded text) or "content_base64 is empty.". Too large to send inline it is 413
   `input_too_large` (the request body may be 16 MB): pass a `url` instead. An upload whose
   `file` part is empty is refused the same way: 400 `invalid_request`, "The uploaded file is
   empty.".

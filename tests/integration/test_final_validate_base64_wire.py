@@ -67,6 +67,35 @@ async def test_mcp_converts_url_safe_base64_to_the_rows_sent(
     assert len(facilitator.settled) == 1
 
 
+# data: URLs that name base64, spelled other than RFC 2397's exact ';base64,'. 07fa450 decoded
+# each to the right bytes; refused as "not base64-encoded" when only a header ending in
+# ';base64' counted, they were lost sales.
+DATA_URLS = [
+    "data:text/csv; base64,",
+    "data:text/csv;base64;charset=utf-8,",
+    "data:text/csv;base64 ,",
+    "data:text/csv ; Base64 ,",
+]
+
+
+@pytest.mark.parametrize("prefix", DATA_URLS)
+async def test_a_data_url_that_names_base64_converts_to_the_rows_sent(
+    prefix: str, paid_app: kit.AppHarness, facilitator: kit.FakeFacilitator
+) -> None:
+    body = {"content_base64": prefix + base64.b64encode(CSV).decode(), "filename": "sales.csv"}
+    r = await paid_app.paying.post("/v1/convert", json=body)
+    assert r.status_code == 200, r.text
+    assert await _downloaded(paid_app, r.json()["artifact"]) == EXPECTED
+    assert len(facilitator.settled) == 1
+    async with kit.mcp_over_http(paid_app.app) as client:
+        quote = await client.call_tool("convert_to_parquet", body)
+        meta = await kit.mcp_payment_meta(kit.paying_client(), quote.structured_content)
+        result = await client.call_tool("convert_to_parquet", body, meta=meta)
+    assert not result.is_error, result.content
+    assert await _downloaded(paid_app, result.structured_content["artifact"]) == EXPECTED
+    assert len(facilitator.settled) == 2
+
+
 # A stray character anywhere, and the percent-encoded data: URL JavaScript builds with
 # encodeURIComponent: each used to be dropped or misread, and sometimes converted and charged.
 STRAY = [
@@ -77,6 +106,16 @@ STRAY = [
     ),
     (
         "data:text/csv;charset=utf-8,id%2Clabel%0A1%2Cx%0A",
+        "content_base64 is a data: URL that is not base64-encoded.",
+    ),
+    # No base64 parameter at all, as RFC 2397 reads it: percent-encoded text.
+    ("data:," + URLSAFE, "content_base64 is a data: URL that is not base64-encoded."),
+    (
+        "data:text/csv;charset=utf-8," + URLSAFE,
+        "content_base64 is a data: URL that is not base64-encoded.",
+    ),
+    (
+        "data:text/csv;base64x," + URLSAFE,
         "content_base64 is a data: URL that is not base64-encoded.",
     ),
 ]

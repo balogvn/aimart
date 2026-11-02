@@ -98,6 +98,11 @@ def test_check_base64_refusals(value: str, message: str, tmp_path: Path) -> None
         "YSxiCjEsMgo=",
         "data:text/csv;base64,YSxiCjEsMgo=",
         "DATA:text/csv;charset=utf-8;BASE64,YSxiCjEsMgo=",
+        # base64 named other than as the header's exact end: decoded at 07fa450, then refused.
+        "data:text/csv; base64,YSxiCjEsMgo=",
+        "data:text/csv;base64;charset=utf-8,YSxiCjEsMgo=",
+        "data:text/csv;base64 ,YSxiCjEsMgo=",
+        "data:;base64,YSxiCjEsMgo=",
         "YSxi\nCjEs\nMgo=",
         "YSxi\r\nCjEs\r\nMgo=\r\n",
         " YSxi\tCjEsMgo= ",
