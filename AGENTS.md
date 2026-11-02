@@ -135,7 +135,8 @@ Module docstrings explain the why; read the one you are about to change.
   other tool `url`/`artifact_id`. Local: convert takes `path`/`url`/`content_base64`, the others
   `path`/`url`. A refusal's hint names only the calling tool's inputs (`SourceRef.takes`).
   `argument_checker` validates tool arguments before the gate quotes a price, and refuses an
-  argument the tool does not declare (the SDK would drop it silently).
+  argument the tool does not declare (the SDK would drop it silently), except `filename`, which
+  only names the input.
 - `api/`: `app.py` (`create_app`; routes, OpenAPI `x-payment-info`, middleware order;
   `_body_check` and `_form_check` refuse a request that can only fail before the 402;
   `InternalErrorMiddleware`, inside the body limit and outside the x402 middleware, makes any
@@ -377,7 +378,7 @@ each test's docstring has the incident.
   the quote: undecodable or empty `content_base64`, inline bytes that cannot be Parquet sent to
   inspect, preview or query, URLs that can never be fetched, short SQL that is not one SELECT,
   forms past Starlette's limits or with an empty file part, MCP arguments a tool does not
-  declare. (`integration/test_fix_money_gate.py`, `integration/test_fix_money_upload_check.py`,
+  declare (but `filename`), an option value the named format's reader can never use. (`integration/test_fix_money_gate.py`, `integration/test_fix_money_upload_check.py`,
   `unit/test_fix_money_form_peek.py`, `unit/test_fix_money_service.py`,
   `integration/test_final_validate_*.py`, `integration/test_final_integrate_empty_upload.py`,
   `integration/test_final_integrate_mcp_unknown_args.py`)

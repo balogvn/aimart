@@ -200,6 +200,12 @@ def _precheck(service: Service, args: Mapping[str, Any], takes: tuple[str, ...])
         service.check_input(src)
 
 
+# Undeclared arguments let through: metadata about the input that selects nothing. Anything
+# else undeclared (an input, sql, tables, options, a column list, a typo of a declared name)
+# would be dropped by the SDK while it changes what the agent asked for, so it is refused.
+_INPUT_NAME = frozenset({"filename"})
+
+
 def argument_checker(
     server: MCPServer, service: Service
 ) -> Callable[[str, dict[str, Any]], CallToolResult | None]:
@@ -215,7 +221,10 @@ def argument_checker(
     The SDK drops undeclared names silently: {artifact_id, url} to a convert that took no
     artifact_id was charged and converted the url alone, and {artifact_id, content_base64} to
     inspect_parquet inspected the artifact, with nothing to say the other input was ignored. A
-    null value asks for nothing and is let through, as the SDK lets it.
+    null value asks for nothing and is let through, as the SDK lets it, and so is
+    ``_INPUT_NAME``: it only names the input, and changes nothing a tool that does not take it
+    reads. Refused, an agent carrying {artifact_id, filename} from its convert call into
+    inspect_parquet, served and settled at 07fa450, was turned away before the quote.
     """
 
     def check(name: str, arguments: dict[str, Any]) -> CallToolResult | None:
@@ -224,7 +233,9 @@ def argument_checker(
             return None
         declared = list(tool.parameters.get("properties", {}))
         unknown = [
-            key for key, value in arguments.items() if key not in declared and value is not None
+            key
+            for key, value in arguments.items()
+            if key not in declared and value is not None and key not in _INPUT_NAME
         ]
         if unknown:
             return _err(

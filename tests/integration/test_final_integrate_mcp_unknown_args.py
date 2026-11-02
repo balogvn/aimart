@@ -5,7 +5,8 @@ declare. convert_to_parquet took no artifact_id then, so {artifact_id, url} was 
 and converted the url alone, and nothing told the agent its artifact_id was ignored. The same
 holds for any tool: inspect_parquet with {artifact_id, content_base64} inspected the artifact
 and charged for it, though the agent sent bytes it meant to be read. ``argument_checker`` now
-refuses undeclared names (with a value) before the SDK can drop them.
+refuses undeclared names (with a value) before the SDK can drop them, except ``filename``,
+which only names the input and changes nothing a tool that does not take it reads.
 """
 
 from __future__ import annotations
@@ -71,6 +72,37 @@ async def test_the_hint_lists_exactly_the_tools_parameters(paid_app: kit.AppHarn
         result = await client.call_tool("inspect_parquet", {"artifact_id": A, "sheet": "x"})
     error = (result.structured_content or {})["error"]
     assert _named(error["hint"]) == list(tools["inspect_parquet"].input_schema["properties"])
+
+
+@pytest.mark.parametrize(
+    ("tool", "extra"),
+    [
+        ("inspect_parquet", {}),
+        ("preview_parquet", {"limit": 1}),
+        ("query_parquet", {"sql": "SELECT count(*) AS n FROM data"}),
+    ],
+)
+async def test_a_filename_carried_from_the_convert_is_served_and_settled(
+    tool: str, extra: dict[str, Any], paid_app: kit.AppHarness, facilitator: kit.FakeFacilitator
+) -> None:
+    # The reviewer's case: {artifact_id, filename} to inspect_parquet was served and settled at
+    # 07fa450, then refused ("inspect_parquet does not take filename."), a lost sale. filename
+    # only names the input; it selects nothing a tool that does not declare it reads.
+    r = await paid_app.paying.post(
+        "/v1/convert", json={"content_base64": kit.b64(b"a,b\n1,x\n2,y\n"), "filename": "a.csv"}
+    )
+    artifact = r.json()["artifact"]["id"]
+    args = {"artifact_id": artifact, "filename": "a.csv", **extra}
+    result = await _call(paid_app, tool, args, pay=True)
+    assert not result.is_error, result.structured_content
+    assert len(facilitator.settled) == 2  # the convert, then this call
+    # Still refused beside it: an input the tool does not take.
+    refused = await _call(paid_app, tool, {**args, "content_base64": "YQ=="}, pay=True)
+    assert refused.is_error
+    assert (refused.structured_content or {})["error"]["message"] == (
+        f"{tool} does not take content_base64."
+    )
+    assert len(facilitator.verified) == 2
 
 
 async def test_a_null_undeclared_argument_is_ignored_as_before(paid_app: kit.AppHarness) -> None:

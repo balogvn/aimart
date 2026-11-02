@@ -214,7 +214,8 @@ decided from the request alone:
   empty.".
 - Over MCP, an argument the tool does not take: 400 `invalid_request`, such as
   "inspect_parquet does not take content_base64.", with the hint "Its parameters are: ..."
-  listing the tool's own (a `null` value is ignored). Only `convert_to_parquet` takes
+  listing the tool's own (a `null` value is ignored, and so is `filename`, which only names the
+  input). Only `convert_to_parquet` takes
   `content_base64`; the other tools take `url` or `artifact_id`.
 - `content_base64` sent to inspect, preview or query that cannot be a Parquet file (it does not
   end in the Parquet footer, as a CSV not converted yet): 422 `invalid_input`, "Not a readable
