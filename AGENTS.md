@@ -442,10 +442,12 @@ each test's docstring has the incident.
   'Cont.' inside a header are column names. Anything else splits the page off ('found N
   tables'): a split is a reported partial result, a different table merged in is silent wrong
   data. The last one or two rows of a borderless table, alone on its last page, are read at the
-  previous page's column edges and kept only when they look like body.
+  previous page's column edges and kept only when they look like body, and never from a page
+  where three more rows hold values under two typed columns: that is a table alignment could
+  not read, and its header of scale points ('Statement', '1', ..., '5') was taken as a row.
   (`unit/test_fix_pdf_reader.py`, `unit/test_fix_pdf_detect.py`, `unit/test_final_data_pdf.py`,
   `unit/test_final_data_pdf_next_page.py`, `unit/test_final_data_pdf_page_tops.py`,
-  `unit/test_final_data_pdf_header_lines.py`)
+  `unit/test_final_data_pdf_header_lines.py`, `unit/test_final_integrate_pdf_spill.py`)
 - **One job taking the instance down** (a 1.6 KB PDF reached 2 GB in 15 s): the RSS watchdog,
   the per-job temp directory (it holds a query's linked inputs: RAM on Cloud Run), and crash text
   kept out of responses. (`integration/test_isolate.py`) The cap counts the job's temporary
@@ -459,7 +461,8 @@ table's last row on a continuation page is appended to it (strict xfail
 its only sign, a row naming every typed column, is also what a first suppressed row such as
 'Area5', 'x', 'x' looks like), and a short one-cell title above a numeric header printed atop
 every page is taken as the header, the numeric header then a data row on each page (123 rows
-for 120; at 07fa450 too). (The 422 for a time past 9999 in preview and query and the 413 for
+for 120; at 07fa450 too). A page whose table text alignment cannot read (its first column
+wraps, as long survey statements do) is not converted, and no warning names it (07fa450 too). (The 422 for a time past 9999 in preview and query and the 413 for
 `read_csv` running out of memory are tested in `integration/test_final_isolate_gaps.py`;
 DuckDB's `memory_limit` no longer sits above the job cap, `unit/test_fix_csv_memory.py`.)
 

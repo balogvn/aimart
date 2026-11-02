@@ -1150,7 +1150,8 @@ def _spilled_body(table: _Table, rows: list[list[str]]) -> list[list[str]]:
     are rows of its body: data rows, written like the body (``_typed_like``) and filling cells
     a body row fills, and section rows shaped like the body's ('South') above data rows.
     Nothing tells them from the page's other text but how they look, so a page number or a
-    date alone under a number column ('4', '2025-01-31') is not taken.
+    date alone under a number column ('4', '2025-01-31') is not taken, and nothing is taken
+    from a page that holds a table of its own below them.
     """
     typed = table.typed()
     forms = table.forms(typed)
@@ -1168,6 +1169,14 @@ def _spilled_body(table: _Table, rows: list[list[str]]) -> list[list[str]]:
     end = next((i for i, row in enumerate(rows) if not body(row)), len(rows))
     while end and not data(rows[end - 1]):  # a section row heads data rows, or is not body
         end -= 1
+    # A spill is the table's last one or two rows: text alignment sees a table from three.
+    # Three more rows below them holding values under two typed columns are a table it could
+    # not read (its first column wraps), whose first row (a header of scale points, '1'..'5')
+    # only looked like body: taken, it was a junk row of this table, 21 rows for 20 under
+    # "merged a table that continues across 2 pages". Not merging is what 07fa450 did.
+    valued = [r for r in rows[end:] if sum(_kind(_cell(r, c)) in _TYPED for c in typed) >= 2]
+    if len(valued) >= 3:
+        return []
     return rows[:end]
 
 
