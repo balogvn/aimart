@@ -114,9 +114,11 @@ class Settings(BaseSettings):
             "API (~250 MB) and the forkserver (~250 MB) plus max_concurrent_jobs=2 jobs at "
             "700 MB, since a 1.6 KB PDF or a query of huge strings once took one job to 2 GB, "
             "and a 1.5 MB gzip CSV wrote 500 MB of temporary files. On Linux it includes the "
-            "~160 MB of preloaded engine each child shares with the forkserver. Ordinary inputs "
-            "peak at 250-500 MB; about 120-150 MB of decompressed CSV reaches the limit. 0 "
-            "disables it. Needs isolate_jobs (the parent polls the child's RSS and files)."
+            "~160 MB of preloaded engine each child shares with the forkserver. Inside a job "
+            "DuckDB is held at this minus 300 MB and its spill files at the rest, so the two "
+            "together stay under it. Ordinary inputs peak at 250-500 MB; a CSV conversion's "
+            "process at 210-370 MB whatever the file's size, plus its files. 0 disables it. "
+            "Needs isolate_jobs (the parent polls the child's RSS and files)."
         ),
     )
     queue_wait_s: float = 10.0

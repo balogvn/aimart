@@ -73,6 +73,13 @@ READERS: dict[InputFormat, Reader] = {
 
 _MAX_COLUMNS_META = 256 * 1024  # file-level label map; huge survey files keep field metadata only
 
+# Delimited text is staged and then written by COPYs that keep input order, and DuckDB keeps
+# that order by holding every batch a faster thread finished early. With 2 threads that held
+# 400-650 MB for a 40-column CSV (spilled to the RAM disk, or out of memory, under a lower
+# limit); with one it held about 100 MB. Production runs on 1 vCPU, where a second thread buys
+# no CPU anyway. Other formats are read into memory before the write and keep the setting.
+_ONE_THREAD = frozenset({InputFormat.CSV, InputFormat.TSV})
+
 SQL_TYPES = {
     "string": "VARCHAR",
     "int64": "BIGINT",
@@ -303,6 +310,15 @@ def _apply_expected_schema(
     return result + extras
 
 
+def _out_of_memory_hint(options: ConvertOptions) -> str:
+    """What to change when DuckDB ran out of memory converting: only what the call can change."""
+    sort = ", drop sort_by (it sorts the whole file)" if options.sort_by else ""
+    return (
+        f"Split the file into parts with fewer columns or rows{sort}, or pass "
+        "options.infer_types=false to keep text columns as text; you were not charged."
+    )
+
+
 def convert_file(
     src: Path,
     out_path: Path,
@@ -321,23 +337,23 @@ def convert_file(
     tmp.mkdir(exist_ok=True)
     con = connect(
         memory_limit=limits.duckdb_memory_limit,
-        threads=limits.duckdb_threads,
+        threads=1 if fmt in _ONE_THREAD else limits.duckdb_threads,
         allowed_dirs=[workdir],
         temp_dir=tmp,
+        max_temp_size=limits.duckdb_max_temp_size,
     )
     try:
         raw = READERS[fmt](con, path, workdir, options, fmt, limits)
-        try:
-            report = _finish(con, raw, out_path, name, options, fmt)
-        except duckdb.OutOfMemoryException as exc:
-            # Inference and the final COPY run every column's type ladder over the whole table:
-            # 30 ISO-date columns of 100 rows once passed the 1 GB memory_limit here. It was a
-            # 500 whose hint said to retry; the file, not the moment, is the problem.
-            raise InputTooLarge(
-                "The file needs more memory to convert than this server allows.",
-                hint="Split the file into parts with fewer columns or rows, or pass "
-                "options.infer_types=false to keep text columns as text; you were not charged.",
-            ) from exc
+        report = _finish(con, raw, out_path, name, options, fmt)
+    except duckdb.OutOfMemoryException as exc:
+        # Reading, typing every column and the final COPY (a sort, with sort_by) all run in
+        # DuckDB; past its memory limit and spill cap that is the file's size, not the moment.
+        # It was a 500 whose hint said to retry, which cannot succeed: 30 ISO-date columns of
+        # 100 rows once passed the 1 GB limit while being typed. read_csv says 'to read'.
+        raise InputTooLarge(
+            "The file needs more memory to convert than this server allows.",
+            hint=_out_of_memory_hint(options),
+        ) from exc
     finally:
         con.close()
     report.source_bytes = source_bytes

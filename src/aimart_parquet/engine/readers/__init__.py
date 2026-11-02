@@ -1,5 +1,8 @@
 """Format readers. Each one loads its input into a DuckDB table and describes its columns.
 
+(Delimited text is the exception: its ``raw`` is a view over a staged Parquet file, because a
+table of a 500 MB CSV does not fit in a job's memory. Downstream SQL cannot tell the difference.)
+
 The contract keeps every format on one downstream path: whatever the source, the pipeline gets
 a table name plus a ``RawColumn`` per column saying where the header came from, whether its
 values are text still waiting for type inference, and any labels the source format carried.

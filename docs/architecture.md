@@ -83,7 +83,9 @@ flowchart LR
    [ADR 0005](adr/0005-job-isolation-forkserver.md).
 5. **Engine** (`engine/`). Detection by magic bytes (`detect.py`) is followed by bomb-safe
    decompression (`safety.py`) and UTF-8 transcoding (`text.py`). A reader (`readers/`)
-   produces a raw table in a locked-down DuckDB connection (`duck.py`). Next come type
+   produces a raw table in a locked-down DuckDB connection (`duck.py`); for delimited text
+   it is a view over a compressed Parquet copy of the text, so memory stays flat as files
+   grow, and DuckDB's memory limit sits under the job's cap (`limits.py`). Next come type
    inference in SQL (`infer.py`), name normalization (`names.py`), and the writer
    (`writer.py`): DuckDB `COPY` to zstd Parquet, or pyarrow when labels must be embedded
    ([ADR 0006](adr/0006-duckdb-copy-writer.md)).

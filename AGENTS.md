@@ -72,16 +72,20 @@ Module docstrings explain the why; read the one you are about to change.
   `readers/` (delimited, jsonish, excel, statistical, columnar, pdf; the `READERS` map is in
   `convert.py`), `infer.py` (type ladder in SQL; the number convention is decided per column,
   then by the file's other number columns, then by the dialect; text with a zone only ever
-  becomes TIMESTAMPTZ; constant lists go through `_one_of`, never `IN`), `names.py`, `convert.py` (pipeline,
-  `expected_schema`, report), `writer.py` (DuckDB `COPY` by default, pyarrow when labels exist),
-  `inspect.py` (footer-only stats), `tabular.py` (preview and SELECT-only query: inputs are views
-  over DuckDB's own Parquet reader (`_native_view`), long cells are cut inside DuckDB, rows are
-  built by position, results over `MAX_RESULT_BYTES` are refused), `isolate.py` (forkserver
-  child per job: deadline, a watchdog on RSS plus the job's temporary files (its temp directory
-  and the `job_dirs` the service passes) for `job_memory_limit_mb`, a per-job temp directory
-  the parent deletes; a crash is logged by type and frames, never its text), `models.py` (the
-  pydantic contract agents read). DuckDB running out of memory is a 413 (`read_csv` in
-  `delimited.py`, inference and the final COPY in `convert.py`), never a 500 that says retry.
+  becomes TIMESTAMPTZ; constant lists go through `_one_of`, never `IN`), `names.py`,
+  `convert.py` (pipeline, `expected_schema`, report; CSV/TSV jobs run DuckDB on one thread),
+  `writer.py` (DuckDB `COPY` by default, pyarrow when labels exist), `inspect.py` (footer-only
+  stats), `tabular.py` (preview and SELECT-only query: inputs are views over DuckDB's own
+  Parquet reader (`_native_view`), long cells are cut inside DuckDB, rows are built by
+  position, results over `MAX_RESULT_BYTES` are refused), `isolate.py` (forkserver child per
+  job: deadline, a watchdog on RSS plus the job's temporary files (its temp directory and the
+  `job_dirs` the service passes) for `job_memory_limit_mb`, a per-job temp directory the
+  parent deletes; a crash is logged by type and frames, never its text), `limits.py` (per-job
+  limits; under the watchdog DuckDB's memory limit is the cap minus 300 MB and its spill cap
+  the rest of the cap, `within_job_cap`), `models.py` (the pydantic contract agents read).
+  Delimited text is staged once as zstd Parquet and `raw` is a view over it. DuckDB running out
+  of memory is a 413 (`read_csv` in `delimited.py`; any other step in `convert_file`), never a
+  500 that says retry.
 - `quantum/`: premium tools (`kernel_pca.py`, `portfolio.py`, `data.py`, `models.py`). Served only
   when the `quantum` extra is installed AND `AIMART_ENABLE_QUANTUM=true` (off by default; a buyer
   panel valued them at $0). `pricing.active_operations(settings)` decides. Spec:
@@ -330,6 +334,21 @@ Found by the engine unit suite (commit 0fea70d), each with a regression test:
 - **Short cp1252/Latin-1 files were misdetected as cp437/cp1250**, giving silent mojibake.
   cp1252 is preferred when its decoding reads as Latin text (`engine/text.py`).
 
+Found by profiling CSV memory (a 200 MB CSV peaked at the 700 MB job cap; all of it DuckDB),
+each pinned in `tests/unit/test_fix_csv_memory.py`:
+
+- **The whole CSV as a VARCHAR table**, read through 256 MB of buffers (DuckDB's default is
+  16 x `max_line_size`). Delimited text is now staged as zstd Parquet and `raw` is a view.
+- **`IN (...)` with 5+ constants is a hash join** in DuckDB, one per occurrence: ~600 MB for a
+  40-column file's null-token lists (the same join as in "No `IN (...)`" below). Use
+  `infer._one_of`.
+- **An ordered COPY on 2 threads holds every batch a faster thread finished early** (400-650 MB
+  for 40 columns). CSV jobs run DuckDB on one thread; production has one vCPU anyway.
+- **DuckDB's 1 GB limit sat above the 700 MB cap**, so a sort was killed before it could spill.
+  `Limits.from_settings` holds DuckDB at the cap minus 300 MB and its spill files at the rest
+  of the cap: the watchdog counts spill files with the job's memory (they are RAM on Cloud
+  Run), so the two together never pass it.
+
 ## Bug classes guarded since the review of 6f99145
 
 Each was a 200 for wrong data, a charge for nothing, or a bare 500. Paths are under `tests/`;
@@ -421,16 +440,15 @@ each test's docstring has the incident.
   (`integration/test_final_isolate_disk.py`, `integration/test_final_integrate_stream_cap.py`)
 
 Known gaps: ISO date formats accept 1-digit years ('1/2/3' becomes 0001-02-03); JSON timestamps
-that all carry offsets become naive UTC with no note; DuckDB's `memory_limit` (1 GB) is above the
-700 MB job cap, so the watchdog can stop a job before DuckDB would spill. In PDFs, a different
-table after a table's last row on a continuation page is appended to it (strict xfail
+that all carry offsets become naive UTC with no note. In PDFs, a different table after a
+table's last row on a continuation page is appended to it (strict xfail
 `unit/test_final_data_pdf_next_page.py::test_a_different_table_after_the_last_row_is_not_appended`:
 its only sign, a row naming every typed column, is also what a first suppressed row such as
 'Area5', 'x', 'x' looks like), and a short one-cell title above a numeric header printed atop
 every page is taken as the header, the numeric header then a data row on each page (123 rows
-for 120; at 07fa450 too). (The 422 for a time past
-9999 in preview and query and the 413 for `read_csv` running out of memory are now tested, in
-`integration/test_final_isolate_gaps.py`.)
+for 120; at 07fa450 too). (The 422 for a time past 9999 in preview and query and the 413 for
+`read_csv` running out of memory are tested in `integration/test_final_isolate_gaps.py`;
+DuckDB's `memory_limit` no longer sits above the job cap, `unit/test_fix_csv_memory.py`.)
 
 ## Agent tooling
 

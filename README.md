@@ -263,23 +263,28 @@ URL that can never be fetched, or SQL of up to 256 characters that is not one `S
 MCP error result; the full list is in the
 [agents guide](docs/agents-guide.md#6-handle-errors)). The defaults, which an operator can change:
 
-| limit | default | over it |
-|---|---|---|
-| input size (`url`, `content_base64` or upload) | 50 MB per call, all inputs of the call together; stored `artifact_id`s do not count | 413 `input_too_large` |
-| decompressed size | 256 MB for a gzip, bz2 or zip stream; 512 MB for the XML of all the sheets of an xlsx or ods | 413 `input_too_large` |
-| memory per job | 700 MB, counting its resident memory plus its temporary files | 413 `input_too_large` ("The job exceeded its memory budget") |
-| stored outputs | 512 MiB for all outputs together (256 MiB on the Cloud Run deploy without a bucket) | 413 for one output larger than the whole budget; 503 `busy` while the space is held by outputs that have not expired (kept until their `expires_at`) or outputs still settling; the hint says when to retry |
-| preview and query results | 500 preview rows, 1,000 query rows, cells cut to 2,000 characters, 64 MB in all | more rows: `truncated: true`; over 64 MB: 413 |
-| time | 120 s to convert, 15 s to inspect, preview or query | 504 `timeout` |
-| downloads | 60 s of downloading for all of a call's `url` inputs together | 422 `fetch_failed` |
-| concurrency | 2 jobs; a call waits up to 10 s for a free one | 503 `busy` |
+| limit | default | setting | over it |
+|---|---|---|---|
+| input size (`url`, `content_base64` or upload) | 50 MB per call, all inputs of the call together; stored `artifact_id`s do not count | `AIMART_MAX_INPUT_BYTES` | 413 `input_too_large` |
+| decompressed size | 256 MB for a gzip, bz2 or zip stream; 512 MB for the XML of all the sheets of an xlsx or ods | `AIMART_MAX_DECOMPRESSED_BYTES`, `AIMART_MAX_WORKBOOK_XML_BYTES` | 413 `input_too_large` |
+| memory per job | 700 MB, counting its resident memory plus its temporary files | `AIMART_JOB_MEMORY_LIMIT_MB` | 413 `input_too_large` ("The job exceeded its memory budget") |
+| stored outputs | 512 MiB for all outputs together (256 MiB on the Cloud Run deploy without a bucket) | `AIMART_ARTIFACT_MAX_TOTAL_BYTES` | 413 for one output larger than the whole budget; 503 `busy` while the space is held by outputs that have not expired (kept until their `expires_at`) or outputs still settling; the hint says when to retry |
+| preview and query results | 500 preview rows, 1,000 query rows, cells cut to 2,000 characters, 64 MB in all | `AIMART_MAX_PREVIEW_ROWS`, `AIMART_MAX_QUERY_ROWS`, `AIMART_MAX_CELL_CHARS` | more rows: `truncated: true`; over 64 MB: 413 |
+| time | 120 s to convert, 15 s to inspect, preview or query | `AIMART_CONVERT_TIMEOUT_S`, `AIMART_QUERY_TIMEOUT_S` | 504 `timeout` |
+| downloads | 60 s of downloading for all of a call's `url` inputs together | `AIMART_FETCH_TIMEOUT_S` | 422 `fetch_failed` |
+| concurrency | 2 jobs; a call waits up to 10 s for a free one, with up to 4 calls per job waiting | `AIMART_MAX_CONCURRENT_JOBS`, `AIMART_QUEUE_WAIT_S` | 503 `busy` |
 
-**Large CSVs, roughly over 120 MB uncompressed, may be refused on the default hosted
-instance** (413, unpaid). Converting a CSV takes about 3.5 times its uncompressed size in
-memory, plus the decompressed file itself, which counts toward the 700 MB a job may use because
-`/tmp` is RAM on Cloud Run. Split such files, or convert them with the free local
-server and `AIMART_JOB_MEMORY_LIMIT_MB` raised to suit your machine (the local server applies
-the same 700 MB cap by default).
+**CSV memory no longer grows with the file.** The text is staged as compressed Parquet instead
+of loaded into a table, so a conversion's process stays at about 210-370 MB whatever the file's
+size (measured in process; a 446 MiB CSV took 1.2 GB, and CSVs over about 120 MB were refused).
+The job's files still grow with it, and they count toward the 700 MB a job may use because
+`/tmp` is RAM on Cloud Run: the decompressed text, its staged copy and the output. `sort_by`
+sorts the whole file and spills to disk past 400 MiB; the spill counts too, and DuckDB may
+spill only the 300 MiB the cap leaves it. Over the cap the call fails with 413, unpaid: split
+such files, or convert them with the free local server and `AIMART_JOB_MEMORY_LIMIT_MB` raised
+to suit your machine (the local server applies the same 700 MB cap by default).
+[deploy/README.md](deploy/README.md#memory-capacity-what-one-2-gib-instance-converts) has the
+numbers.
 
 Password-protected and scanned PDFs (422 `invalid_input`), a column preview or query cannot show,
 such as a time past year 9999 (422; cast it to text), and a storage failure (503

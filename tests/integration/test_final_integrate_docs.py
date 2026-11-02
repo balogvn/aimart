@@ -79,6 +79,12 @@ async def test_the_guide_quotes_the_convert_out_of_memory_refusal(
     assert f'"{error["message"]}"' in GUIDE
     assert "`options.infer_types=false`" in GUIDE
     assert "options.infer_types=false" in error["hint"]
+    assert "sort_by" not in error["hint"]
+    # With sort_by the hint names it too (perf/csv-memory): the sort is what DuckDB spills.
+    sorted_body = {**body, "options": {"sort_by": ["a"]}}
+    error = _error(await paid_app.paying.post("/v1/convert", json=sorted_body), 413)
+    assert "drop sort_by" in error["hint"]
+    assert "drop `sort_by` (the hint says so when you passed it)" in GUIDE
 
 
 def test_the_guide_quotes_the_memory_budget_refusal(
@@ -129,8 +135,15 @@ def test_readme_and_security_describe_the_cap_as_memory_plus_files() -> None:
         f"| memory per job | {limit} MB, counting its resident memory plus its temporary files |"
         in README
     )
-    assert "roughly over 120 MB uncompressed" in README
-    assert "roughly over 120 MB uncompressed" in GUIDE
+    # Both said CSVs "roughly over 120 MB uncompressed" were refused: true while a CSV took about
+    # 3.5 times its size in memory, not since perf/csv-memory staged the text (updated at the
+    # merge). What still grows with a CSV is its files, and the docs say so.
+    for doc in (README, GUIDE):
+        assert "roughly over 120 MB" not in doc
+        assert "3.5 times" not in doc
+    assert "**CSV memory no longer grows with the file.**" in README
+    assert "The job's files still grow with it, and they count toward the" in README
+    assert "A CSV conversion's memory does not grow with the file, but its files do" in GUIDE
     security = text("SECURITY.md")
     assert "resident memory plus its temporary files" in security
     assert "logged by its type and traceback frames, never its text" in security

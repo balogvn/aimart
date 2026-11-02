@@ -137,7 +137,10 @@ def _one_of(expr: str, values: tuple[str, ...]) -> str:
     several times per column, so a 100-row CSV with 30 date columns ran out of memory in the
     final COPY (a 500). The join also broke insertion order: once a file had more than one
     122,880-row group, its rows were written out of source order, and preview offset 0 showed
-    row 122,881. ``list_contains`` is a plain function: no join, no reordering.
+    row 122,881. A 40-column CSV's final SELECT held 90 of them, about 600 MB of hash tables
+    and join buffers for a 13 MB file, over the 700 MB job cap whatever the row count (found
+    profiling CSV memory, separately). ``list_contains`` is a plain function: no join, no
+    reordering, and NULL for a NULL expr, as IN is.
     """
     return f"list_contains({_fmt_list(list(values))}, {expr})"
 

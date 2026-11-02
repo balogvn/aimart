@@ -41,7 +41,7 @@ import pyarrow.dataset as pads
 import pyarrow.parquet as pq
 from duckdb.sqltypes import DuckDBPyType
 
-from aimart_parquet.engine.duck import connect, ident, literal
+from aimart_parquet.engine.duck import DEFAULT_MAX_TEMP_SIZE, connect, ident, literal
 from aimart_parquet.engine.inspect import type_name
 from aimart_parquet.engine.models import TabularResult
 from aimart_parquet.errors import (
@@ -749,6 +749,7 @@ def query(
     max_chars: int,
     memory_limit: str,
     threads: int,
+    max_temp_size: str = DEFAULT_MAX_TEMP_SIZE,
 ) -> TabularResult:
     text = validate_select(sql)
     # A private, throwaway spill directory: big sorts and joins can spill instead of failing,
@@ -758,7 +759,7 @@ def query(
     inputs = spill / "inputs"
     inputs.mkdir()
     con = connect(
-        memory_limit=memory_limit, threads=threads, temp_dir=spill
+        memory_limit=memory_limit, threads=threads, temp_dir=spill, max_temp_size=max_temp_size
     )  # no other file access
     timer = threading.Timer(query_timeout, con.interrupt)
     try:

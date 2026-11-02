@@ -258,14 +258,17 @@ The `input_too_large` messages, and what to change (numbers are the defaults):
 - "The job exceeded its memory budget (700 MB) and was stopped: N MB in memory plus M MB of
   temporary files, which count toward the budget.", with `details.memory_bytes` and
   `details.temp_file_bytes`: each job's memory is capped, and its temporary files count (on the
-  hosted instance they are in RAM). Large CSVs, roughly over 120 MB uncompressed (a compressed
-  file counts at its decompressed size), can reach it on the default hosted instance: split
-  them. For a PDF, read fewer pages with `pdf_pages`; for a query, return less.
+  hosted instance they are in RAM). A CSV conversion's memory does not grow with the file, but
+  its files do: the decompressed text (a compressed file counts at its decompressed size), a
+  compressed copy of it and the output. `sort_by` sorts the whole file, and what DuckDB spills
+  to disk counts too. Split such files, or drop `sort_by`. For a PDF, read fewer pages with
+  `pdf_pages`; for a query, return less.
 - "The file needs more memory to read than this server allows." (a delimited file) or "The PDF
   needs more memory than this server allows.": send a smaller file, or fewer pages.
-- "The file needs more memory to convert than this server allows.": typing every column took
-  more memory than DuckDB has. Split the file into parts with fewer columns or rows, or pass
-  `options.infer_types=false` to keep text columns as text.
+- "The file needs more memory to convert than this server allows.": reading, typing every
+  column or, with `sort_by`, sorting took more memory than DuckDB has, its spill files
+  included. Split the file into parts with fewer columns or rows, drop `sort_by` (the hint says
+  so when you passed it), or pass `options.infer_types=false` to keep text columns as text.
 - "The output exceeds the artifact budget: ...": the converted file is larger than everything
   this server keeps. Send fewer rows or columns.
 - "The result is over 64 MB after long cells were cut to 2000 characters." (preview or query):

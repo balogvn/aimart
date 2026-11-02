@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 # username) into `SELECT current_setting('secret_directory')`, and into the error text of
 # `duckdb_extensions()` / `duckdb_secrets()`.
 NOWHERE = "/nonexistent/aimart"
+DEFAULT_MAX_TEMP_SIZE = "2GB"
 
 
 def ident(name: str) -> str:
@@ -45,6 +46,7 @@ def connect(
     threads: int,
     allowed_dirs: Iterable[Path] = (),
     temp_dir: Path | None = None,
+    max_temp_size: str = DEFAULT_MAX_TEMP_SIZE,
 ) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect(
         database=":memory:",
@@ -65,7 +67,7 @@ def connect(
     con.execute("SET enable_progress_bar = false")
     if temp_dir is not None:
         con.execute(f"SET temp_directory = {literal(str(temp_dir))}")
-        con.execute("SET max_temp_directory_size = '2GB'")
+        con.execute(f"SET max_temp_directory_size = {literal(max_temp_size)}")
     else:
         # No spill directory at all. DuckDB's default is <cwd>/.tmp/, which it also adds to
         # allowed_directories — readable via current_setting(), leaking the server's path.

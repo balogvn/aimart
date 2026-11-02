@@ -338,6 +338,51 @@ Run pricing page before relying on them.
   rule from `setup-gcp.sh`: about a day. Without that rule there is no worst-case bound, so keep
   it on any bucket you use.
 
+### Memory capacity: what one 2 GiB instance converts
+
+On Cloud Run `/tmp` is the instance's RAM, so every file a job writes counts against the same
+2 GiB as its process. The job watchdog (`AIMART_JOB_MEMORY_LIMIT_MB`, 700 MB) therefore counts
+both: a job whose resident memory plus its temporary files (the call's work directory and the
+job's own temp directory) pass it is killed and answered 413 `input_too_large`, unpaid. It
+polls every 0.1 s, so a job allocating fast passes the cap by what it gains in one poll.
+
+| holds memory | how much |
+|---|---|
+| API process, forkserver | ~250 MB each |
+| a job, process and files together | ≤ 700 MB (`AIMART_JOB_MEMORY_LIMIT_MB`) |
+| a job's process | a CSV conversion measured 210-370 MB whatever the file size; with `sort_by`, ~520 MB |
+| DuckDB inside a job | limit = the job cap minus 300 MB (400 MiB), so sorts spill instead of being killed; spill cap = the rest of the job cap (300 MiB), so DuckDB's memory and its spill together never pass the cap |
+| a job's files in `/tmp` | the upload (≤ 50 MB) + the decompressed text (≤ 256 MB, `AIMART_MAX_DECOMPRESSED_BYTES`) + a second, UTF-8 copy when the input was not UTF-8 + the staged text (18-31% of the CSV) + the output (20-33%) + spill (`sort_by` only, ≤ 300 MiB) |
+| stored artifacts without a bucket | ≤ `AIMART_ARTIFACT_MAX_TOTAL_BYTES` (256 MiB) |
+
+Measured in-process on macOS (Linux, where production runs, was not measured; files not
+counted), `main` at e8d228e against the staged reader, peak resident memory:
+
+| CSV (decompressed) | before | now | CPU seconds, before → now |
+|---|---|---|---|
+| 198 MiB, 11 mixed columns | 622-815 MiB | 215 MiB | 23.7 → 17.0 |
+| 446 MiB, 11 mixed columns | 1.17-1.19 GiB | 206-219 MiB | 53.0 → 39.3 |
+| 135 MiB, 40 short columns | 901-963 MiB | 353-368 MiB | 53.6 → 7.0 |
+| 446 MiB with `sort_by` | 1.16 GiB | 518 MiB (+ 418 MiB spill) | |
+
+What that means for the default deploy (1 vCPU, 2 GiB, `AIMART_MAX_CONCURRENT_JOBS=2`); these
+are sums of the numbers above, not measurements of a live instance:
+
+- **The 50 MB upload cap binds first.** A file reaches the 256 MB stream cap only if it
+  compresses about 5:1; the test files above compressed 2-2.5:1.
+- **A job's files, not its process, decide what converts.** Near the 256 MB stream cap a CSV
+  holds about 210-370 MB of process plus 350-400 MB of files: at the edge of the 700 MB cap for
+  the widest files, refused (413, unpaid) past it, never an instance out of memory.
+- **Two jobs at the cap** hold 1.4 GB next to ~500 MB for the API and the forkserver. Stored
+  artifacts in `/tmp` come on top, so without a bucket the instance can still run out.
+- **`sort_by` is the worst case:** DuckDB fills its 400 MiB before it spills, so a sort of a
+  large CSV reaches the cap with its input, staged text and spill, and is refused (413).
+- **Time is the next limit.** 39 CPU-seconds for 446 MiB on an Apple M-series core; Cloud Run's
+  vCPU was not measured, and conversions stop at `AIMART_CONVERT_TIMEOUT_S` (120 s, unpaid).
+
+To convert bigger files concurrently, set `AIMART_MAX_CONCURRENT_JOBS=1` or give the service
+more memory, and set `AIMART_GCS_BUCKET` so stored artifacts leave the RAM disk.
+
 ---
 
 ## 4. Fallback hosts (documented, not set up)

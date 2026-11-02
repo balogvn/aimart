@@ -49,14 +49,11 @@ def test_the_defaults_split_streams_from_workbooks() -> None:
     limits = Limits.from_settings(settings)
     assert limits.max_decompressed_bytes == 256 * _MB
     assert limits.max_workbook_xml_bytes == 512 * _MB
-    assert Limits() == limits.__class__(
-        max_input_bytes=limits.max_input_bytes,
-        max_decompressed_bytes=limits.max_decompressed_bytes,
-        max_workbook_xml_bytes=limits.max_workbook_xml_bytes,
-        max_json_repair_bytes=limits.max_json_repair_bytes,
-        duckdb_memory_limit=limits.duckdb_memory_limit,
-        duckdb_threads=limits.duckdb_threads,
-    )  # the dataclass defaults are the settings defaults
+    # The dataclass defaults are the settings defaults. Isolated jobs hold DuckDB under the job
+    # cap (perf/csv-memory, merged after this test: 400 MiB and 300 MiB of spill under 700),
+    # so only an in-process service applies duckdb_memory_limit as configured.
+    assert Limits() == Limits.from_settings(Settings(_env_file=None, isolate_jobs=False))
+    assert (limits.duckdb_memory_limit, limits.duckdb_max_temp_size) == ("400MiB", "300MiB")
 
 
 def test_a_300_mb_stream_stops_at_256_mb(big_gzip: Path, tmp_path: Path) -> None:
