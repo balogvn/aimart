@@ -223,6 +223,12 @@ more; "tamper-proof via quantum kernels" is not a real technique and must not be
 - **Isolated-job tests assert the error type, not wall-clock time** (the forkserver's first
   start took over 15 s under load); memory-cap tests keep touching their allocation (macOS pages
   idle memory out before the poll sees it). Never give DuckDB ~1,500-level JSON in-process.
+- **A test that encoded the bug is updated, never deleted or loosened**, with a comment saying
+  what it asserted before and why that changed. Some such values look arbitrary and are not:
+  `unit/test_convert.py::TestShaping::test_row_group_size` needs 5000 rows, not 2500, because
+  without the `IN` join DuckDB's order-preserving COPY writes a final batch under about 3000
+  rows as one group; the spill caps in `unit/test_fix_csv_memory.py` are the rest of the job
+  cap, not the cap.
 - A streamed paid upload needs `io.BytesIO` through the plain client with an explicit payment
   header (ASGITransport and x402's transport send one message). The shared fake GCS client is
   `tests/fixtures/money/fake_gcs.py`.
