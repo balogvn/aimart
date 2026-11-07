@@ -464,12 +464,12 @@ class _Table:
 def parse_pages(spec: str | None, total: int) -> list[int]:
     """'1-3,7' -> [1, 2, 3, 7] (1-based, in range). None -> every page up to MAX_PAGES.
 
-    The syntax is ``pdf_page_ranges``'s, refused before the price quote when the request names
-    a PDF (``ConvertOptions.refusal``); what a range selects depends on the document.
+    The syntax is ``pdf_page_ranges``'s, refused before the price quote when the input is known
+    to be a PDF then (``ConvertOptions.refusal``); what a range selects depends on the document.
     """
     if not spec:
         return list(range(1, min(total, MAX_PAGES) + 1))
-    refusal = pages_refusal(spec)  # a file with no name or format may still be a PDF
+    refusal = pages_refusal(spec)  # a url's file may be a PDF whatever its path says
     if refusal is not None:
         raise refusal
     ranges = pdf_page_ranges(spec)

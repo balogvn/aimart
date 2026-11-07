@@ -176,14 +176,6 @@ def _filename_from(url: str, disposition: str | None) -> str | None:
     return safe_filename(name) if name else None
 
 
-def url_filename(url: str) -> str | None:
-    """The file name a URL's path ends in, as a download without a Content-Disposition gets."""
-    try:
-        return _filename_from(url, None)
-    except ValueError:  # urlsplit: a malformed bracketed host, refused by validate_url
-        return None
-
-
 def safe_filename(name: str) -> str:
     """Keep only the final path component, in a conservative alphabet."""
     base = PurePosixPath(name.replace("\\", "/")).name

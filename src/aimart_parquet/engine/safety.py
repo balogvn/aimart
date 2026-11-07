@@ -27,7 +27,11 @@ MAX_ZIP_MEMBERS = 10_000
 _IGNORED_MEMBER_PREFIXES = ("__MACOSX/", ".DS_Store")
 
 
-def read_magic(path: Path, n: int = 600) -> bytes:
+# The bytes ``detect_format`` judges a file's start by (``read_magic``'s default).
+MAGIC_BYTES = 600
+
+
+def read_magic(path: Path, n: int = MAGIC_BYTES) -> bytes:
     with path.open("rb") as fh:
         return fh.read(n)
 

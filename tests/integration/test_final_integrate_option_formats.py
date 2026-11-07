@@ -6,9 +6,12 @@ refused every format: a 2-row CSV with ``{"pdf_pages": "0"}`` or ``"1-3,"``, and
 a 400 before the quote at bebfe33, on REST, the upload form and MCP alike: a lost sale on a
 value that format never reads.
 
-Now each is refused before the quote only when the request names a format whose reader reads
-it (``options.format``, else the filename's extension, else a url's path), with the error that
-reader raises. With no name and no format, the reader refuses it after the verify, typed and
+Now each is refused before the quote only when the input's format is one whose reader reads
+it, with the error that reader raises. That format was first the one the request names
+(``options.format``, else the filename's extension, else a url's path); it is now the one the
+engine reads the input's bytes as (test_final_verify_option_bytes.py): inline bytes decide
+even with no name, and a url, whose bytes are not known before the quote, is judged by
+``options.format`` alone. Otherwise the reader refuses the value after the verify, typed and
 unpaid: ``delimiter`` '"' reached csv.reader there once, a bare 500. And an SPSS portable
 file (.por) with any ``encoding`` was a 500: pyreadstat's read_por takes none.
 """
@@ -154,17 +157,28 @@ async def test_an_option_the_named_format_cannot_use_is_refused_before_the_quote
     assert fake.settled == []
 
 
-async def test_a_url_names_its_format_by_its_path(paid_app: kit.AppHarness) -> None:
-    body = {"url": "https://e.example/exports/a.csv", "options": {"encoding": "rot13"}}
+async def test_a_url_is_judged_by_its_options_format_alone(paid_app: kit.AppHarness) -> None:
+    """Before: a url's path named its format, so this 'a.csv' was a 400 before the quote. But a
+    url's file is whatever its server sends (an 'export.csv' link serving an xlsx, with
+    encoding 'auto', converted and settled at 07fa450 and was refused), so only
+    ``options.format`` decides now; for a CSV the reader refuses the encoding after the verify,
+    unpaid (test_final_verify_option_bytes.py)."""
+    body: dict[str, Any] = {
+        "url": "https://e.example/exports/a.csv",
+        "options": {"encoding": "rot13"},
+    }
+    r = await paid_app.http.post("/v1/convert", json=body)
+    assert r.status_code == 402, r.text
+    body["options"]["format"] = "csv"
     r = await paid_app.http.post("/v1/convert", json=body)
     assert r.status_code == 400, r.text
     assert r.json()["error"]["message"] == "'rot13' is not a text encoding."
-    body["url"] = "https://e.example/exports/a.xlsx"
+    body["options"]["format"] = "xlsx"
     r = await paid_app.http.post("/v1/convert", json=body)
     assert r.status_code == 402  # an xlsx never reads encoding: quoted
 
 
-# (bytes, options): with no name or format the value is only found by the reader that reads it.
+# (bytes, options): with no name or format, the inline bytes say which reader reads the value.
 UNNAMED: list[tuple[str, dict[str, Any], str]] = [
     ("a.csv", {"delimiter": '"'}, DELIMITER),  # before: csv.reader's ValueError, a bare 500
     ("a.csv", {"encoding": "rot13"}, "'rot13' is not a text encoding."),
@@ -173,18 +187,21 @@ UNNAMED: list[tuple[str, dict[str, Any], str]] = [
 
 
 @pytest.mark.parametrize(("name", "options", "message"), UNNAMED, ids=_id)
-async def test_without_a_name_the_reader_refuses_the_value_unpaid(
+async def test_without_a_name_the_bytes_name_the_reader_before_the_quote(
     name: str, options: dict[str, Any], message: str, paid_app: kit.AppHarness, tmp_path: Path
 ) -> None:
+    """Before: quoted (402) and verified, then the reader's 400: the format was taken from a
+    name, and with none it was not known before the file was read. The inline bytes are known
+    before the quote, and the engine decides the format from them first."""
     fake = paid_app.facilitator
     assert fake is not None
     body = {"content_base64": kit.b64(_files(tmp_path)[name]), "options": options}
-    quote = await paid_app.http.post("/v1/convert", json=body)
-    assert quote.status_code == 402  # the format is not known before the file is read
-    r = await paid_app.paying.post("/v1/convert", json=body)
-    assert r.status_code == 400, r.text
-    error = r.json()["error"]
-    assert error["code"] == "invalid_request"
-    assert error["message"] == message
-    assert len(fake.verified) == 1
+    for client in (paid_app.http, paid_app.paying):
+        r = await client.post("/v1/convert", json=body)
+        assert r.status_code == 400, r.text
+        assert "payment-required" not in r.headers
+        error = r.json()["error"]
+        assert error["code"] == "invalid_request"
+        assert error["message"] == message
+    assert fake.verified == []
     assert fake.settled == []

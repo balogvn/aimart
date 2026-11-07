@@ -263,13 +263,15 @@ class ConvertOptions(BaseModel):
         """The error the reader of ``fmt`` raises for an option value it can never use.
 
         REST, the upload form and MCP raise it before the quote, with ``fmt`` the format the
-        request names (``Service.check_options``); each was found only after the payment was
-        verified, and some crashed into a bare 500 ('rot13', '"'). Only an option that format
-        reads: the PDF reader reads ``pdf_pages``, the text readers ``encoding``, the delimited
-        reader ``delimiter``. These were field validators, so they refused every format, and a
-        CSV with pdf_pages '0', or an xlsx with encoding 'binary', which converted and settled
-        at 07fa450, became a 400: a lost sale on a value that format never reads. With ``fmt``
-        None, nothing is refused here; the reader that reads the value refuses it, unpaid.
+        engine will read the input as, where that is known then (``Service.check_options``:
+        ``options.format``, else the inline bytes or the upload's start, and the name); each
+        was found only after the payment was verified, and some crashed into a bare 500
+        ('rot13', '"'). Only an option that format reads: the PDF reader reads ``pdf_pages``,
+        the text readers ``encoding``, the delimited reader ``delimiter``. These were field
+        validators, so they refused every format, and a CSV with pdf_pages '0', or an xlsx with
+        encoding 'binary', which converted and settled at 07fa450, became a 400: a lost sale on
+        a value that format never reads. With ``fmt`` None, nothing is refused here; the reader
+        that reads the value refuses it, unpaid.
         """
         if fmt in _DELIMITED and self.delimiter is not None:
             refusal = delimiter_refusal(self.delimiter)

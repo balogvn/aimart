@@ -161,10 +161,16 @@ def _convert_options(options: str | None) -> ConvertOptions:
 
 
 def _upload_check(peek: FormPeek) -> None:
-    """The upload route's ``options`` as it parses them, then what the reader of the format the
-    upload names (``options.format``, else its filename) would refuse about them."""
+    """The upload route's ``options`` as it parses them, then what the reader of the upload's
+    format (``options.format``, else what the start of its file and its filename make it)
+    would refuse about them."""
     options = _convert_options(peek.fields.get("options"))
-    Service.check_options(options, peek.filenames.get("file"))
+    Service.check_options(
+        options,
+        peek.starts.get("file"),
+        peek.filenames.get("file"),
+        whole="file" in peek.whole_files,
+    )
 
 
 # What a form route would refuse from its fields (to FastAPI they are plain strings), by path.

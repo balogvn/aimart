@@ -181,6 +181,42 @@ async def test_a_file_part_cut_off_is_not_counted() -> None:
     assert peek.fields == {"options": "{}"}
 
 
+async def test_the_start_of_each_file_part_is_kept_for_its_format() -> None:
+    """``starts`` holds a file part's first START_BYTES, split across messages or not, and
+    ``whole_files`` the parts that ended inside them: ``Service.check_options`` decides the
+    upload's format from them as the engine does, bytes before the name (an xlsx uploaded as
+    data.csv with encoding 'auto' was refused before the quote by its name alone)."""
+    from aimart_parquet.engine.detect import START_BYTES
+
+    big = bytes(range(256)) * 20
+    body = multipart(
+        part("small", b"a,b\n1,2\n", filename="s.csv"),
+        part("file", b"stale", filename="old.csv"),  # the last part of a name is the one read
+        part("file", big, filename="b.csv"),
+        part("edge", b"e" * START_BYTES, filename="e.csv"),
+    )
+    h = Harness()
+    await h.run(split(body, 333))
+    [peek] = h.peeks
+    assert peek.starts == {
+        "small": b"a,b\n1,2\n",
+        "file": big[:START_BYTES],
+        "edge": b"e" * START_BYTES,
+    }
+    assert peek.whole_files == {"small", "edge"}
+    assert peek.filenames["file"] == "b.csv"
+    # A part cut off by the peek keeps the start it had, and is not whole.
+    cut = (
+        part("options", b"{}")
+        + f'--{BOUNDARY}\r\nContent-Disposition: form-data; name="file"; filename="a"\r\n\r\nabc'.encode()
+    )
+    h = Harness()
+    await h.run([cut])
+    [peek] = h.peeks
+    assert peek.starts == {"file": b"abc"}
+    assert peek.whole_files == set()
+
+
 async def test_urlencoded_fields_are_decoded_like_starlette() -> None:
     h = Harness()
     await h.run(

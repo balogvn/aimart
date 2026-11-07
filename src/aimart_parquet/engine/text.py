@@ -182,8 +182,8 @@ def to_utf8(path: Path, workdir: Path, forced_encoding: str | None = None) -> Te
     UTF-8 twin converted.
     """
     if forced_encoding:
-        # Refused before the quote only when the request names a text format (a file with no
-        # name or format may not be text), so a request can reach here with one.
+        # Refused before the quote only when the input is known to be text then (a url's file,
+        # or compressed bytes, is not), so a request can reach here with one.
         refusal = encoding_refusal(forced_encoding)
         if refusal is not None:
             raise refusal

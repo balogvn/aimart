@@ -6,11 +6,13 @@ as .xls), so magic bytes win over extensions wherever a format has a reliable si
 
 from __future__ import annotations
 
+import io
 import os
 import zipfile
 from pathlib import Path
 
 from aimart_parquet.engine.models import InputFormat
+from aimart_parquet.engine.safety import MAGIC_BYTES, sniff_compression
 from aimart_parquet.errors import UnsupportedFormat
 
 _SAS7BDAT_MAGIC = bytes.fromhex("000000000000000000000000c2ea8160b31411cfbd92080009c7318c181f1011")
@@ -18,6 +20,8 @@ _BOM = b"\xef\xbb\xbf"
 # PDF readers accept the '%PDF-' header anywhere in the first 1024 bytes and look for the
 # trailer ('startxref', '%%EOF') in the last 1024.
 _PDF_WINDOW = 1024
+# The most of a file's start ``detect_format`` reads; what ``format_from_start`` needs of one.
+START_BYTES = _PDF_WINDOW
 
 _EXTENSIONS: dict[str, InputFormat] = {
     ".csv": InputFormat.CSV,
@@ -62,9 +66,9 @@ def format_from_name(name: str | None) -> InputFormat | None:
     return _EXTENSIONS.get(suffix)
 
 
-def _zip_office_format(path: Path) -> InputFormat | None:
+def _zip_office_format(path: Path | bytes) -> InputFormat | None:
     try:
-        with zipfile.ZipFile(path) as zf:
+        with zipfile.ZipFile(io.BytesIO(path) if isinstance(path, bytes) else path) as zf:
             names = set(zf.namelist())
             if "[Content_Types].xml" in names and any(n.startswith("xl/") for n in names):
                 return InputFormat.XLSX
@@ -77,7 +81,9 @@ def _zip_office_format(path: Path) -> InputFormat | None:
     return None
 
 
-def _read_window(path: Path, *, tail: bool) -> bytes:
+def _read_window(path: Path | bytes, *, tail: bool) -> bytes:
+    if isinstance(path, bytes):
+        return path[-_PDF_WINDOW:] if tail else path[:_PDF_WINDOW]
     try:
         with path.open("rb") as fh:
             if tail:
@@ -87,7 +93,12 @@ def _read_window(path: Path, *, tail: bool) -> bytes:
         return b""
 
 
-def _pdf_after_junk(path: Path, magic: bytes) -> bool:
+def _pdf_header(magic: bytes) -> bool:
+    """The file starts with a PDF header, after at most a BOM, NULs and whitespace."""
+    return magic.removeprefix(_BOM).lstrip(b"\x00\t\r\n ")[:5] == b"%PDF-"
+
+
+def _pdf_after_junk(path: Path | bytes, magic: bytes) -> bool:
     """A PDF whose header follows junk: a UTF-8 BOM, an HTTP or PJL header, binary bytes.
 
     Detection once looked at offset 0 only, so such a file (which pdfminer reads fine) was
@@ -102,10 +113,10 @@ def _pdf_after_junk(path: Path, magic: bytes) -> bool:
     return b"startxref" in end or b"%%EOF" in end
 
 
-def format_from_magic(path: Path, magic: bytes) -> InputFormat | None:
+def format_from_magic(path: Path | bytes, magic: bytes) -> InputFormat | None:
     if magic.startswith(b"PAR1"):
         return InputFormat.PARQUET
-    if magic.removeprefix(_BOM).lstrip(b"\x00\t\r\n ")[:5] == b"%PDF-":
+    if _pdf_header(magic):
         return InputFormat.PDF
     if magic.startswith(b"$FL3"):
         return InputFormat.ZSAV
@@ -152,8 +163,9 @@ def format_from_text(magic: bytes) -> InputFormat:
 
 
 def detect_format(
-    path: Path, magic: bytes, filename: str | None, forced: InputFormat | None
+    path: Path | bytes, magic: bytes, filename: str | None, forced: InputFormat | None
 ) -> InputFormat:
+    """The format of the file at ``path`` (or of these bytes), which starts with ``magic``."""
     if forced is not None:
         return forced
     by_magic = format_from_magic(path, magic)
@@ -192,3 +204,36 @@ def detect_format(
             return sniffed
         return by_name
     return format_from_text(magic)
+
+
+def format_from_start(
+    start: bytes, filename: str | None, forced: InputFormat | None, *, whole: bool
+) -> InputFormat | None:
+    """The format ``convert_file`` reads a file beginning with ``start`` as, or None when its
+    start does not decide that. ``whole``: ``start`` is the entire file, not only its start.
+
+    For the checks before the quote (``Service.check_options``), which refuse an option only
+    for a format whose reader refuses it. Judged by the name alone, as 5ecb6ac did, an xlsx
+    named data.csv with encoding 'auto' (which agents send) and a JSON array named data.csv
+    with delimiter '"' were refused before the quote, while 07fa450 converted and settled
+    them: the bytes win over the name here, and the reader that runs never reads the option.
+
+    None when the bytes say no more before the file is opened: gzip, bz2 and zip (``unwrap``
+    inflates the first two and extracts a zip's member; only a zip's central directory, at its
+    end, says it is a workbook, and a workbook reads none of these options anyway); a start
+    shorter than ``detect_format`` reads, or one holding a PDF header after junk, whose trailer
+    (at the end) decides; bytes nothing recognises, which the engine refuses itself.
+    """
+    if forced is not None:
+        return forced
+    if sniff_compression(start[:8]) is not None:
+        return None
+    magic = start[:MAGIC_BYTES]
+    if not whole and (
+        len(start) < START_BYTES or (b"%PDF-" in start[:_PDF_WINDOW] and not _pdf_header(magic))
+    ):
+        return None
+    try:
+        return detect_format(start, magic, filename, None)
+    except UnsupportedFormat:
+        return None

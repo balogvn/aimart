@@ -21,6 +21,8 @@ from python_multipart.exceptions import FormParserError
 from python_multipart.multipart import MultipartParser, QuerystringParser, parse_options_header
 from starlette.datastructures import Headers
 
+from aimart_parquet.engine.detect import START_BYTES
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -259,6 +261,12 @@ class FormPeek:
     filenames: dict[str, str] = field(default_factory=dict)
     # Names whose last finished file part held no bytes: an empty upload, which can only fail.
     empty_files: set[str] = field(default_factory=set)
+    # The first START_BYTES of each file part read (the last one by name), and the names whose
+    # last part ended within them: what the engine decides the file's format by, before the
+    # name (``Service.check_options``). By the name alone, an xlsx uploaded as data.csv with
+    # encoding 'auto' was refused before the quote; 07fa450 converted and settled it.
+    starts: dict[str, bytes] = field(default_factory=dict)
+    whole_files: set[str] = field(default_factory=set)
     complete: bool = False  # the whole body was read: no other part follows
     error: str | None = None  # not a well-formed form: the route could only answer 400
 
@@ -290,6 +298,7 @@ class _FormReader:
         self._value = bytearray()
         self._is_file = False
         self._file_bytes = 0  # of the file part being read
+        self._start = bytearray()  # its first START_BYTES
         self._in_field = False  # reading a field's value (not a file's, not headers)
         self._parts = 0
         self._fields = 0
@@ -359,6 +368,7 @@ class _FormReader:
         self._value = bytearray()
         self._is_file = False
         self._file_bytes = 0
+        self._start = bytearray()
         self._parts += 1
         self._in_field = not self._multipart  # a multipart part is a field once its headers say
 
@@ -388,6 +398,8 @@ class _FormReader:
                 raise _Refused(f"The form has more than {MAX_FILES} files.")
             name = _decode(self._name, self._charset)
             self.peek.filenames[name] = _decode(options[b"filename"], self._charset)
+            self.peek.starts[name] = b""
+            self.peek.whole_files.discard(name)
         else:
             self._fields += 1
             if self._fields > MAX_FIELDS:
@@ -397,6 +409,9 @@ class _FormReader:
     def _data(self, data: bytes, start: int, end: int) -> None:
         if self._is_file:
             self._file_bytes += end - start
+            if len(self._start) < START_BYTES:
+                self._start += data[start:end][: START_BYTES - len(self._start)]
+                self.peek.starts[_decode(self._name, self._charset)] = bytes(self._start)
             return
         self._value += data[start:end]
         self._check_size()
@@ -422,6 +437,8 @@ class _FormReader:
         name = _decode(self._name, self._charset)
         if self._is_file:
             self.peek.files.add(name)
+            if self._file_bytes == len(self._start):
+                self.peek.whole_files.add(name)
             if self._file_bytes:  # the last part of a name is the one the route reads
                 self.peek.empty_files.discard(name)
             else:

@@ -160,7 +160,7 @@ def read_delimited(
 ) -> RawTable:
     if options.delimiter is not None:
         # csv.reader refuses these ("bad delimiter or quotechar value", a bare 500 after the
-        # payment). Refused before the quote only when the request names a delimited format.
+        # payment). Refused before the quote only when the input is known to be delimited then.
         refusal = delimiter_refusal(options.delimiter)
         if refusal is not None:
             raise refusal

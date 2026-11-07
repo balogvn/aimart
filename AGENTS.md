@@ -125,8 +125,11 @@ Module docstrings explain the why; read the one you are about to change.
   names (`data` + up to 7 joined artifacts) for one query price. Before the quote:
   `check_input`, `check_parquet_input` (inline bytes that cannot be Parquet, for inspect and
   preview), `check_query` (with `check_tables`, which `query` runs too), `check_convert` (with
-  `check_options`: `pdf_pages`, `encoding` or `delimiter` the reader of the format the request
-  names can never use, as `ConvertOptions.refusal`; any other format ignores them).
+  `check_options`: `pdf_pages`, `encoding` or `delimiter` the reader of the input's format can
+  never use, as `ConvertOptions.refusal`; any other format ignores them. The format is
+  `options.format`, else `detect.format_from_start` over the inline bytes or an upload's first
+  KB (`FormPeek.starts`), bytes before the name as the engine decides; a url's or artifact's
+  file, or compressed bytes, is not known before the quote, so only `options.format` counts).
 - `payments/`: `pricing.py` (`OPERATIONS`, the single source of prices, routes and tool names;
   `usd_to_atomic`), `__init__.py` (`Payments`: x402 resource server, REST route configs with the
   Bazaar extension, lazy facilitator init, price-floor check; `http_middleware(prevalidate=,
@@ -380,12 +383,15 @@ each test's docstring has the incident.
   quote: undecodable or empty `content_base64`, inline bytes that cannot be Parquet sent to
   inspect, preview or query, URLs that can never be fetched, short SQL that is not one SELECT,
   forms past Starlette's limits or with an empty file part, MCP arguments a tool does not declare
-  (but `filename`), an option value the named format's reader can never use.
+  (but `filename`), an option value the reader of the input's format can never use (that format
+  decided from the bytes, as the engine decides it: by the name alone an xlsx named data.csv
+  with encoding 'auto' was refused, a lost sale).
   (`integration/test_fix_money_gate.py`, `integration/test_fix_money_upload_check.py`,
   `unit/test_fix_money_form_peek.py`, `unit/test_fix_money_service.py`,
   `integration/test_final_validate_*.py`, `integration/test_final_integrate_empty_upload.py`,
   `integration/test_final_integrate_mcp_unknown_args.py`,
   `integration/test_final_integrate_option_formats.py`,
+  `integration/test_final_verify_option_bytes.py`,
   `integration/test_final_integrate_url_spaces.py`)
 - **Host paths readable from SQL** through DuckDB settings. (`unit/test_fix_money_duck.py`)
 - **Numbers in the wrong convention** ('1.5' as 15 in an EU column, '1.234' as 1.234 in a
