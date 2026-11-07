@@ -190,7 +190,7 @@ class ConvertOptions(BaseModel):
     # max_length holds for every format, before any codec lookup (``refusal``, the readers):
     # codecs.lookup caches every unknown name for good, so unpaid requests with megabyte-long
     # names grew the API process by their size (and each took ~1 s of the event loop). The
-    # longest stdlib codec name has 24 characters.
+    # longest stdlib codec name has 24 characters on 3.13, 21 on 3.12.
     encoding: str | None = Field(
         default=None,
         max_length=64,
