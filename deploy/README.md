@@ -21,7 +21,11 @@ synthetic.yml (every 6 h) ─► scripts/smoke.py against production ─► issu
 | `../.github/workflows/deploy.yml` | The deploy: digest in, verified revision out, rollback on failure. |
 
 Service shape (set by `deploy.yml`): 1 vCPU, 2 GiB, `concurrency=4`, `max-instances=1`,
-`min-instances=0`, 120 s request timeout, startup CPU boost, CPU billed only during requests.
+`min-instances=0`, 300 s request timeout, startup CPU boost, CPU billed only during requests.
+The request timeout is the payment window (`PAYMENT_WINDOW_S`, the 300 s a payment authorization
+is valid for): a paid call may wait for a job slot, download its inputs and run its job inside
+it. A shorter timeout answered 504 to calls still running, and one that finished afterwards
+could still be settled: charged for a response the caller never received.
 
 Memory on that instance is shared by the API (about 250 MB), the forkserver (about 250 MB), two
 jobs (`AIMART_MAX_CONCURRENT_JOBS=2`) and, without a bucket, the artifacts in RAM-backed `/tmp`.

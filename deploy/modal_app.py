@@ -51,7 +51,7 @@ app = modal.App("aimart-parquet", image=image)
 @app.function(
     cpu=1.0,
     memory=2048,  # MiB, as on Cloud Run
-    timeout=120,
+    timeout=300,  # the payment window (payments.PAYMENT_WINDOW_S), as on Cloud Run
     min_containers=0,  # scale to zero
     max_containers=1,  # the cost ceiling's first line, as on Cloud Run
     secrets=[modal.Secret.from_name("aimart-parquet")],

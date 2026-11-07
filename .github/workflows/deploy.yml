@@ -245,6 +245,12 @@ jobs:
           # the cost ceiling's first line; the budget/spend cap is the second (deploy/README.md).
           # concurrency=4 lets cheap 402s and reads interleave with the two heavy job slots
           # (AIMART_MAX_CONCURRENT_JOBS=2 answers 503 beyond that, unsettled).
+          # timeout=300 is the payment window (payments.PAYMENT_WINDOW_S, set in config.py, the
+          # x402 max_timeout_seconds): a paid call may wait for a slot, download its inputs and
+          # run its job inside it (Settings.queue_wait_for). At 120 s the front end answered 504
+          # to calls still running, and the x402 middleware could settle one that finished
+          # afterwards: charged for a response the caller never received.
+          # tests/unit/test_final_verify_deploy_timeout.py checks the two agree.
           flags: >-
             --service-account=${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
             --allow-unauthenticated
@@ -254,7 +260,7 @@ jobs:
             --concurrency=4
             --min-instances=0
             --max-instances=1
-            --timeout=120
+            --timeout=300
             --cpu-boost
             --cpu-throttling
 
