@@ -72,7 +72,8 @@ Module docstrings explain the why; read the one you are about to change.
   (sandboxed DuckDB; `NOWHERE` for every `$HOME`-derived setting), `readers/` (delimited, jsonish,
   excel, statistical, columnar, pdf; the `READERS` map is in `convert.py`), `infer.py` (type
   ladder in SQL; the number convention is decided per column, then by the file's other number
-  columns when they agree, then by the dialect; text with a zone only ever becomes TIMESTAMPTZ;
+  columns when they agree and one writes '1,234.5' or '1.234,5', else by the dialect; text with
+  a zone only ever becomes TIMESTAMPTZ;
   constant lists go through `_one_of`, never `IN`), `names.py`, `convert.py` (pipeline,
   `expected_schema`, report; CSV/TSV jobs run DuckDB on one thread), `writer.py` (DuckDB `COPY` by
   default, pyarrow when labels exist), `inspect.py` (footer-only stats), `tabular.py` (preview and
@@ -398,12 +399,17 @@ each test's docstring has the incident.
   semicolon file). Casts are gated on the style's own pattern (`_style_fit`; never `TRY_CAST` an
   unmatched value: DuckDB reads '1_000' as 1000), the convention is decided per column
   (`TypeInferrer._text_style`), then by the file's other number columns
-  (`TypeInferrer._decimal_comma`: '398.53' in a semicolon file is a decimal point, not 398,530),
-  only when they agree: GPS columns ('54.565860') beside '1.093.086,46' make a mixed file, and
-  times of day ('10.15') are no evidence. Then by the dialect, and every ambiguous choice adds a
+  (`TypeInferrer._decimal_comma`), only when they agree (GPS columns ('54.565860') beside
+  '1.093.086,46' make a mixed file) and one of them proves it: a value with a thousands group
+  and a decimal separator ('1,234.5', '1.234,5'). Any one-sided evidence overrode the dialect
+  (740ddae: '398.53' made a semicolon file's '16.469' kg 16.469), but versions '2.23', factors
+  '0.95', coordinates, day.month dates and times are written the same, and a comma file's
+  quoted choices '"2,4"' like '"12,5"': each read counts '43.445' or incomes '"238,308"' 1000x
+  off where 07fa450 read them right (c5237d3's H.MM discount made it worse). Then by the
+  dialect, as at 07fa450, and every ambiguous choice adds a
   note. (`unit/test_fix_infer_numbers.py`,
   `unit/test_roundtrip_property.py`, `unit/test_final_data_decimals.py`,
-  `unit/test_final_integrate_decimal_vote.py`)
+  `unit/test_final_integrate_decimal_vote.py`, `unit/test_final_verify_decimal_dialect.py`)
 - **Offsets dropped, zones carried over.** DuckDB's TIMESTAMP cast drops offsets; its
   TIMESTAMPTZ cast carries a zone name ('09:00 EST') to later naive values in the same 2048-row
   vector. Zoned text is read only as TIMESTAMPTZ, in CASE branches no naive row takes
@@ -471,7 +477,12 @@ each test's docstring has the incident.
   (`unit/test_final_integrate_transcode_files.py`).
 
 Known gaps: ISO date formats accept 1-digit years ('1/2/3' becomes 0001-02-03); JSON timestamps
-that all carry offsets become naive UTC with no note. In PDFs, a different table after a table's
+that all carry offsets become naive UTC with no note. A semicolon file whose only evidence of
+a decimal point has no thousands group ('398.53' prices) reads its '16.469' kg as 16469, and a
+tab file whose EU amounts ('96.076,50') sit beside H.MM times ('6.48') reads counts '43.445' as
+43.445: the dialect's reading, as at 07fa450, with the note that says it was assumed (the same
+evidence also comes from versions and times, which made right counts wrong). In
+PDFs, a different table after a table's
 last row on a continuation page is appended to it (strict xfail
 `unit/test_final_data_pdf_next_page.py::test_a_different_table_after_the_last_row_is_not_appended`:
 its only sign, a row naming every typed column, is also what a first suppressed row such as

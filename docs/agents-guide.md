@@ -74,12 +74,14 @@ conversion understood the file:
 Notes and warnings name what the service had to assume. Look for these in particular:
 
 - **Numbers.** The convention is decided for the whole column; the file's other number
-  columns, then its delimiter, break a tie (`398.53` elsewhere in a semicolon file makes
-  `1.234` 1.234; with no such evidence a semicolon file reads it as 1234). The other columns
-  decide only when they agree: a file with columns of both conventions (GPS coordinates
-  `54.565860` beside amounts `1.093.086,46`) is read by its delimiter, and a time of day
-  written `10.15` is no evidence. A value written in the other convention is a counted reject,
-  never a wrong number.
+  columns, then its delimiter, break a tie. The other columns decide only with proof: they
+  agree, and one of them writes a thousands group and a decimal separator in one value
+  (`1,234.56` in a semicolon file makes `1.234` 1.234; `"1.234,56"` in a comma file makes it
+  1234). A file with columns of both conventions (GPS coordinates `54.565860` beside amounts
+  `1.093.086,46`) is read by its delimiter, and so is one whose other columns read only one
+  way without proof (`398.53`, a version `2.23`, a time `10.15`, a quoted choice `"2,4"`):
+  a semicolon file reads `1.234` as 1234, a comma file as 1.234. A value written in the other
+  convention is a counted reject, never a wrong number.
   When a value reads both ways, the column says which way it was read, with an example:
   `ambiguous thousands/decimal separator; assumed a decimal comma, so '1.234' is 1234 (infer_types=false keeps the original text)`
   (or `a decimal point`).

@@ -67,18 +67,24 @@ def _ledger(rows: int, *, title: str, header: bool) -> bytes:
 
 
 def test_the_guide_states_the_decimal_tie_rule_as_the_code_applies_it(tmp_path: Path) -> None:
+    # This asserted that '398.53' made the weights 1.234 and that the guide said so. A price
+    # with no thousands group is written like a version or a factor, which made right counts
+    # 1000x off: only a value like '1,398.53' overrides the semicolon now, as the guide says
+    # (test_final_verify_decimal_dialect.py); '398.53' leaves 07fa450's 1234.
     points = kit.convert_bytes(
-        tmp_path, "shop.csv", "price;weight\n398.53;1.234\n12.10;2.500\n7.25;12.750\n"
+        tmp_path, "shop.csv", "price;weight\n1,398.53;1.234\n12.10;2.500\n7.25;12.750\n"
     )
     assert points.rows["weight"] == [1.234, 2.5, 12.75]
+    weak = kit.convert_bytes(
+        tmp_path, "weak.csv", "price;weight\n398.53;1.234\n12.10;2.500\n7.25;12.750\n"
+    )
+    assert weak.rows["weight"] == [1234, 2500, 12750]
     bare = kit.convert_bytes(tmp_path, "bare.csv", "a;weight\nx;1.234\ny;2.500\nz;12.750\n")
     assert bare.rows["weight"] == [1234, 2500, 12750]
     assert "the file's other number columns, then its delimiter, break a tie" in GUIDE
     assert "the file's delimiter breaks a tie" not in GUIDE
-    assert (
-        "(`398.53` elsewhere in a semicolon file makes `1.234` 1.234; with no such evidence a "
-        "semicolon file reads it as 1234)"
-    ) in GUIDE
+    assert "(`1,234.56` in a semicolon file makes `1.234` 1.234;" in GUIDE
+    assert "without proof (`398.53`, a version `2.23`" in GUIDE
 
 
 def test_the_guide_and_readme_quote_the_unread_zone_note(tmp_path: Path) -> None:

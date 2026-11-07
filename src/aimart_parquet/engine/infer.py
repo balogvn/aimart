@@ -17,8 +17,9 @@ Correctness beats cleverness on purpose:
   ``NA`` may be Namibia, so text keeps it unless the caller lists it in ``null_values``.
 * When ``03/04/2025`` parses both ways and no value disambiguates, ``date_order`` decides and
   the report says so. Likewise ``1,234`` and ``1.234`` (thousands or decimals?): when no value
-  in the column settles it, the file's other number columns decide, then its dialect (decimal
-  comma in semicolon files), and the report says so. The expected_schema cast of a text
+  in the column settles it, the file's other number columns decide when they agree and one
+  proves its convention ('1,234.56', '1.234,56'), else its dialect (decimal comma in semicolon
+  files), and the report says so. The expected_schema cast of a text
   column decides the same way, for the whole column, so a value never depends on whether
   inference left its column as text.
 * A decimal cast never rounds: a digit beyond the requested scale makes the value a reject.
@@ -75,9 +76,11 @@ _RE_US = r"[+-]?[1-9]\d{0,2}(,\d{3})+(\.\d+)?"
 _RE_EU = r"[+-]?[1-9]\d{0,2}(\.\d{3})+(,\d+)?|[+-]?\d+,\d+"
 _RE_SPACE = r"[+-]?[1-9]\d{0,2}([ \x{00A0}\x{202F}]\d{3})+([.,]\d+)?"
 _RE_LEADING_ZERO = r"[+-]?0\d+"
-# A time of day as Danish, Norwegian and Finnish files write it ('10.15', '9.05'): only a
-# decimal point reads it as a number, so it voted for one in the file's convention.
-_RE_CLOCK = r"([01]?\d|2[0-3])\.[0-5]\d"
+# A thousands group and a decimal separator in one value: written so by one convention only,
+# and by nothing that is not a number in it (a time, a date, a version, a list of choices).
+# The only evidence strong enough to override the dialect (``TypeInferrer._decimal_comma``).
+_RE_US_PROOF = r"[+-]?[1-9]\d{0,2}(,\d{3})+\.\d+"
+_RE_EU_PROOF = r"[+-]?[1-9]\d{0,2}(\.\d{3})+,\d+"
 _STYLES = ("plain", "us", "eu", "space")
 _NUMERIC_TYPES = frozenset(
     {"tinyint", "smallint", "integer", "bigint", "hugeint", "float", "double", "decimal"}
@@ -629,17 +632,26 @@ class TypeInferrer:
         Decided once per file, before the delimiter: each number column (every value, or 98%,
         fits a convention) votes for the convention of its values that only one convention
         reads ('398.53', '0.250' and '1,234.5' have a decimal point, '12,5' and '1.234,5' a
-        decimal comma; a time of day such as '10.15' is no evidence). The delimiter alone read
-        every '16.469' kg in a semicolon file as 16469, beside a price of '398.53' in the same
-        row that only a decimal point writes. Only one-sided evidence overrides the dialect:
-        with votes for both, or none, the dialect decides, as it did for every file at
-        07fa450. A majority vote let two GPS columns ('54.565860') outvote a turnover written
+        decimal comma). The dialect decides unless the votes are unanimous against it and
+        strong: some column of the winning side writes a thousands group and a decimal
+        separator in one value ('1,234.56' in a semicolon file, '"1.234,56"' in a comma file).
+
+        740ddae let any one-sided evidence override the dialect, because a semicolon file's
+        '398.53' prices only a decimal point writes made its '16.469' kg 16469. But what a
+        decimal point writes in every locale reads the same: versions '2.23', factors '0.95',
+        GPS '48.154041', day.month dates '21.02', times '10.15'; each made a semicolon file's
+        downloads '43.445' 43.445 (07fa450: 43445). In a comma file a survey's quoted choices
+        '"2,4"' made its incomes '"238,308"' 238.308; c5237d3, which no longer counted
+        H.MM-looking values ('0.25', '$12.50') as points, took away what had made such a file
+        mixed. Nothing tells a price from a version, or '"12,50"' from a choice '"10,15"', so
+        such evidence leaves the dialect's reading, 07fa450's, with the note that says it was
+        assumed. A majority vote, before that, let two GPS columns outvote a turnover written
         '1.093.086,46' in the same row, and every visitor count '11.753' was read as 11.753.
         """
         if self._file_decimal_comma is None:
             texts = self.con.sql(f"SELECT * FROM {self.table} LIMIT 0")
             sources = [c for c, t in zip(texts.columns, texts.types, strict=True) if t == "VARCHAR"]
-            point_votes = comma_votes = 0
+            point_votes = comma_votes = point_proofs = comma_proofs = 0
             for start in range(0, len(sources), _BATCH):
                 aggs: list[str] = []
                 batch = [ident(s) for s in sources[start : start + _BATCH]]
@@ -651,28 +663,27 @@ class TypeInferrer:
                         f"count_if({point} OR {comma})",
                         f"count_if({point} AND NOT {comma})",
                         f"count_if({comma} AND NOT {point})",
-                        f"count_if({_match(e.n, _RE_CLOCK)})",
+                        f"count_if({_match(e.n, _RE_US_PROOF)})",
+                        f"count_if({_match(e.n, _RE_EU_PROOF)})",
                     ]
                 row = self.con.sql(f"SELECT {', '.join(aggs)} FROM {table}").fetchone()
                 assert row is not None
-                for i in range(0, len(aggs), 5):
-                    n, fit, point_only, comma_only, clock = (int(x or 0) for x in row[i : i + 5])
-                    # '10.15' is no evidence of a decimal point: a 'dato;tid;antal' file's times
-                    # made every count '1.000' 1.0. Every clock value is point-only.
-                    point_only -= clock
+                for i in range(0, len(aggs), 6):
+                    n, fit, point_only, comma_only, us_proof, eu_proof = (
+                        int(x or 0) for x in row[i : i + 6]
+                    )
                     tolerant = n >= MIN_ROWS_FOR_TOLERANCE
                     if n and (fit == n or (tolerant and fit >= MIN_FIT * n)):
-                        comma_votes += comma_only > point_only
-                        point_votes += point_only > comma_only
-            # Only one-sided evidence overrides the dialect. A file holding columns of both
-            # conventions is mixed: GPS coordinates from another system ('54.565860') beside
-            # amounts written '1.093.086,46' outvoted them, and visitors '11.753' became 11.753.
-            if comma_votes and point_votes:
-                self._file_decimal_comma = self.prefer_decimal_comma
+                        if point_only > comma_only:
+                            point_votes += 1
+                            point_proofs += us_proof > 0
+                        elif comma_only > point_only:
+                            comma_votes += 1
+                            comma_proofs += eu_proof > 0
+            if self.prefer_decimal_comma:
+                self._file_decimal_comma = not (point_votes and point_proofs and not comma_votes)
             else:
-                self._file_decimal_comma = bool(comma_votes) or (
-                    self.prefer_decimal_comma and not point_votes
-                )
+                self._file_decimal_comma = bool(comma_votes and comma_proofs and not point_votes)
         return self._file_decimal_comma
 
     def cast_text(self, source: str, type_name: str, sql_type: str) -> str:

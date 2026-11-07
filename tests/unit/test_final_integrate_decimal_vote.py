@@ -11,8 +11,9 @@ A file with columns of both conventions is mixed: the dialect decides, as it did
 And a time of day written H.MM ('10.15', as Danish and Finnish files write it) is no decimal
 point: the times of a 'dato;tid;antal' file were its only evidence, and its counts '1.000'
 became 1.0 (1000 at 07fa450).
-A semicolon file whose only evidence is '398.53' still reads dot decimals
-(``test_final_data_decimals.py``).
+A semicolon file whose only evidence is '398.53' read dot decimals here; it reads as 07fa450 did
+now, since only a value with a thousands group and a decimal separator overrides the dialect
+(``test_final_verify_decimal_dialect.py``).
 """
 
 from __future__ import annotations
@@ -76,12 +77,27 @@ def test_times_of_day_are_no_decimal_point(tmp_path: Path) -> None:
 
 
 def test_one_sided_evidence_still_decides(tmp_path: Path) -> None:
-    # Only points (a price no comma convention writes): '1.234' is a decimal, as before.
+    # This asserted 1.234 beside '398.53' and 1234 beside '"{i},50"': one-sided evidence of any
+    # kind decided. Versions and quoted choices are written the same and read counts 1000x off
+    # where 07fa450 read them right, so only proof decides now (a thousands group and a
+    # decimal separator in one value); with less, '1.234' is read by the delimiter.
     lines = ["sku;price;weight"] + [f"A{i};{398 + i}.53;{i + 1}.234" for i in range(30)]
-    assert _convert(tmp_path, "p.csv", lines)["weight"] == [i + 1.234 for i in range(30)]
-    # Only commas: '1.234' is a thousands group.
+    assert _convert(tmp_path, "p.csv", lines)["weight"] == [(i + 1) * 1000 + 234 for i in range(30)]
+    lines = ["sku;price;weight"] + [f"A{i};1,{398 + i}.53;{i + 1}.234" for i in range(30)]
+    assert _convert(tmp_path, "p2.csv", lines)["weight"] == [i + 1.234 for i in range(30)]
+    lines = ["sku,price,weight"] + [f'A{i},"{i},50",{i + 1}.234' for i in range(30)]
+    assert _convert(tmp_path, "q.csv", lines)["weight"] == [i + 1.234 for i in range(30)]
+    lines = ["sku,price,weight"] + [f'A{i},"1.{398 + i},50",{i + 1}.234' for i in range(30)]
+    assert _convert(tmp_path, "q2.csv", lines)["weight"] == [
+        (i + 1) * 1000 + 234 for i in range(30)
+    ]
+    # This asserted 1000x for '"{i},5"' too. But a comma file quotes a one-digit pair as often
+    # as a decimal ('"2,4"' choices, a '"4,5"' rating), and the same shape made a survey's
+    # incomes '"238,308"' 238.308 where 07fa450 read 238308: a one-digit fraction is no
+    # evidence against a decimal point (test_final_verify_decimal_dialect.py), and '1.234' is
+    # read by the delimiter, as at 07fa450.
     lines = ["sku,price,weight"] + [f'A{i},"{i},5",{i + 1}.234' for i in range(30)]
-    assert _convert(tmp_path, "q.csv", lines)["weight"] == [(i + 1) * 1000 + 234 for i in range(30)]
+    assert _convert(tmp_path, "r.csv", lines)["weight"] == [i + 1.234 for i in range(30)]
 
 
 def _flat(texts: Iterable[str]) -> str:
@@ -90,10 +106,18 @@ def _flat(texts: Iterable[str]) -> str:
 
 def test_the_docs_state_the_rule_as_the_code_applies_it() -> None:
     guide = _flat((ROOT / "docs" / "agents-guide.md").read_text(encoding="utf-8").splitlines())
+    # This also pinned "a time of day written `10.15` is no evidence" and "when they agree, then
+    # the delimiter": only proof (a thousands group with a decimal separator) overrides now.
     assert (
-        "The other columns decide only when they agree: a file with columns of both conventions "
-        "(GPS coordinates `54.565860` beside amounts `1.093.086,46`) is read by its delimiter, "
-        "and a time of day written `10.15` is no evidence."
+        "The other columns decide only with proof: they agree, and one of them writes a "
+        "thousands group and a decimal separator in one value"
     ) in guide
+    assert (
+        "a file with columns of both conventions (GPS coordinates `54.565860` beside amounts "
+        "`1.093.086,46`) is read by its delimiter"
+    ) in guide.replace("A file with", "a file with")
     readme = _flat((ROOT / "README.md").read_text(encoding="utf-8").splitlines())
-    assert "then the file's other number columns when they agree, then the delimiter" in readme
+    assert (
+        "then the file's other number columns when they agree and one writes a thousands group "
+        "with a decimal separator, else the delimiter"
+    ) in readme

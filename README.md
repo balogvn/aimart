@@ -239,7 +239,8 @@ Any of these can also arrive gzip-, bz2- or zip-compressed. Detection uses magic
 extensions. Every column in the report carries its type, null count, rejected values with
 examples, and notes on anything the service assumed: "assumed day-first", "ambiguous
 thousands/decimal separator; assumed a decimal comma, so '1.234' is 1234" (the column's own
-values decide, then the file's other number columns when they agree, then the delimiter), "values without a
+values decide, then the file's other number columns when they agree and one writes a thousands group with a
+decimal separator, else the delimiter), "values without a
 UTC offset were read as UTC (k of n)", "values with a UTC offset were rejected (k of n)" or
 "converted to UTC", and "zone 'BST' was not read as a zone (k of n)" for a zone abbreviation
 with several meanings (BST, IST, CST, ...; only offsets, UTC, IANA names and GMT, EST, MST,
