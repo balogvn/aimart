@@ -10,6 +10,12 @@ Location header with a space failed the same way on the next hop.
 Now spaces and control characters in the path, query and fragment are percent-encoded (h11
 takes only 0x21-0x7E there), and leading and trailing ones are stripped first, as WHATWG does.
 A host with a space or control character can never resolve: that is refused before the quote.
+
+Two over-reaches of that fix, both after the verify or before the quote of a URL 07fa450 served
+and settled: a tab in a Location header was percent-encoded ('/x.c%09sv', a 404 and an unsettled
+422; a host '127.0.0.1%09'), where WHATWG and urllib remove tabs and line breaks from a URL; and
+a space in the userinfo ('http://user:p w@host/x.csv') was refused as a space in the host,
+though userinfo is never sent (no Authorization header goes out).
 """
 
 from __future__ import annotations
@@ -37,12 +43,20 @@ CSV = b"a,b\n1,2\n3,4\n"
 
 class Files(BaseHTTPRequestHandler):
     requests: ClassVar[list[str]] = []
+    authorization: ClassVar[list[str | None]] = []
 
     def do_GET(self) -> None:
         self.requests.append(self.path)
-        if self.path == "/moved":
+        self.authorization.append(self.headers.get("Authorization"))
+        port = self.server.server_address[1]
+        location = {
+            "/moved": "/my file.csv",
+            "/tab-in-path": "/x.c\tsv",
+            "/tab-in-host": f"http://127.0.0.1\t:{port}/x.csv",
+        }.get(self.path)
+        if location is not None:
             self.send_response(302)
-            self.send_header("Location", "/my file.csv")
+            self.send_header("Location", location)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
@@ -66,6 +80,7 @@ def base(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     httpd.daemon_threads = True
     port = httpd.server_address[1]
     Files.requests = []
+    Files.authorization = []
     monkeypatch.setattr(sources, "ALLOWED_PORTS", frozenset({80, 443, 8080, 8443, port}))
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -84,6 +99,10 @@ FETCHABLE = [
     ("/x.csv \n\t", "/x.csv"),
     ("/x.csv?q=a b", "/x.csv?q=a%20b"),
     ("/moved", "/my%20file.csv"),  # a Location header with a space, followed
+    # A tab is removed from a Location, as WHATWG and urllib do; before: '/x.c%09sv', a 404, and
+    # a host '127.0.0.1%09' that could not resolve, each a 422 after the verify.
+    ("/tab-in-path", "/x.csv"),
+    ("/tab-in-host", "/x.csv"),
 ]
 
 
@@ -100,6 +119,27 @@ async def test_a_paid_convert_of_a_url_with_spaces_is_served_and_settled(
     assert r.status_code == 200, r.text
     assert r.json()["report"]["rows"] == 2
     assert Files.requests[-1] == target
+    assert len(fake.verified) == 1
+    assert len(fake.settled) == 1
+
+
+@pytest.mark.parametrize("userinfo", ["user:p w@", "my user@", "u:\x01@"])
+async def test_a_space_in_the_userinfo_is_fetched_without_it_and_settled(
+    userinfo: str, base: str, make_settings: Callable[..., Settings]
+) -> None:
+    """Before: 422 url_not_allowed "The URL's host contains a space or a control character."
+    before the quote; 07fa450 fetched '/x.csv' and settled. Userinfo is never sent."""
+    fake = kit.FakeFacilitator()
+    settings = make_settings(allow_private_urls=True)
+    url = base.replace("http://", "http://" + userinfo) + "/x.csv"
+    async with kit.running_app(settings, facilitator=fake) as h:
+        quote = await h.http.post("/v1/convert", json={"url": url})
+        assert quote.status_code == 402, quote.text
+        r = await h.paying.post("/v1/convert", json={"url": url})
+    assert r.status_code == 200, r.text
+    assert r.json()["report"]["rows"] == 2
+    assert Files.requests == ["/x.csv"]
+    assert Files.authorization == [None]
     assert len(fake.verified) == 1
     assert len(fake.settled) == 1
 
@@ -149,6 +189,11 @@ def test_validate_url_encodes_what_h11_refuses_in_a_target() -> None:
     assert validate_url(signed) == signed
     with pytest.raises(UrlNotAllowed, match="contains a space or a control character"):
         validate_url("https://e.exa\x00mple/x.csv")
+    with pytest.raises(UrlNotAllowed, match="contains a space or a control character"):
+        validate_url("https://u:p@e.exa mple/x.csv")  # the host after the userinfo still counts
+    assert sources._redirect_target("https://e.example/d/", b"\x01 a\tb\r\n.csv\x00") == (
+        "https://e.example/d/ab.csv"
+    )
     assert sources._redirect_target("https://e.example/d/", b"my file.csv") == (
         "https://e.example/d/my%20file.csv"
     )

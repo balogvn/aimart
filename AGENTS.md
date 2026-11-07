@@ -96,7 +96,9 @@ Module docstrings explain the why; read the one you are about to change.
 - `provenance.py`: ML-DSA-65 manifests and signatures for every hosted artifact.
 - `sources.py`: SSRF-safe URL fetch (validated IPs at connect time, re-checked redirects, port
   allow-list, size cap; spaces, controls and non-ASCII in a path, query or Location
-  percent-encoded, since h11 takes only 0x21-0x7E in a request target; `downloads_deadline`,
+  percent-encoded, since h11 takes only 0x21-0x7E in a request target, after tabs and line
+  breaks are removed from a Location as WHATWG does; a space only in the host, not the userinfo,
+  which is never sent, is refused; `downloads_deadline`,
   opened by `Service._job`, gives all of a call's URL downloads one `fetch_timeout_s`),
   `check_base64` (exact: the standard or URL-safe alphabet, whitespace ignored, padding
   completed, a `data:` URL only with a `base64` parameter, every other character, or an empty

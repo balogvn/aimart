@@ -231,7 +231,10 @@ def validate_url(url: str, *, allow_private: bool = False) -> str:
         raise UrlNotAllowed(
             "The URL's host is not ASCII.", hint="Use the host's ASCII (xn--) form."
         )
-    if _SPACE_OR_CONTROL.search(parts.netloc):
+    # The host and port only: userinfo is never sent (no Authorization header goes out), so
+    # 'http://user:p w@host/x.csv' fetches '/x.csv' from host, as at 07fa450. Checked whole,
+    # the netloc refused it before the quote as "a space in the host": a lost sale.
+    if _SPACE_OR_CONTROL.search(parts.netloc.rpartition("@")[2]):
         raise UrlNotAllowed(
             "The URL's host contains a space or a control character.", hint="Check the URL."
         )
@@ -356,8 +359,16 @@ async def fetch_url(
 def _redirect_target(current: str, location: bytes) -> str:
     """Where a Location header points, as ASCII: raw non-ASCII bytes (servers send UTF-8 there)
     are percent-encoded byte for byte, so the next request names exactly what the server sent.
-    So are spaces and control characters, which h11 refuses in the next request's target."""
-    raw = _UNTARGETABLE_BYTE.sub(lambda m: b"%%%02X" % m[0][0], location.strip())
+    So are spaces and control characters, which h11 refuses in the next request's target.
+
+    Leading and trailing controls and spaces are stripped, and tabs and line breaks removed,
+    first, as WHATWG (and urllib's urlsplit, which 07fa450 joined with) do for any URL: encoded,
+    'Location: /x.c<TAB>sv' was fetched as '/x.c%09sv', a 404, and a tab after the host made
+    it '127.0.0.1%09', which never resolves: each a 422 after the verify for a redirect 07fa450
+    followed and settled.
+    """
+    raw = location.strip(_C0_OR_SPACE.encode()).translate(None, b"\t\r\n")
+    raw = _UNTARGETABLE_BYTE.sub(lambda m: b"%%%02X" % m[0][0], raw)
     escaped = raw.decode("ascii")
     try:
         return urljoin(current, escaped)
