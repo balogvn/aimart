@@ -106,10 +106,13 @@ def encoding_problem(name: str) -> str | None:
     ``codecs.lookup`` also finds codecs that are not text encodings at all: decoding with
     'rot13' raised TypeError and 'base64' AssertionError, a bare 500 after payment. 'idna'
     refuses the "replace" error handler every transcode uses, and 'undefined' refuses all input.
+    A name with a NUL in it ('utf-8\\x00') makes ``lookup`` raise ValueError, not LookupError:
+    the pre-quote check, which handles only AimartError, then crashed into the 500 that says
+    "Retry", on every route, for a name that can never work.
     """
     try:
         info = codecs.lookup(name)
-    except LookupError:
+    except (LookupError, ValueError):
         return f"Unknown encoding {name!r}."
     if not info._is_text_encoding:  # bytes-to-bytes (base64, zlib) or str-to-str (rot13)
         return f"{name!r} is not a text encoding."
