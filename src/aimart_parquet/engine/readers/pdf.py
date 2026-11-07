@@ -1145,13 +1145,16 @@ def _continuation(
     return None
 
 
-def _spilled_body(table: _Table, rows: list[list[str]]) -> list[list[str]]:
+def _spilled_body(table: _Table, rows: list[list[str]]) -> tuple[list[list[str]], bool]:
     """The leading ``rows`` of a page read at ``table``'s column edges (``_spilled_rows``) that
     are rows of its body: data rows, written like the body (``_typed_like``) and filling cells
     a body row fills, and section rows shaped like the body's ('South') above data rows.
     Nothing tells them from the page's other text but how they look, so a page number or a
-    date alone under a number column ('4', '2025-01-31') is not taken, and nothing is taken
-    from a page that holds a table of its own below them.
+    date alone under a number column ('4', '2025-01-31') is not taken.
+
+    And whether they surely are its body: not when a table of its own follows them on the page
+    with no header between that says where it starts. ``_merge`` splits such rows off instead
+    of merging them, as it splits any page it cannot place.
     """
     typed = table.typed()
     forms = table.forms(typed)
@@ -1166,7 +1169,10 @@ def _spilled_body(table: _Table, rows: list[list[str]]) -> list[list[str]]:
     def body(row: list[str]) -> bool:
         return data(row) or _section_row(table, row)
 
-    end = next((i for i, row in enumerate(rows) if not body(row)), len(rows))
+    end = next(
+        (i for i, row in enumerate(rows) if not body(row) or _scale_header(row, typed)),
+        len(rows),
+    )
     while end and not data(rows[end - 1]):  # a section row heads data rows, or is not body
         end -= 1
     # A spill is the table's last one or two rows: text alignment sees a table from three.
@@ -1174,10 +1180,27 @@ def _spilled_body(table: _Table, rows: list[list[str]]) -> list[list[str]]:
     # not read (its first column wraps), whose first row (a header of scale points, '1'..'5')
     # only looked like body: taken, it was a junk row of this table, 21 rows for 20 under
     # "merged a table that continues across 2 pages". Not merging is what 07fa450 did.
+    # The row that ends the body says more: a scale header ends it (with one or two statements
+    # below, too few to count, it was still taken as a row), and when that row is another
+    # table's header, the rows above it are this table's spill. Otherwise they may be the
+    # other table's first rows: not merged, but not dropped either (a84df39 dropped them, and
+    # the last rows of a table spilled above a table of statements were lost, 40 of 45, with
+    # no warning): ``_merge`` splits them off, a second table the 'found N tables' names.
     valued = [r for r in rows[end:] if sum(_kind(_cell(r, c)) in _TYPED for c in typed) >= 2]
-    if len(valued) >= 3:
-        return []
-    return rows[:end]
+    headed = end < len(rows) and (
+        _names(rows[end], typed, table.rows) >= len(typed) or _scale_header(rows[end], typed)
+    )
+    return rows[:end], headed or len(valued) < 3
+
+
+def _scale_header(row: list[str], typed: list[int]) -> bool:
+    """A header of scale points over the typed columns ('Statement', '1', ..., '5'): three or
+    more typed cells holding consecutive integers from 0 or 1."""
+    values = [_cell(row, c) for c in typed]
+    if len(values) < 3 or not all(v.isascii() and v.isdigit() for v in values):
+        return False
+    first = int(values[0])
+    return first in {0, 1} and [int(v) for v in values] == list(range(first, first + len(values)))
 
 
 def _squashed(text: str) -> str:
@@ -1276,7 +1299,8 @@ def _merge(found: list[_Found]) -> list[_Table]:
                 # is reported ('found 2 tables') as any other page's split, not dropped.
                 if last is None or last_page != item.page - 1:
                     continue
-                if not (rows := _spilled_body(last, rows)):
+                rows, _ = _spilled_body(last, rows)  # split off whether it is sure or not
+                if not rows:
                     continue
             last = _Table(
                 header=header,
@@ -1288,8 +1312,21 @@ def _merge(found: list[_Found]) -> list[_Table]:
             tables.append(last)
             last_page = item.page
             continue
-        if item.spill and not (body := _spilled_body(target, body)):
-            continue
+        if item.spill:
+            body, sure = _spilled_body(target, body)
+            if not body:
+                continue
+            if not sure:  # perhaps another table's first rows: split off, as an unplaced page
+                last = _Table(
+                    header=[""] * len(target.header),
+                    rows=body,
+                    pages=[item.page],
+                    strategy=item.strategy,
+                    captions=list(item.captions),
+                )
+                tables.append(last)
+                last_page = item.page
+                continue
         target.add(body)
         target.pages.append(item.page)
         target.captions.extend(item.captions)

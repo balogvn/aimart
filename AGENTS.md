@@ -462,12 +462,16 @@ each test's docstring has the incident.
   'Cont.' inside a header are column names. Anything else splits the page off ('found N
   tables'): a split is a reported partial result, a different table merged in is silent wrong
   data. The last one or two rows of a borderless table, alone on its last page, are read at the
-  previous page's column edges and kept only when they look like body, and never from a page
-  where three more rows hold values under two typed columns: that is a table alignment could
-  not read, and its header of scale points ('Statement', '1', ..., '5') was taken as a row.
-  (`unit/test_fix_pdf_reader.py`, `unit/test_fix_pdf_detect.py`, `unit/test_final_data_pdf.py`,
-  `unit/test_final_data_pdf_next_page.py`, `unit/test_final_data_pdf_page_tops.py`,
-  `unit/test_final_data_pdf_header_lines.py`, `unit/test_final_integrate_pdf_spill.py`)
+  previous page's column edges and kept only when they look like body. A header of scale
+  points ('Statement', '1', ..., '5') ends them (it was taken as a row), and so does another
+  table's header, which keeps the rows above it. Below rows with no such header, three more
+  rows holding values under two typed columns are a table alignment could not read, and the
+  rows above may be its first: they are split off as a table of their own ('found N tables'),
+  neither merged (a junk row) nor dropped (a84df39 lost 5 of 45 rows with no warning).
+  (`unit/test_fix_pdf_reader.py`, `unit/test_fix_pdf_detect.py`,
+  `unit/test_final_data_pdf.py`, `unit/test_final_data_pdf_next_page.py`,
+  `unit/test_final_data_pdf_page_tops.py`, `unit/test_final_data_pdf_header_lines.py`,
+  `unit/test_final_integrate_pdf_spill.py`, `unit/test_final_verify_pdf_spill.py`)
 - **One job taking the instance down** (a 1.6 KB PDF reached 2 GB in 15 s): the RSS watchdog,
   the per-job temp directory (it holds a query's linked inputs: RAM on Cloud Run), and crash text
   kept out of responses. (`integration/test_isolate.py`) The cap counts the job's temporary
