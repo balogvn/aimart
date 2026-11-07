@@ -34,6 +34,7 @@ from x402.schemas.config import ResourceConfig
 
 from aimart_parquet.artifacts import discard_withheld, outputs_of
 from aimart_parquet.config import PAYMENT_WINDOW_S, SETTLE_MARGIN_S, NetworkMode, Settings
+from aimart_parquet.errors import AimartError
 from aimart_parquet.payments.bazaar import EXAMPLES
 from aimart_parquet.payments.mcp_gate import X402McpGate, payments_unavailable
 from aimart_parquet.payments.pricing import Operation, active_operations, usd_to_atomic
@@ -80,6 +81,17 @@ def facilitator_urls(settings: Settings) -> list[str]:
     if settings.facilitator_urls:
         return [u.strip() for u in settings.facilitator_urls.split(",") if u.strip()]
     return list(DEFAULT_FACILITATORS[settings.network_mode])
+
+
+class ClientDisconnected(AimartError):
+    """The caller hung up before its response was ready: nobody receives it, so it is unpaid.
+
+    499 is nginx's "client closed request"; no standard status says it, and nobody reads it
+    but the access log.
+    """
+
+    code = "client_disconnected"
+    http_status = 499
 
 
 class Payments:
@@ -253,6 +265,12 @@ class Payments:
         otherwise: a failed settlement turns the route's 200 into a 402 and withholds the body,
         so that output was never paid for and must not stay, or have evicted anyone, in the
         artifact budget.
+
+        A paid response whose client has disconnected becomes a 499 before the SDK settles it:
+        the SDK settled every response below 400, so a caller that hung up while its call ran
+        (its own timeout, or the front end's 504 at Cloud Run's request timeout) was charged
+        for a response it never received. A disconnect during the settlement itself still
+        settles; the request timeout is the payment window, past which nothing can.
         """
         inner = payment_middleware(self.routes(), self.server, sync_facilitator_on_start=False)
         paid = {(op.method, op.path) for op in active_operations(self.settings)}
@@ -276,9 +294,21 @@ class Payments:
                 log.exception("facilitator initialization failed")
                 unavailable = payments_unavailable()
                 return JSONResponse(unavailable.to_dict(), status_code=unavailable.http_status)
+
+            async def served(req: Request) -> Response:
+                response = await call_next(req)
+                if response.status_code < 400 and await req.is_disconnected():
+                    gone = ClientDisconnected(
+                        "The client disconnected before the response was ready.",
+                        hint="Retry the call; you were not charged.",
+                    )
+                    log.warning("paid response withheld: the client disconnected")
+                    return JSONResponse(gone.to_dict(), status_code=gone.http_status)
+                return response
+
             with outputs_of(store) as produced:
                 try:
-                    response = await inner(request, call_next)
+                    response = await inner(request, served)
                 except BaseException:
                     withhold(produced, "handler_raised")
                     raise

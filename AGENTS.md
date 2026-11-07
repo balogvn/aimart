@@ -134,7 +134,9 @@ Module docstrings explain the why; read the one you are about to change.
 - `payments/`: `pricing.py` (`OPERATIONS`, the single source of prices, routes and tool names;
   `usd_to_atomic`), `__init__.py` (`Payments`: x402 resource server, REST route configs with the
   Bazaar extension, lazy facilitator init, price-floor check; `http_middleware(prevalidate=,
-  store=)` commits or deletes a paid call's outputs from its final status), `mcp_gate.py` (x402
+  store=)` commits or deletes a paid call's outputs from its final status, and makes a paid
+  response whose client has disconnected a 499 `client_disconnected` before the SDK settles
+  it), `mcp_gate.py` (x402
   for MCP tool calls, same commit or delete), `bazaar.py` (catalog examples).
 - `mcp/server.py`: `build_mcp(...)`, the tools and their descriptions (the whole interface an
   agent sees). Remote: `convert_to_parquet` takes `url`/`content_base64`/`artifact_id`, every
@@ -479,14 +481,20 @@ each test's docstring has the incident.
   (`integration/test_final_isolate_disk.py`, `integration/test_final_integrate_stream_cap.py`)
   A non-UTF-8 text's decompressed copy is deleted once its UTF-8 copy is written
   (`unit/test_final_integrate_transcode_files.py`).
+- **Charged for a response nobody received.** Cloud Run's 120 s request timeout answered 504
+  to paid calls the payment window lets run 300 s, and the x402 middleware settled one that
+  finished afterwards; a caller that hung up was settled the same way. The timeout is the
+  window (`deploy.yml`), and a paid REST response whose client is gone is a 499, unsettled.
+  (`unit/test_final_verify_deploy_timeout.py`, `integration/test_final_verify_disconnect.py`)
 
 Known gaps: ISO date formats accept 1-digit years ('1/2/3' becomes 0001-02-03); JSON timestamps
 that all carry offsets become naive UTC with no note. A semicolon file whose only evidence of
 a decimal point has no thousands group ('398.53' prices) reads its '16.469' kg as 16469, and a
 tab file whose EU amounts ('96.076,50') sit beside H.MM times ('6.48') reads counts '43.445' as
 43.445: the dialect's reading, as at 07fa450, with the note that says it was assumed (the same
-evidence also comes from versions and times, which made right counts wrong). In
-PDFs, a different table after a table's
+evidence also comes from versions and times, which made right counts wrong). An
+MCP tool call whose HTTP client disconnected is still settled when it succeeds: the gate has no
+view of the connection (REST checks it before settling). In PDFs, a different table after a table's
 last row on a continuation page is appended to it (strict xfail
 `unit/test_final_data_pdf_next_page.py::test_a_different_table_after_the_last_row_is_not_appended`:
 its only sign, a row naming every typed column, is also what a first suppressed row such as
