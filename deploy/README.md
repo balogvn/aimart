@@ -359,31 +359,38 @@ polls every 0.1 s, so a job allocating fast passes the cap by what it gains in o
 | a job's files in `/tmp` | the upload (≤ 50 MB) + the staged text (18-31% of the CSV) + the output (20-33%) + spill (`sort_by` only, ≤ 300 MiB). A gzip of CSV or TSV is never unpacked: DuckDB reads UTF-8 from it, and other text is transcoded from it, its UTF-8 version on disk while it is read. A bz2 or zip is unpacked (≤ 256 MB, `AIMART_MAX_DECOMPRESSED_BYTES`), plus a UTF-8 version while one that is not UTF-8 is transcoded, which then replaces the unpacked text. Whatever the reader read is deleted once it returns |
 | stored artifacts without a bucket | ≤ `AIMART_ARTIFACT_MAX_TOTAL_BYTES` (256 MiB) |
 
-Measured at the merge of 1886f60 into d83c738 in the isolated child with the defaults, against d83c738 (before a gzip was
-read where it lies), on macOS on Apple silicon: the watchdog's own peak readings, in MiB. Linux,
-where production runs, was not measured; there the child's resident memory also counts the ~160
-MB of pages it shares with the forkserver, which macOS counts elsewhere. The first five ran with
-the input caps as they are, the rest with `AIMART_MAX_INPUT_BYTES` and
-`AIMART_MAX_DECOMPRESSED_BYTES` raised so the file reached the engine. Each input was written
-into the call's work directory, as an upload is, and counted.
+Measured at faaeaed in the isolated child with the defaults, beside d83c738 (before a gzip was
+read where it lies and the unpacked text deleted once read), on macOS on Apple silicon with
+other work running: the watchdog's own peak readings, in MiB. Linux, where production runs, was
+not measured; there the child's resident memory also counts the ~160 MB of pages it shares
+with the forkserver, which macOS counts elsewhere. The first five ran with the input caps as
+they are, the rest with `AIMART_MAX_INPUT_BYTES` and `AIMART_MAX_DECOMPRESSED_BYTES` raised so
+the file reached the engine. Each input was written into the call's work directory, as an
+upload is, and counted.
 
 | CSV (decompressed), as sent | result | process | files | in all | at d83c738 (files) | seconds |
 |---|---|---|---|---|---|---|
-| 255 MiB, 39 MB of gzip | converted | 191 | 46 | 232 | 509 (301) | 39 |
-| 230 MiB of orders, 47 MB of gzip | converted | 221 | 52 | 274 | 491 (286) | 27 |
-| the same orders in cp1252, 47 MB of gzip | converted | 286 | 282 | 552 | 601 (433) | 27 |
-| the same in cp1252, 24 MB of bz2 | converted | 284 | 476 | 651 | 627 (455) | 32 |
-| the same in cp1252, 47 MB of zip | converted | 285 | 506 | 683 | 655 (479) | 27 |
-| 198 MiB, 71 MiB of gzip | converted | 207 | 144 | 352 | 532 (342) | 17 |
-| 198 MiB in cp1252, 71 MiB of gzip | converted | 207 | 305 | 496 | 575 (365) | 17 |
-| 198 MiB, 51 MiB of bz2 | converted | 200 | 286 | 450 | 543 (337) | 19 |
-| 198 MiB, 71 MiB of zip | converted | 204 | 304 | 463 | 530 (342) | 16 |
-| 446 MiB, 159 MiB of gzip | converted | 188 | 335 | 489 | 413 at the cap: 737 (606) | 79 |
-| 429 MiB, uncompressed | 413 at the cap | 149 | 562 | 700 | - | 30 |
-| 95 MiB, uncompressed, with `sort_by` | converted | 337 | 132 | 469 | 469 (130) | 8 |
-| 191 MiB, uncompressed, with `sort_by` | 413 at the cap | 475 | 229 | 704 | 413 at the cap: 701 (229) | 14 |
-| 198 MiB as gzip, with `sort_by` | converted | 486 | 169 | 655 | 413 at the cap: 703 (304) | 17 |
-| 446 MiB as gzip, with `sort_by` | 413 at the cap | 502 | 268 | 770 | 413 at the cap: 734 (605) | 35 |
+| 255 MiB, 37 MiB of gzip | converted | 198 | 47 | 245 | 492 (301) | 14 |
+| 230 MiB of orders, 45 MiB of gzip | converted | 204 | 51 | 256 | 487 (286) | 10 |
+| the same orders in cp1252, 45 MiB of gzip | converted | 284 | 282 | 533 | 581 (411) | 10 |
+| the same in cp1252, 23 MiB of bz2 | converted | 285 | 451 | 622 | 565 (395) | 12 |
+| the same in cp1252, 45 MiB of zip | converted | 282 | 438 | 609 | 603 (432) | 10 |
+| 198 MiB, 71 MiB of gzip | converted | 222 | 145 | 367 | 553 (343) | 18 |
+| 198 MiB in cp1252, 71 MiB of gzip | converted | 230 | 305 | 496 | 571 (421) | 17 |
+| 198 MiB, 51 MiB of bz2 | converted | 207 | 298 | 460 | 548 (336) | 19 |
+| 198 MiB, 71 MiB of zip | converted | 205 | 304 | 463 | 553 (343) | 16 |
+| 446 MiB, 159 MiB of gzip | converted | 178 | 336 | 506 | 413 at the cap: 738 (606) | 38 |
+| 429 MiB, uncompressed | 413 at the cap | 172 | 544 | 701 | 413 at the cap: 700 (550) | 26 |
+| 95 MiB, uncompressed, with `sort_by` | converted | 336 | 132 | 468 | 471 (134) | 8 |
+| 191 MiB, uncompressed, with `sort_by` | 413 at the cap | 473 | 229 | 702 | 413 at the cap: 704 (229) | 14 |
+| 198 MiB as gzip, with `sort_by` | converted | 485 | 168 | 654 | 413 at the cap: 710 (304) | 17 |
+| 446 MiB as gzip, with `sort_by` | 413 at the cap | 467 | 239 | 707 | 413 at the cap: 703 (605) | 34 |
+
+The bz2 and zip peaks last an instant, at the end of the transcode, so the 0.1 s poll catches
+them unevenly: over three runs each, 436-456 MiB of files for the bz2 and 395-484 for the zip
+at faaeaed, 395-489 and 389-432 at d83c738, the same work in both (the upload, the unpacked
+text and its whole UTF-8 version). Without the job cap the 446 MiB gzip needs 177 MiB of
+process and 336 MiB of files (211 + 782 at d83c738, its unpacked text on disk to the end).
 
 Before the staged reader (`main` at e8d228e, in process, files not counted), the 191 MiB CSV
 peaked at 622-815 MiB resident, a 446 MiB one at 1.17-1.19 GiB and the 40-column one at
@@ -392,13 +399,13 @@ peaked at 622-815 MiB resident, a 446 MiB one at 1.17-1.19 GiB and the 40-column
 What that means for the default deploy (1 vCPU, 2 GiB, `AIMART_MAX_CONCURRENT_JOBS=2`):
 
 - **The input caps bind first.** A CSV reaches the engine only if it is under 50 MB on the wire
-  and 256 MB decompressed, and every such file measured converted. A gzip's files are the
-  upload, the staged text and the output (232-552 MiB in all); one that is not UTF-8 adds its
-  UTF-8 version while it is read. A bz2 or zip is unpacked first, so the same 230 MiB of cp1252
-  orders, its unpacked text and its UTF-8 version both on disk while it is transcoded, peaked
-  at 651 (bz2) and 683 MiB (zip), close to the cap: with Linux's shared pages counted such a
-  file may be a 413, unpaid (it was at d83c738 too). The 6-column test CSV compressed 3.3:1, so
-  as gzip it is refused at the 50 MB cap from about 165 MB.
+  and 256 MB decompressed, and every such file measured converted. Sent as gzip, its files are
+  the upload, the staged text and the output (about 50 MiB here; 245-256 MiB in all), and text
+  that is not UTF-8 adds its UTF-8 version while it is read (533 MiB). A bz2 or zip is unpacked
+  first, so the same cp1252 orders, their unpacked text and its UTF-8 version both on disk while
+  it is transcoded, peaked at 574-664 MiB, close to the cap, as at d83c738: with Linux's shared
+  pages counted such a file may be a 413, unpaid. The 6-column test CSV compressed 3.3:1, so as
+  gzip it is refused at the 50 MB cap from about 165 MB.
 - **A job's files, not its process, decide what converts:** for a gzip, the upload plus about
   0.4-0.65 times the CSV (its staged copy and the output); for a bz2, zip or uncompressed CSV,
   the unpacked text or the upload as well. With the input caps raised a 446 MiB CSV sent as
@@ -410,7 +417,7 @@ What that means for the default deploy (1 vCPU, 2 GiB, `AIMART_MAX_CONCURRENT_JO
   gzip, while 200 MB uncompressed is refused (413).
 - **Two jobs at the cap** hold 1.4 GB next to ~500 MB for the API and the forkserver. Stored
   artifacts in `/tmp` come on top, so without a bucket the instance can still run out.
-- **Time is the next limit.** 40-80 s of wall time for the 446 MiB gzip on an Apple M-series
+- **Time is the next limit.** 38 s of wall time for the 446 MiB gzip on an Apple M-series
   core (other work running); Cloud Run's vCPU was not measured, and conversions stop at
   `AIMART_CONVERT_TIMEOUT_S` (120 s, unpaid).
 

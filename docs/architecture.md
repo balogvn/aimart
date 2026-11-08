@@ -79,11 +79,11 @@ flowchart LR
    file's size; its files (the upload, the staged copy of the text, the output) grow with it,
    and no input outlives its read: a gzip of CSV or TSV is read by DuckDB where it lies, and
    what is unpacked or transcoded is deleted once the reader returns. Measured with the
-   defaults, the input caps bind before the job cap: a 255 MiB CSV sent as 39 MB of gzip
-   peaked at 232 MiB in all, and 230 MiB of cp1252 CSV sent as 45 MB of gzip at 552 MiB (its
+   defaults, the input caps bind before the job cap: a 255 MiB CSV sent as 37 MiB of gzip
+   peaked at 245 MiB in all, and 230 MiB of cp1252 CSV sent as 45 MiB of gzip at 533 MiB (its
    UTF-8 version, transcoded from the stream, on disk while it is read); as bz2 or zip, its
-   unpacked text beside that UTF-8 version, at 651-683 MiB. With the caps raised a 446 MiB CSV
-   sent as gzip converted (489 MiB), and 450 MB uncompressed reached the job cap (a 413). A
+   unpacked text beside that UTF-8 version, at 574-664 MiB. With the caps raised a 446 MiB CSV
+   sent as gzip converted (506 MiB), and 450 MB uncompressed reached the job cap (a 413). A
    convert's input is on that disk once: an upload is written into the work directory, and a
    stored artifact is hard-linked there, not copied; the reader gets a hard link of its own.
    A gzip/bz2/zip stream also stops as it inflates past `max_decompressed_bytes` (256 MB), and

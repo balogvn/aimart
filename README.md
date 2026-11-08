@@ -275,28 +275,27 @@ MCP error result; the full list is in the
 | downloads | 60 s of downloading for all of a call's `url` inputs together | `AIMART_FETCH_TIMEOUT_S` | 422 `fetch_failed` |
 | concurrency | 2 jobs; a call waits for a free one as long as its payment window leaves it (60 s to convert, 165 s to inspect or preview, 160 s to query), with up to 4 calls per job waiting | `AIMART_MAX_CONCURRENT_JOBS`, `AIMART_QUEUE_WAIT_S` | 503 `busy` |
 
-**CSV memory no longer grows with the file.** The text is staged as compressed Parquet instead
-of loaded into a table, so a conversion's process stays at about 150-330 MiB whatever the
-file's size (it took about 3.5 times the file, and CSVs over about 120 MB were refused). The
-job's files still grow with it, and they count toward the 700 MB a job may use because `/tmp`
-is RAM on Cloud Run: the upload, the staged text and the output (those two about 0.4-0.65
-times the CSV), and no input outlives its read. A gzip of CSV or TSV is not unpacked: DuckDB
-reads it once one pass has counted it against the 256 MB cap and checked that DuckDB reads it
-as Python does, and text that is not UTF-8 is transcoded straight from it, its UTF-8 version on
-disk while it is read. A bz2 or
-zip is unpacked, and one that is not UTF-8 also holds its UTF-8 version while it is
-transcoded, which then replaces the unpacked text. Measured with the defaults, the input caps
-bind first: a 255 MiB CSV sent as 39 MB of gzip converted at 232 MiB in all, and 230 MiB of
-orders in cp1252 sent as 45 MB of gzip at 552 MiB; the same orders sent as bz2 or zip peaked at
-651 and 683 MiB, close to the cap, with the unpacked text and its UTF-8 version both on disk.
-With the input caps raised, a 446 MiB CSV sent as 159 MiB of gzip converts (489 MiB), and 450 MB
-sent uncompressed is stopped at the job cap (149 MiB in memory plus 562 MiB of files).
-`sort_by` sorts the whole file and spills to disk past 400 MiB; the spill counts too, and
-DuckDB may spill only the 300 MiB the cap leaves it: a 100 MB CSV sorts (469 MiB), and so does
-198 MiB sent as gzip (655 MiB), while 200 MB sent uncompressed is refused. Over the cap the call
-fails with 413, unpaid: split such files, or convert them with the free local server, which
-applies the same defaults, with `AIMART_MAX_INPUT_BYTES`, `AIMART_MAX_DECOMPRESSED_BYTES` and
-`AIMART_JOB_MEMORY_LIMIT_MB` raised to suit your machine.
+**CSV memory no longer grows with the file.** The text is staged as compressed Parquet instead of
+loaded into a table, so a conversion's process stays at about 150-330 MiB whatever the file's size
+(it took about 3.5 times the file, and CSVs over about 120 MB were refused). The job's files still
+grow with it, and they count toward the 700 MB a job may use because `/tmp` is RAM on Cloud Run:
+the upload, the staged text and the output (those two about 0.4-0.65 times the CSV), and no input
+outlives its read. A gzip of CSV or TSV is not unpacked: DuckDB reads it once one pass has counted
+it against the 256 MB cap and checked that DuckDB reads it as Python does, and text that is not
+UTF-8 is transcoded straight from it, its UTF-8 version on disk while it is read. A bz2 or zip is
+unpacked, and one that is not UTF-8 also holds its UTF-8 version while it is transcoded, which then
+replaces the unpacked text. Measured with the defaults, the input caps bind first: a 255 MiB CSV
+sent as 37 MiB of gzip converted at 245 MiB in all, and 230 MiB of orders in cp1252 sent as 45 MiB
+of gzip at 533 MiB; the same orders sent as bz2 or zip peaked at 574-664 MiB, close to the cap,
+with the unpacked text and its UTF-8 version both on disk. With the input caps raised, a 446 MiB
+CSV sent as 159 MiB of gzip converts (506 MiB; it used to be stopped at the cap), and 450 MB sent
+uncompressed is stopped there (157 MiB in memory plus 544 MiB of files). `sort_by` sorts the whole
+file and spills to disk past 400 MiB; the spill counts too, and DuckDB may spill only the 300 MiB
+the cap leaves it: a 100 MB CSV sorts (468 MiB), and so does 198 MiB sent as gzip (654 MiB), while
+200 MB sent uncompressed is refused. Over the cap the call fails with 413, unpaid: split such
+files, or convert them with the free local server, which applies the same defaults, with
+`AIMART_MAX_INPUT_BYTES`, `AIMART_MAX_DECOMPRESSED_BYTES` and `AIMART_JOB_MEMORY_LIMIT_MB` raised
+to suit your machine.
 [deploy/README.md](deploy/README.md#memory-capacity-what-one-2-gib-instance-converts) has the
 numbers.
 
