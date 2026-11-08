@@ -11,7 +11,9 @@ workbook check now uses ``max_workbook_xml_bytes`` (512 MB), and streams are bac
 from __future__ import annotations
 
 import gzip
+import zlib
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -20,6 +22,9 @@ from aimart_parquet.config import Settings
 from aimart_parquet.engine.convert import unwrap
 from aimart_parquet.engine.limits import Limits
 from aimart_parquet.errors import InputTooLarge
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _MB = 1024 * 1024
 STREAM_MB = 300
@@ -76,6 +81,64 @@ async def test_a_300_mb_stream_is_an_unpaid_413_on_the_wire(
     error = r.json()["error"]
     assert error["code"] == "input_too_large"
     assert error["message"] == "Decompressed input exceeds the 256 MB limit."
+    assert error["details"] == {"limit_bytes": 256 * _MB}
+    assert "payment-response" not in r.headers
+    assert facilitator.settled == []
+
+
+def _bomb(path: Path, byte: bytes) -> Path:
+    """300 MB of text that is not UTF-8, ``byte`` over and over, in under 1 MB of gzip of one
+    member (a gzip of more than one is unpacked, as at d83c738)."""
+    row = b"1," + byte * 1021 + b"\n"
+    block = row * (_MB // len(row))
+    deflate = zlib.compressobj(6, zlib.DEFLATED, 31)  # 31: one gzip member
+    with path.open("wb") as out:
+        out.write(deflate.compress(b"a,b\n"))
+        for _ in range(STREAM_MB):
+            out.write(deflate.compress(block))
+        out.write(deflate.flush())
+    assert path.stat().st_size < _MB
+    return path
+
+
+@pytest.fixture(scope="module")
+def bombs(tmp_path_factory: pytest.TempPathFactory) -> Callable[[bytes], Path]:
+    root = tmp_path_factory.mktemp("bombs")
+    return lambda byte: _bomb(root / f"{byte.hex()}.csv.gz", byte)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("byte", "encoding"),
+    # Each is three bytes of UTF-8: 0x80 named cp1252 is '€'; 0xE9 detected (as cp874, from a
+    # sample of nothing else) is Thai. At 4510071 both ran into the watchdog.
+    [(b"\xe9", None), (b"\x80", "cp1252")],
+    ids=["detected", "named"],
+)
+async def test_a_300_mb_stream_of_text_that_is_not_utf8_stops_at_256_mb(
+    bombs: Callable[[bytes], Path],
+    make_settings: Callable[..., Settings],
+    byte: bytes,
+    encoding: str | None,
+) -> None:
+    # The isolated child at the production defaults: the 256 MB stream cap and a 700 MB job.
+    # Since 1886f60 such text was transcoded from the gzip, its input alone capped: about 450 MB
+    # of UTF-8 were written before the job's watchdog stopped it, a 413 that blamed the job's
+    # memory ('The job exceeded its memory budget (700 MB) ...') where d83c738 refused the
+    # stream itself. The stream is counted to its end before any UTF-8 is written.
+    settings = make_settings(isolate_jobs=True)
+    assert (settings.job_memory_limit_mb, settings.max_decompressed_bytes) == (700, 256 * _MB)
+    facilitator = kit.FakeFacilitator()
+    body: dict[str, object] = dict(_body(bombs(byte)))
+    if encoding:
+        body["options"] = {"encoding": encoding}
+    async with kit.running_app(settings, facilitator=facilitator) as h:
+        r = await h.paying.post("/v1/convert", json=body)
+    assert r.status_code == 413, r.text
+    error = r.json()["error"]
+    assert error["code"] == "input_too_large"
+    assert error["message"] == "Decompressed input exceeds the 256 MB limit."
+    assert error["hint"] == "Split the file, or send a smaller extract."
     assert error["details"] == {"limit_bytes": 256 * _MB}
     assert "payment-response" not in r.headers
     assert facilitator.settled == []

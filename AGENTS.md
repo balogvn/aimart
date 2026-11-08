@@ -66,27 +66,34 @@ Module docstrings explain the why; read the one you are about to change.
   `InternalErrorMiddleware` and MCP's `_guard`): its type only, hint "Retry; if it persists,
   report it. You were not charged.". `without_paths()` strips server paths from any message
   built from a library's exception text.
-- `engine/`: the pure conversion engine. `detect.py` (magic bytes over extensions; a `%PDF-`
-  header anywhere in the first 1 KB), `safety.py` (gzip/zip bomb caps), `text.py` (UTF-8
-  transcoding; a decompressed stream is deleted once its UTF-8 copy is written), `duck.py`
-  (sandboxed DuckDB; `NOWHERE` for every `$HOME`-derived setting), `readers/` (delimited, jsonish,
-  excel, statistical, columnar, pdf; the `READERS` map is in `convert.py`), `infer.py` (type
-  ladder in SQL; the number convention is decided per column, then by the file's other number
-  columns when they agree and one writes '1,234.5' or '1.234,5', else by the dialect; text with
-  a zone only ever becomes TIMESTAMPTZ;
-  constant lists go through `_one_of`, never `IN`), `names.py`, `convert.py` (pipeline,
-  `expected_schema`, report; CSV/TSV jobs run DuckDB on one thread), `writer.py` (DuckDB `COPY` by
-  default, pyarrow when labels exist), `inspect.py` (footer-only stats), `tabular.py` (preview and
-  SELECT-only query: inputs are views over DuckDB's own Parquet reader (`_native_view`), long
+- `engine/`: the pure conversion engine. `detect.py` (magic bytes over extensions; a `%PDF-` header
+  anywhere in the first 1 KB), `safety.py` (gzip/zip bomb caps; `sniff_compression` and
+  `unread_compression`, the compression a file starts with, bz2 by its block magic, not 'BZh'
+  alone; `gzip_chunks`, the pass that lets DuckDB read a gzip only where it reads it as Python
+  does: one member), `text.py` (UTF-8 transcoding, from a file or, with `transcode`, a gzip
+  stream counted to its end first; `replace=True` renames the UTF-8 version over the reader's
+  input; a forced 'utf-8' is checked only with `check_forced`, which the JSON reader passes),
+  `duck.py` (sandboxed DuckDB; `NOWHERE` for every `$HOME`-derived setting), `readers/` (delimited,
+  jsonish, excel, statistical, columnar, pdf; the `READERS` map is in `convert.py`), `infer.py`
+  (type ladder in SQL; the number convention is decided per column, then by the file's other number
+  columns when they agree and one writes '1,234.5' or '1.234,5', else by the dialect; text with a
+  zone only ever becomes TIMESTAMPTZ; constant lists go through `_one_of`, never `IN`), `names.py`,
+  `convert.py` (pipeline, `expected_schema`, report; CSV/TSV jobs run DuckDB on one thread; a gzip
+  of CSV/TSV of one member is read by DuckDB as it is, `keep_gzip`; `unwrap` removes up to two
+  layers of gzip, bz2 or zip, refusing a third and compression no reader reads, and hands a
+  reader a file of the pipeline's own, deleted once it returns), `writer.py` (DuckDB `COPY` by
+  default, pyarrow when labels exist), `inspect.py` (footer-only stats), `tabular.py` (preview
+  and SELECT-only query: inputs are views over DuckDB's own Parquet reader (`_native_view`), long
   cells are cut inside DuckDB, rows are built by position, results over `MAX_RESULT_BYTES` are
-  refused), `isolate.py` (forkserver child per job: deadline, a watchdog on RSS plus the job's
-  temporary files (its temp directory and the `job_dirs` the service passes) for
-  `job_memory_limit_mb`, a per-job temp directory the parent deletes; a crash is logged by type
-  and frames, never its text), `limits.py` (per-job limits; under the watchdog DuckDB's memory
-  limit is the cap minus 300 MB and its spill cap the rest of the cap, `within_job_cap`),
-  `models.py` (the pydantic contract agents read). Delimited text is staged once as zstd Parquet
-  and `raw` is a view over it. DuckDB running out of memory is a 413 (`read_csv` in
-  `delimited.py`; any other step in `convert_file`), never a 500 that says retry.
+  refused), `isolate.py`
+  (forkserver child per job: deadline, a watchdog on RSS plus the job's temporary files (its temp
+  directory and the `job_dirs` the service passes) for `job_memory_limit_mb`, a per-job temp
+  directory the parent deletes; a crash is logged by type and frames, never its text), `limits.py`
+  (per-job limits; under the watchdog DuckDB's memory limit is the cap minus 300 MB and its spill
+  cap the rest of the cap, `within_job_cap`), `models.py` (the pydantic contract agents read).
+  Delimited text is staged once as zstd Parquet and `raw` is a view over it. DuckDB running out of
+  memory is a 413 (`read_csv` in `delimited.py`; any other step in `convert_file`), never a 500 that
+  says retry.
 - `quantum/`: premium tools (`kernel_pca.py`, `portfolio.py`, `data.py`, `models.py`). Served only
   when the `quantum` extra is installed AND `AIMART_ENABLE_QUANTUM=true` (off by default; a buyer
   panel valued them at $0). `pricing.active_operations(settings)` decides. Spec:
@@ -369,6 +376,36 @@ each pinned in `tests/unit/test_fix_csv_memory.py`:
   `Limits.from_settings` holds DuckDB at the cap minus 300 MB and its spill files at the rest
   of the cap: the watchdog counts spill files with the job's memory (they are RAM on Cloud
   Run), so the two together never pass it.
+- **The input outlived the read on that RAM disk**: the decompressed text, a copy of every
+  upload and a UTF-8 copy stayed to the end of the job (777 MiB of files for a 446 MiB CSV,
+  1.25 GiB with `sort_by`). `unwrap` hands the reader a file of the pipeline's own (a hard link
+  to a file in the work directory, a copy of one elsewhere: a local caller's file is never
+  linked), the UTF-8 version is renamed over it (`to_utf8(replace=True)`), and `convert_file`
+  deletes it once the reader returns. The source, a caller's file or a stored artifact, is
+  never deleted or written. That file keeps the caller's suffixes ('input.csv.gz', a zip
+  member's 'unzipped.csv.zst'), and DuckDB inflates a '.gz' or '.zst' name unless told: the
+  readers pass `compression` ('uncompressed', or 'gzip' for a checked gzip), or cp1252 text
+  under such a name was a 422 (`unit/test_fix_csv_followup.py`).
+- **A gzip of CSV/TSV is read by DuckDB where it lies** (`keep_gzip`, the format decided by
+  `format_from_start` over the first KB it holds), and other text is transcoded from the
+  stream, unless DuckDB would read it otherwise than Python: then it is unpacked, as d83c738
+  unpacked every gzip. DuckDB 1.5 does not check a member's CRC or length (a truncated or
+  corrupt file reads as far as it inflates) and refuses FTEXT, FHCRC, FCOMMENT and the zero
+  padding Python skips, so `safety.gzip_chunks` lets it read only a member that both read the
+  same way, and counts it against the 256 MB stream cap. Only one member: DuckDB 1.5.6 refills
+  its 32 KiB input buffer as each member ends, and once a refill has read exactly to the end of
+  the file the next refill reads nothing and it stops, dropping the members still in its
+  buffer, with no error. A gzip of one member per CSV line lost its last 712 rows of 9,000, a
+  200 for wrong data; such files also converted 2.7-3.5x slower than d83c738 unpacked them
+  (`gzip_chunks` re-sliced its read buffer for every member, and DuckDB starts each member
+  afresh on each of its two reads), and DuckDB refuses a later member's header of 32,760 bytes
+  or more (`unit/test_fix_csv_followup_safety.py`, CS5 and CS1; `unit/test_fix_csv_followup.py`,
+  CF2). What gzip, pigz, Python and pandas write is one member. Text that is not UTF-8 is
+  transcoded from the stream only after that pass has counted all of it against the cap
+  (`text.transcode`), and is not checked again: transcoding first capped only its input, and a
+  gzip of cp1252 0x80 bytes ('€', three bytes of UTF-8) wrote 3x the cap before the job's
+  watchdog stopped it, a 413 that blamed the job's memory where d83c738 refused the stream (CS2,
+  and `integration/test_final_integrate_stream_cap.py`).
 
 ## Bug classes guarded since the review of 6f99145
 
@@ -397,6 +434,21 @@ each test's docstring has the incident.
   `integration/test_final_verify_option_bytes.py`,
   `integration/test_final_integrate_url_spaces.py`)
 - **Host paths readable from SQL** through DuckDB settings. (`unit/test_fix_money_duck.py`)
+- **Inflate errors that are not `OSError`.** zlib's 'invalid block type', zipfile's bad CRC, an
+  encrypted or deflate64 member: each escaped `decompress_stream` or `extract_single_member`
+  as the 500 that says retry. They are 422s (`safety._CORRUPT`). So is text a forced
+  `encoding` does not fit (`text.undecodable`). `to_utf8` passes 'utf-8' unchecked to the CSV
+  reader, whose DuckDB refuses such bytes itself; for the JSON reader it checks all of it
+  (`check_forced`): its own decoding raised UnicodeDecodeError, and DuckDB's lenient NDJSON
+  pass skipped a later line, a 200 for the rest (XA2).
+  (`unit/test_final_integrate_corrupt_streams.py`, `unit/test_fix_csv_followup.py`)
+- **Compressed bytes read as text.** `unwrap` removed one layer, and the next one's compressed
+  bytes were read as cp1252 text: a zip of data.csv.gz, sent without `encoding`, was a 200 of
+  10 garbage rows (d83c738 too), and xz named data.csv one of 128. It removes up to two layers
+  of gzip, bz2 or zip, each to the same cap and checks as the first, and refuses a third and
+  compression no reader reads (xz, zstd, lz4, 7z, rar), 415. bz2 is known by its block size and
+  block magic: 'BZh' alone begins text too, and a CSV whose header began so was a 422.
+  (`unit/test_fix_csv_followup.py`, XA1)
 - **Numbers in the wrong convention** ('1.5' as 15 in an EU column, '1.234' as 1.234 in a
   semicolon file). Casts are gated on the style's own pattern (`_style_fit`; never `TRY_CAST` an
   unmatched value: DuckDB reads '1_000' as 1000), the convention is decided per column
@@ -431,7 +483,10 @@ each test's docstring has the incident.
   test fails on any join in a column expression)
 - **`expected_schema` rewriting values.** Scale 0 is not "unset" (check `is None`), a decimal
   never rounds and a bool is only 0 or 1 (else a counted reject), a column declared string keeps
-  its text, and `strict` counts values inference nulled. (`unit/test_fix_infer_schema.py`)
+  its text, and `strict` counts values inference nulled. `count_if` is NULL, not 0, when no row
+  gives it a value (a CSV that is only its header, a column nobody filled in): read it as
+  `int(x or 0)`, or the schema is a 500. (`unit/test_fix_infer_schema.py`,
+  `unit/test_fix_csv_followup.py`)
 - **Readers losing values.** Nested keys that differ only by case (DuckDB matches STRUCT fields
   ignoring ASCII case and silently dropped every `K`) are renamed (`K_2`) with a warning, only
   where DuckDB reads a STRUCT: MAP keys and JSON text are data. `read_csv` skips exactly the blank
@@ -479,8 +534,11 @@ each test's docstring has the incident.
   kept out of responses. (`integration/test_isolate.py`) The cap counts the job's temporary
   files: a 1.5 MB gzip CSV wrote 500 MB into the work directory while RSS alone stayed under it.
   (`integration/test_final_isolate_disk.py`, `integration/test_final_integrate_stream_cap.py`)
-  A non-UTF-8 text's decompressed copy is deleted once its UTF-8 copy is written
-  (`unit/test_final_integrate_transcode_files.py`).
+  No input outlives its read: a gzip of UTF-8 CSV of one member is never unpacked, a
+  non-UTF-8 text's UTF-8 version replaces its input, a second layer's compressed file is
+  deleted once unpacked, and the caller's file or a stored artifact is never deleted or written
+  (`unit/test_final_integrate_transcode_files.py`,
+  `unit/test_fix_csv_memory.py`, `unit/test_final_isolate_service.py`).
 - **Charged for a response nobody received.** Cloud Run's 120 s request timeout answered 504
   to paid calls the payment window lets run 300 s, and the x402 middleware settled one that
   finished afterwards; a caller that hung up was settled the same way. The timeout is the
@@ -501,10 +559,26 @@ its only sign, a row naming every typed column, is also what a first suppressed 
 'Area5', 'x', 'x' looks like), and a short one-cell title above a numeric header printed atop
 every page is taken as the header, the numeric header then a data row on each page (123 rows for
 120; at 07fa450 too). A page whose table text alignment cannot read (its first column wraps, as
-long survey statements do) is not converted, and no warning names it (07fa450 too). (The 422 for a
-time past 9999 in preview and query and the 413 for `read_csv` running out of memory are tested in
-`integration/test_final_isolate_gaps.py`; DuckDB's `memory_limit` no longer sits above the job
-cap, `unit/test_fix_csv_memory.py`.)
+long survey statements do) is not converted, and no warning names it (07fa450 too). A bz2 or zip
+of text that is not UTF-8 is unpacked, and its UTF-8 version written beside the unpacked text
+before replacing it: 230 MiB of cp1252 orders peaked at 574-664 MiB of the 700 MB job cap on
+macOS, as at d83c738 (deploy/README.md), likely a 413 on Linux, whose RSS counts the
+forkserver's shared pages; transcoding from the bz2 or zip stream, as from a gzip, would drop
+the unpacked text. A gzip of more than one member (concatenated, appended to a row at a time,
+bgzip's blocks) is unpacked too, as at d83c738, so it holds the unpacked text while it is read,
+as a bz2 does; a file compressed twice also holds its second layer while that is unpacked.
+A convert input that starts with xz, zstd, lz4, 7z or rar magic, or is compressed three times
+over, can only fail (415, unpaid), yet it is still quoted: `Service.check_options` decides the
+options alone. The first KB that FormPeek or a decoded `content_base64` already holds would let
+`safety.unread_compression` refuse the magic-byte cases before the quote; a third layer cannot
+be known before inflating. Before upgrading DuckDB past 1.5.6, run
+`unit/test_fix_csv_followup_safety.py::test_duckdb_drops_the_members_left_when_a_refill_reads_to_the_end`:
+if it fails, the multi-member gzip data loss may be fixed, but re-check with many random member
+layouts before letting DuckDB read a gzip of more than one member again. Capacity numbers in
+`deploy/README.md` are macOS measurements; re-measure on Linux/Cloud Run before raising caps.
+(The 422 for a time past 9999 in preview and query and the 413 for
+`read_csv` running out of memory are tested in `integration/test_final_isolate_gaps.py`;
+DuckDB's `memory_limit` no longer sits above the job cap, `unit/test_fix_csv_memory.py`.)
 
 ## Agent tooling
 

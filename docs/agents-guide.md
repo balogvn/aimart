@@ -52,6 +52,10 @@ Pass exactly one input:
 - REST only: `POST /v1/convert/upload` as multipart (`file`, plus optional `options` as a
   JSON string).
 
+A file may be gzip-, bz2- or zip-compressed, once or twice: a zip of `data.csv.gz` is read as
+the CSV. Compressed three times, or with xz, zstd, lz4, 7z or rar, it is refused with 415
+`unsupported_format` ("The file is xz-compressed, which is not read here."), unpaid.
+
 Over MCP, `inspect_parquet`, `preview_parquet` and `query_parquet` take an `artifact_id` or a
 `url`, not `content_base64`: convert the file first.
 
@@ -276,11 +280,16 @@ The `input_too_large` messages, and what to change (numbers are the defaults):
   temporary files, which count toward the budget.", with `details.memory_bytes` and
   `details.temp_file_bytes`: each job's memory is capped, and its temporary files count (on the
   hosted instance they are in RAM). A CSV conversion's memory does not grow with the file, but
-  its files do: the decompressed text (a compressed file counts at its decompressed size), a
-  compressed copy of it and the output. With the defaults the input limits above bind first:
-  measured, a CSV of 255 MiB decompressed converted at 481 MiB of the 700. `sort_by` sorts the
-  whole file, and what DuckDB spills to disk counts too: sorting 100 MB of CSV peaked at
-  461 MiB, and 200 MB passed the budget. Split such files, or drop `sort_by`. For a PDF, read
+  its files do: the upload, a compressed copy of the text and the output, plus, while it is
+  read, the UTF-8 version of text that is not UTF-8 and the unpacked text of a bz2 or zip. A
+  gzip of CSV or TSV is read without unpacking, except where DuckDB would read it otherwise
+  than Python's gzip module, and then it is unpacked too: a gzip of more than one member
+  (concatenated, appended to a row at a time, or bgzip's blocks; gzip, pigz and Python write
+  one), or one with a header field DuckDB does not read (FTEXT, FHCRC, FCOMMENT) or zero padding
+  after it. With the defaults the input limits above bind first: measured, a CSV of 255 MiB
+  sent as gzip converted at 245 MiB of the 700, and 230 MiB of cp1252 text sent as a zip at up
+  to 664. `sort_by` sorts the whole file, and what DuckDB spills to disk counts too: sorting 100 MB of CSV peaked at 468 MiB, and 200 MB passed the budget
+  (198 MiB sent as gzip sorted, at 654). Split such files, or drop `sort_by`. For a PDF, read
   fewer pages with `pdf_pages`; for a query, return less.
 - "The file needs more memory to read than this server allows." (a delimited file) or "The PDF
   needs more memory than this server allows.": send a smaller file, or fewer pages.

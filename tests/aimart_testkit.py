@@ -11,7 +11,9 @@ import base64
 import contextlib
 import io
 import json
+import struct
 import zipfile
+import zlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -288,6 +290,25 @@ def zip_bytes(members: dict[str, bytes], *, compression: int = zipfile.ZIP_DEFLA
         for name, data in members.items():
             zf.writestr(name, data)
     return buf.getvalue()
+
+
+def gzip_member(
+    data: bytes, flags: int = 0, *, extra: bytes = b"AB\x00\x00", name: bytes = b"data.csv"
+) -> bytes:
+    """One gzip member with header ``flags`` (FTEXT 1, FHCRC 2, FEXTRA 4, FNAME 8, FCOMMENT 16)
+    and their fields, ``extra`` and ``name`` for FEXTRA and FNAME: gzip.compress sets none."""
+    header = bytearray(b"\x1f\x8b\x08" + bytes([flags]) + b"\0\0\0\0\0\xff")
+    if flags & 4:
+        header += len(extra).to_bytes(2, "little") + extra
+    if flags & 8:
+        header += name + b"\0"
+    if flags & 16:
+        header += b"a comment\0"
+    if flags & 2:
+        header += (zlib.crc32(header) & 0xFFFF).to_bytes(2, "little")
+    deflate = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    body = deflate.compress(data) + deflate.flush()
+    return bytes(header) + body + struct.pack("<II", zlib.crc32(data), len(data))
 
 
 def csv_text(header: Iterable[str], rows: Iterable[Iterable[object]]) -> str:

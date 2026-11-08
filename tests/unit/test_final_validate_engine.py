@@ -163,7 +163,7 @@ def test_to_utf8_refuses_them_too(encoding: str, tmp_path: Path) -> None:
 
 
 def _decoder_says(encoding: str, data: bytes) -> str:
-    """What the running interpreter's own decoder says about ``data``, as ``_undecodable`` reads it.
+    """What the running interpreter's own decoder says about ``data``, as ``undecodable`` reads it.
 
     The wording is the interpreter's: 3.13 raises UnicodeDecodeError, reason 'Stream does not
     start with BOM'; 3.12 a plain UnicodeError, 'UTF-16 stream does not start with BOM'.

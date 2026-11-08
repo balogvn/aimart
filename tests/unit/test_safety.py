@@ -20,10 +20,17 @@ MB = 1024 * 1024
     ("magic", "expected"),
     [
         (b"\x1f\x8b\x08\x00", "gzip"),
-        (b"BZh91AY", "bz2"),
+        (b"BZh91AY&SY", "bz2"),
+        (b"BZh1\x17rE8P\x90", "bz2"),  # an empty stream: its end, where a block would be
         (b"PK\x03\x04", "zip"),
         (b"a,b\n", None),
         (b"", None),
+        # Until XA1 'BZh' alone was bz2, and this case was b"BZh91AY" (7 bytes): text may begin
+        # 'BZh' (a CSV header 'BZh_code' was refused as a corrupt bz2 stream), and a stream is
+        # known by its block size and its first block's magic, SNIFF_BYTES in all.
+        (b"BZh_code,a", None),
+        (b"BZh91AY", None),
+        (b"BZh01AY&SY", None),
     ],
 )
 def test_sniff_compression(magic: bytes, expected: str | None) -> None:
@@ -84,6 +91,115 @@ class TestDecompressStream:
         with pytest.raises(InvalidInput) as info:
             safety.decompress_stream(src, tmp_path / "out", kind, MB)
         assert kind in info.value.message
+
+
+class TestGzipChunks:
+    """What DuckDB is let read from a gzip: only one member, which Python's gzip module reads
+    the same way."""
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            gzip.compress(b"a,b\n1,2\n"),
+            kit.gzip_member(b"a,b\n1,2\n", 4),
+            kit.gzip_member(b"a,b\n1,2\n", 4 | 8),
+            gzip.compress(b""),
+            kit.gzip_member(b"a,b\n1,2\n", 4 | 8, extra=b"e" * 65_535, name=b"n" * 500_000),
+        ],
+        ids=["one", "fextra", "fextra-fname", "empty", "header-long"],
+    )
+    def test_yields_what_python_reads(self, tmp_path, data) -> None:
+        # Until CS5 this also passed gzips of two or three members, and later headers of up to
+        # 32,759 bytes (the 'more-than-one-member' cases below now): DuckDB drops members when
+        # its buffer's refill ends the file (test_fix_csv_followup_safety.py).
+        path = kit.write(tmp_path / "in.gz", data)
+        assert b"".join(safety.gzip_chunks(path, MB)) == gzip.decompress(data)
+
+    def test_a_bomb_inflates_a_chunk_at_a_time(self, tmp_path) -> None:
+        path = kit.write(tmp_path / "bomb.gz", gzip.compress(b"\0" * (20 * MB)))
+        assert path.stat().st_size < 50_000  # one read of it holds the whole bomb
+        assert max(map(len, safety.gzip_chunks(path, 20 * MB))) <= MB
+
+    def test_past_the_cap_is_too_large(self, tmp_path) -> None:
+        path = kit.write(tmp_path / "bomb.gz", gzip.compress(b"\0" * (3 * MB)))
+        with pytest.raises(InputTooLarge) as info:
+            b"".join(safety.gzip_chunks(path, 2 * MB))
+        assert info.value.details == {"limit_bytes": 2 * MB}
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            kit.gzip_member(b"a\n", 1),
+            kit.gzip_member(b"a\n", 2),
+            kit.gzip_member(b"a\n", 16),
+            kit.gzip_member(b"a\n", 32),
+            gzip.compress(b"a\n") + b"\0",
+            gzip.compress(b"a\n") + b"\0" * 64,
+            gzip.compress(b"a\n") + b"junk after it",
+            gzip.compress(b"a\n")[:-8] + b"\0\0\0\0" + gzip.compress(b"a\n")[-4:],
+            gzip.compress(b"a\n")[:-4] + b"\x09\0\0\0",
+            gzip.compress(b"a\n")[:-3],
+            gzip.compress(b"a\n" * 1000)[:20],
+            gzip.compress(b"a\n")[:12],
+            b"\x1f\x8b\x08\x08" + b"\0" * 6 + b"no end to the name" * 70_000,
+            b"\x1f\x8b\x08\x00" + b"\0" * 6 + b"not deflate",
+            gzip.compress(b"a,b\n") + gzip.compress(b"") + gzip.compress(b"1,2\n"),
+            kit.gzip_member(b"a,b\n", 4) + kit.gzip_member(b"1,2\n", 8),
+            kit.gzip_member(b"a,b\n", 4 | 8, extra=b"e" * 65_535, name=b"n" * 500_000)
+            + gzip.compress(b"1,2\n"),
+            gzip.compress(b"a\n") + kit.gzip_member(b"b\n", 8, name=b"n" * 32_748),
+            gzip.compress(b"a\n") + kit.gzip_member(b"b\n", 4, extra=b"e" * 32_747),
+            gzip.compress(b"a\n") + kit.gzip_member(b"b\n", 8, name=b"n" * 32_749),
+            gzip.compress(b"a\n") + kit.gzip_member(b"b\n", 4, extra=b"e" * 32_748),
+            gzip.compress(b"a\n")
+            + kit.gzip_member(b"b\n", 4 | 8, extra=b"e" * 20_000, name=b"n" * 12_747),
+            gzip.compress(b"a\n") * 2 + kit.gzip_member(b"b\n", 8, name=b"n" * 40_000),
+        ],
+        ids=[
+            "ftext",
+            "fhcrc",
+            "fcomment",
+            "reserved",
+            "zero-byte",
+            "zero-padding",
+            "trailing",
+            "crc",
+            "length",
+            "trailer-cut",
+            "body-cut",
+            "header-only",
+            "endless-name",
+            "not-deflate",
+            "three-members",
+            "two-members-fextra-fname",
+            "first-header-long-two-members",
+            "later-name-at-limit",
+            "later-extra-at-limit",
+            "later-name-past-limit",
+            "later-extra-past-limit",
+            "later-fields-past-limit",
+            "third-name-past-limit",
+        ],
+    )
+    def test_anything_duckdb_might_read_otherwise_is_a_mismatch(self, tmp_path, data) -> None:
+        # Python reads the first four and skips the padding, which DuckDB refuses; DuckDB reads
+        # the next eight, which Python refuses, as whatever inflates. Python reads the rest,
+        # gzips of more than one member, and DuckDB may stop before their end (no error, rows
+        # lost: CS5, test_fix_csv_followup_safety.py) or refuse a later member's header of
+        # 32,760 bytes or more (InternalException; a 422 where d83c738 converted). The first
+        # three and the two 'at-limit' cases passed this check until CS5.
+        path = kit.write(tmp_path / "in.gz", data)
+        with pytest.raises(safety.GzipMismatch):
+            b"".join(safety.gzip_chunks(path, MB))
+
+
+def test_gzip_head(tmp_path) -> None:
+    path = kit.write(tmp_path / "in.gz", gzip.compress(b"x" * 5000))
+    assert safety.gzip_head(path, 1024) == b"x" * 1024
+    short = kit.write(tmp_path / "short.gz", gzip.compress(b"a,b\n"))
+    assert safety.gzip_head(short, 1024) == b"a,b\n"
+    cut = kit.write(tmp_path / "cut.gz", gzip.compress(b"a,b\n")[:12])
+    assert safety.gzip_head(cut, 1024) is None  # decompress_stream says what is wrong
 
 
 class TestCheckZip:
@@ -190,6 +306,31 @@ class TestEnsureSize:
 
 
 def test_copy_file(tmp_path) -> None:
+    # Still the engine's copy of a local caller's file, which is never linked (convert._link).
     src = kit.write(tmp_path / "a", b"abc")
     safety.copy_file(src, tmp_path / "b")
     assert (tmp_path / "b").read_bytes() == b"abc"
+
+
+def test_link_or_copy_links(tmp_path) -> None:
+    src = kit.write(tmp_path / "a", b"abc")
+    safety.link_or_copy(src, tmp_path / "b")
+    assert (tmp_path / "b").stat().st_ino == src.stat().st_ino  # no second copy of the bytes
+
+
+def test_link_or_copy_copies_across_filesystems(tmp_path, monkeypatch) -> None:
+    def cross_device(*_: object, **__: object) -> None:
+        raise OSError(18, "Invalid cross-device link")
+
+    monkeypatch.setattr(safety.os, "link", cross_device)
+    src = kit.write(tmp_path / "a", b"abc")
+    safety.link_or_copy(src, tmp_path / "b")
+    assert (tmp_path / "b").read_bytes() == b"abc"
+
+
+def test_link_or_copy_never_replaces_a_file(tmp_path) -> None:
+    src = kit.write(tmp_path / "a", b"abc")
+    theirs = kit.write(tmp_path / "b", b"keep")
+    with pytest.raises(FileExistsError):
+        safety.link_or_copy(src, theirs)
+    assert theirs.read_bytes() == b"keep"

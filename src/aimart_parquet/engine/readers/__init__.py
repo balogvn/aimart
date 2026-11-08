@@ -47,6 +47,13 @@ class RawTable:
 
 
 class Reader(Protocol):
+    """``path`` is the pipeline's own file (``convert.unwrap``), deleted once the reader returns.
+
+    A reader may replace it (a UTF-8 version renamed over it), but never write into it: it can
+    be a hard link to the caller's file. The result must not refer to it. (A gzip of CSV or
+    TSV reaches read_delimited still compressed: see its ``gzipped``.)
+    """
+
     def __call__(
         self,
         con: duckdb.DuckDBPyConnection,

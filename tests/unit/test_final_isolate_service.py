@@ -9,6 +9,7 @@ be in it once: an upload is written there, a stored artifact is linked there.
 
 from __future__ import annotations
 
+import gzip
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -185,22 +186,35 @@ async def test_an_input_that_cannot_be_linked_is_still_copied_in(
     assert copies == [path]
 
 
+@pytest.mark.parametrize(
+    ("name", "data"),
+    [
+        ("mine.csv", CSV),
+        ("mine.csv", "region\nZürich\nGenève\n".encode("cp1252")),
+        ("mine.csv.gz", gzip.compress("region\nZürich\nGenève\n".encode("cp1252"))),
+    ],
+    ids=["utf8", "cp1252", "cp1252-gzip"],
+)
 async def test_a_local_callers_own_file_is_copied_never_linked(
     make_settings: Callable[..., Settings],
     recorder: Recorder,
     copies: list[Path],
     tmp_path: Path,
+    name: str,
+    data: bytes,
 ) -> None:
     # Only the store's files are linked: a link to a local caller's file would put the
-    # converter one bug away from writing to it, and changes the file's link count.
+    # converter one bug away from writing to it, and changes the file's link count. Since
+    # 1886f60 the reader renames a UTF-8 version over its input and convert_file deletes it:
+    # that input is the copy, and the caller's file (text or a gzip DuckDB reads) is untouched.
     settings = make_settings(isolate_jobs=True)
     service = Service(settings, build_store(settings), local_mode=True)
-    mine = tmp_path / "mine.csv"
-    mine.write_bytes(CSV)
+    mine = tmp_path / name
+    mine.write_bytes(data)
     result = await service.convert(
         SourceRef(path=str(mine)), ConvertOptions(), output_path=str(tmp_path / "o.parquet")
     )
     assert result.report.rows == 2
     assert copies == [mine]
     assert mine.stat().st_nlink == 1
-    assert mine.read_bytes() == CSV
+    assert mine.read_bytes() == data

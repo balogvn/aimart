@@ -519,7 +519,8 @@ class TypeInferrer:
             f"SELECT count_if({fit}), count_if({fit} AND {_match(converted, _RE_INT)}) "
             f"FROM {self.table}"
         ).fetchone()
-        return (int(row[0]), int(row[1])) if row else (0, 0)
+        # count_if is NULL when no row gives it a value (see _text_style).
+        return (int(row[0] or 0), int(row[1] or 0)) if row else (0, 0)
 
     def _plan_temporal_batch(self, sources: list[str]) -> dict[str, ColumnPlan]:
         aggs: list[str] = []
@@ -621,7 +622,11 @@ class TypeInferrer:
             f"SELECT count_if({point} AND NOT {comma}), count_if({comma} AND NOT {point}) "
             f"FROM {self.table}"
         ).fetchone()
-        point_only, comma_only = (int(row[0]), int(row[1])) if row else (0, 0)
+        # count_if is NULL, not 0, when no row gives it a value: over no rows, or a column whose
+        # every value is empty. expected_schema casting such a column (a CSV that is only its
+        # header, an optional amount nobody filled in) to a number type raised TypeError here,
+        # the 500 after the payment that says "Retry".
+        point_only, comma_only = (int(row[0] or 0), int(row[1] or 0)) if row else (0, 0)
         if point_only != comma_only:
             return "us" if point_only > comma_only else "eu"
         return "eu" if self._decimal_comma() else "us"
@@ -752,7 +757,7 @@ class TypeInferrer:
         row = self.con.sql(
             f"SELECT count_if({v} IS NOT NULL AND ({expr}) IS NULL) FROM {self.table}"
         ).fetchone()
-        return int(row[0]) if row else 0
+        return int(row[0] or 0) if row else 0  # count_if is NULL over no rows
 
     def _examples(self, plan: ColumnPlan) -> list[str]:
         v = _Exprs.build(ident(plan.source), self.tokens).v

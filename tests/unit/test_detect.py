@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import gzip
+
 import pytest
 
 import aimart_testkit as kit
+from aimart_parquet.engine.convert import keep_gzip
 from aimart_parquet.engine.detect import (
     _SAS7BDAT_MAGIC,
+    START_BYTES,
     SUPPORTED_EXTENSIONS,
     detect_format,
     format_from_magic,
@@ -184,3 +188,69 @@ class TestDetectFormat:
         content = b"a\tb\n1\t2\n"
         path = kit.write(tmp_path / "blob", content)
         assert detect_format(path, content, None, None) is F.TSV
+
+
+_CSV = b"id,name\n" + b"".join(b"%d,row %d\n" % (i, i) for i in range(200))
+_PDF = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\nstartxref\n0\n%%EOF\n"
+
+
+@pytest.mark.parametrize(
+    ("name", "content"),
+    [
+        ("a.csv", _CSV),
+        ("a.tsv", _CSV.replace(b",", b"\t")),
+        (None, _CSV.replace(b",", b"\t")),
+        ("a.csv", b"\xef\xbb\xbf" + _CSV),
+        ("a.csv", "a,b\n1,2\n".encode("utf-16")),
+        ("a.json", b'[{"a": 1}]'),
+        ("a.csv", b'{"a": 1}\n{"a": 2}\n'),
+        ("a.csv", b"PAR1" + b"\0" * 100),
+        ("a.csv", b"$FL2@(#) SPSS DATA FILE"),
+        ("a.csv", b"\0" * 64),
+        (None, b"\x89PNG\r\n\x1a\n\0\0"),
+        ("old.dta", b"\x71\x02\x01\x00" + b"\0" * 60),
+        ("a.csv", b"\xef\xbb\xbf" + _PDF),
+        ("a.csv", b"x" * 700 + b"\n" + _PDF),  # a PDF after junk: its header past MAGIC_BYTES
+        ("a.csv", b"note\n%PDF-1.4 in a cell\n" + _CSV),  # a CSV quoting a PDF header
+        ("a.csv", _CSV * 3 + b"%PDF-1.4,later\n"),  # past the head: still a CSV
+        ("a.pdf", _CSV),
+        ("a.csv", b"PK\x03\x04" + b"\0" * 40),
+    ],
+)
+def test_a_gzip_is_kept_only_as_what_its_unpacked_text_is_read_as(tmp_path, name, content) -> None:
+    # convert.keep_gzip decides from the first START_BYTES a gzip holds (format_from_start, the
+    # answer the checks before the quote use too): a CSV or TSV there goes to the delimited
+    # reader, not to unwrap, so it must be what detect_format says of the unpacked file. A start that
+    # does not decide it (a zip, a '%PDF-' that may follow junk) is None, and gets unpacked.
+    plain = kit.write(tmp_path / "file", content)
+    try:
+        expected = detect_format(plain, read_magic(plain), name, None)
+    except UnsupportedFormat:
+        expected = None
+    gz = kit.write(tmp_path / "file.gz", gzip.compress(content))
+    work = tmp_path / "work"
+    work.mkdir()
+    kept = keep_gzip(gz, None if name is None else f"{name}.gz", work, None)
+    head = content[:START_BYTES]
+    decided = not head.startswith(b"PK\x03\x04") and b"%PDF-" not in head
+    if expected in {F.CSV, F.TSV} and decided:
+        assert kept is not None
+        assert kept[2] is expected
+    else:
+        assert kept is None
+
+
+def test_a_kept_gzip_takes_a_forced_format(tmp_path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    records = kit.write(tmp_path / "a.gz", gzip.compress(b'[{"a": 1}]'))
+    kept = keep_gzip(records, "a.json.gz", work, F.CSV)
+    assert kept is not None
+    assert kept[1:] == ("a.json", F.CSV)
+    text = kit.write(tmp_path / "b.gz", gzip.compress(_CSV))
+    assert keep_gzip(text, "a.csv.gz", work, F.JSON) is None
+    # This asserted that a gzip of a zip's signature was kept as CSV too, its bytes read as
+    # text. Since XA1 compressed bytes inside a gzip are unwrapped whatever the format: a gzip
+    # of a zip of data.csv, sent with format 'csv', converted as cp1252 garbage.
+    zipped = kit.write(tmp_path / "c.gz", gzip.compress(b"PK\x03\x04" + b"\0" * 40))
+    assert keep_gzip(zipped, "a.xlsx.gz", work, F.CSV) is None
