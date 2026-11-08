@@ -412,6 +412,10 @@ each test's docstring has the incident.
   `integration/test_final_verify_option_bytes.py`,
   `integration/test_final_integrate_url_spaces.py`)
 - **Host paths readable from SQL** through DuckDB settings. (`unit/test_fix_money_duck.py`)
+- **Inflate errors that are not `OSError`.** zlib's 'invalid block type', zipfile's bad CRC, an
+  encrypted or deflate64 member: each escaped `decompress_stream` or `extract_single_member`
+  as the 500 that says retry. They are 422s (`safety._CORRUPT`).
+  (`unit/test_final_integrate_corrupt_streams.py`)
 - **Numbers in the wrong convention** ('1.5' as 15 in an EU column, '1.234' as 1.234 in a
   semicolon file). Casts are gated on the style's own pattern (`_style_fit`; never `TRY_CAST` an
   unmatched value: DuckDB reads '1_000' as 1000), the convention is decided per column

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import bz2
 import gzip
+import lzma
 import os
 import shutil
 import struct
@@ -76,6 +77,12 @@ def copy_capped(src: Readable, dst: IO[bytes], cap: int) -> int:
     return total
 
 
+# What reading a stream that cannot be inflated raises. zlib.error is not an OSError: Python's
+# gzip and zipfile modules let it through for deflate data zlib refuses ('invalid block type'),
+# and it escaped as the 500 that says to retry, for a file that can never convert.
+_CORRUPT = (OSError, EOFError, zlib.error)
+
+
 def decompress_stream(
     src_path: Path, dst_path: Path, kind: Literal["gzip", "bz2"], cap: int
 ) -> int:
@@ -83,7 +90,7 @@ def decompress_stream(
     try:
         with opener(src_path, "rb") as src, dst_path.open("wb") as dst:
             return copy_capped(src, dst, cap)
-    except (OSError, EOFError) as exc:
+    except _CORRUPT as exc:
         raise _corrupt(kind, exc) from exc
 
 
@@ -101,7 +108,7 @@ class _CappedGzip:
     def read(self, size: int = _CHUNK, /) -> bytes:
         try:
             chunk = self._fh.read(size)
-        except (OSError, EOFError) as exc:
+        except _CORRUPT as exc:
             raise _corrupt("gzip", exc) from exc
         self._total += len(chunk)
         if self._total > self._cap:
@@ -122,7 +129,7 @@ def gzip_head(path: Path, n: int) -> bytes | None:
     try:
         with gzip.open(path, "rb") as fh:
             return fh.read(n)
-    except (OSError, EOFError):
+    except _CORRUPT:
         return None
 
 
@@ -271,8 +278,26 @@ def extract_single_member(path: Path, dst_dir: Path, cap: int) -> tuple[Path, st
     name = Path(member.filename).name
     # Never trust the member path: write to a fixed name inside our own temp directory.
     dst = dst_dir / (UNZIPPED + "".join(Path(name).suffixes[-2:]))
-    with zipfile.ZipFile(path) as zf, zf.open(member) as src, dst.open("wb") as out:
-        copy_capped(src, out, cap)
+    try:
+        with zipfile.ZipFile(path) as zf, zf.open(member) as src, dst.open("wb") as out:
+            copy_capped(src, out, cap)
+    except (*_CORRUPT, zipfile.BadZipFile, lzma.LZMAError) as exc:
+        # A member whose data does not inflate ('invalid distance too far back') or whose CRC
+        # fails ('Bad CRC-32'): untyped 500s before, as nothing here caught them.
+        raise _corrupt("zip", exc) from exc
+    except NotImplementedError as exc:  # a RuntimeError: before that clause
+        # A compression method zipfile does not implement (deflate64, from Windows Explorer).
+        raise InvalidInput(
+            f"Could not extract the zip's data file: {without_paths(exc)}",
+            hint="Re-create the archive with deflate compression, or send the file itself.",
+        ) from exc
+    except RuntimeError as exc:
+        # zipfile's other RuntimeError here: "File <ZipInfo ...> is encrypted, password required
+        # for extraction". The archive may be fine; no password can be passed.
+        raise InvalidInput(
+            "The zip's data file is password-protected.",
+            hint="Re-create the archive without a password, or send the file itself.",
+        ) from exc
     return dst, name
 
 
