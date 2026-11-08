@@ -567,6 +567,15 @@ forkserver's shared pages; transcoding from the bz2 or zip stream, as from a gzi
 the unpacked text. A gzip of more than one member (concatenated, appended to a row at a time,
 bgzip's blocks) is unpacked too, as at d83c738, so it holds the unpacked text while it is read,
 as a bz2 does; a file compressed twice also holds its second layer while that is unpacked.
+A convert input that starts with xz, zstd, lz4, 7z or rar magic, or is compressed three times
+over, can only fail (415, unpaid), yet it is still quoted: `Service.check_options` decides the
+options alone. The first KB that FormPeek or a decoded `content_base64` already holds would let
+`safety.unread_compression` refuse the magic-byte cases before the quote; a third layer cannot
+be known before inflating. Before upgrading DuckDB past 1.5.6, run
+`unit/test_fix_csv_followup_safety.py::test_duckdb_drops_the_members_left_when_a_refill_reads_to_the_end`:
+if it fails, the multi-member gzip data loss may be fixed, but re-check with many random member
+layouts before letting DuckDB read a gzip of more than one member again. Capacity numbers in
+`deploy/README.md` are macOS measurements; re-measure on Linux/Cloud Run before raising caps.
 (The 422 for a time past 9999 in preview and query and the 413 for
 `read_csv` running out of memory are tested in `integration/test_final_isolate_gaps.py`;
 DuckDB's `memory_limit` no longer sits above the job cap, `unit/test_fix_csv_memory.py`.)
