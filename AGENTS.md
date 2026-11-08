@@ -70,7 +70,8 @@ Module docstrings explain the why; read the one you are about to change.
   anywhere in the first 1 KB), `safety.py` (gzip/zip bomb caps; `gzip_chunks`, the pass that lets
   DuckDB read a gzip only where it reads it as Python does: one member), `text.py` (UTF-8
   transcoding, from a file or, with `transcode`, a gzip stream counted to its end first;
-  `replace=True` renames the UTF-8 version over the reader's input),
+  `replace=True` renames the UTF-8 version over the reader's input; a forced 'utf-8' is checked
+  only with `check_forced`, which the JSON reader passes),
   `duck.py` (sandboxed DuckDB; `NOWHERE` for every `$HOME`-derived setting), `readers/` (delimited,
   jsonish, excel, statistical, columnar, pdf; the `READERS` map is in `convert.py`), `infer.py`
   (type ladder in SQL; the number convention is decided per column, then by the file's other number
@@ -434,8 +435,10 @@ each test's docstring has the incident.
 - **Inflate errors that are not `OSError`.** zlib's 'invalid block type', zipfile's bad CRC, an
   encrypted or deflate64 member: each escaped `decompress_stream` or `extract_single_member`
   as the 500 that says retry. They are 422s (`safety._CORRUPT`). So is text a forced
-  `encoding` does not fit, wherever it is decoded (`text.undecodable`): `to_utf8` passes
-  'utf-8' unchecked, and the JSON reader's own decoding raised UnicodeDecodeError.
+  `encoding` does not fit (`text.undecodable`). `to_utf8` passes 'utf-8' unchecked to the CSV
+  reader, whose DuckDB refuses such bytes itself; for the JSON reader it checks all of it
+  (`check_forced`): its own decoding raised UnicodeDecodeError, and DuckDB's lenient NDJSON
+  pass skipped a later line, a 200 for the rest (XA2).
   (`unit/test_final_integrate_corrupt_streams.py`, `unit/test_fix_csv_followup.py`)
 - **Numbers in the wrong convention** ('1.5' as 15 in an EU column, '1.234' as 1.234 in a
   semicolon file). Casts are gated on the style's own pattern (`_style_fit`; never `TRY_CAST` an

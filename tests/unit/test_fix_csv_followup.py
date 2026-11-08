@@ -30,6 +30,10 @@ CF4, at d83c738 too. JSON or NDJSON whose bytes are not UTF-8, sent with options
 'utf-8' (which to_utf8 trusts, unchecked), raised UnicodeDecodeError in the JSON reader's own
 decoding (``_looks_like_ndjson``, ``_load_python``): a bare 500 after the payment. It is the 422
 the transcoder gives a forced encoding the bytes do not fit, whose hint says to omit encoding.
+
+XA2, at d83c738 too. Where those bytes came after the first 8 KB of NDJSON, Python never decoded
+them: DuckDB's lenient pass skipped their line, and the rest was a 200 with a warning, charged.
+For the JSON reader to_utf8 now checks a forced 'utf-8' to the end (``check_forced``).
 """
 
 from __future__ import annotations
@@ -354,3 +358,36 @@ def test_json_that_is_not_the_utf8_it_was_sent_as_is_an_unpaid_422(
         )
         assert converted.rows["name"] == _NAMES[:30]
         assert converted.report.encoding == "cp1252"
+
+
+# ------------------------- XA2: NDJSON sent as UTF-8 that stops being UTF-8 after its start
+def _ndjson_with_one_cp1252_line(at: int, rows: int = 5_000) -> bytes:
+    """``rows`` ASCII records, and at line ``at`` one whose name is cp1252 'Café'."""
+    lines = [json.dumps({"id": i, "name": f"n{i}"}).encode() for i in range(rows)]
+    lines.insert(at, '{"id": -1, "name": "Café"}'.encode("cp1252"))
+    return b"\n".join(lines) + b"\n"
+
+
+@pytest.mark.parametrize("wrap", ["plain", "gz", "zip"])
+@pytest.mark.parametrize("at", [2_500, 5_000], ids=["middle", "last"])
+@pytest.mark.parametrize("encoding", ["utf-8", "UTF8"])
+def test_ndjson_sent_as_utf8_that_is_not_all_utf8_is_refused_not_cut(
+    tmp_path: Path, wrap: str, at: int, encoding: str
+) -> None:
+    # d83c738 and 0a0f26d: a 200 with 5,000 rows of 5,001 and the warning 'skipped 1 malformed or
+    # empty JSON lines', charged. CF4's guards caught such bytes only where Python decodes the
+    # file itself, the start of NDJSON (8 KB); DuckDB's lenient pass skipped a later line.
+    data = _ndjson_with_one_cp1252_line(at)
+    assert len(data) > 64 * 1024
+    filename, data = _wrapped(wrap, "records.ndjson", data)
+    with pytest.raises(InvalidInput) as info:
+        _in_the_call_directory(tmp_path / "forced", filename, data, encoding=encoding)
+    assert info.value.http_status == 422
+    assert info.value.message == "The file cannot be decoded as utf-8: invalid continuation byte."
+    assert info.value.hint == "Pass the file's actual encoding, or omit encoding to detect it."
+    # What the hint says works: every row, the name decoded.
+    for named in (None, "cp1252"):
+        converted = _in_the_call_directory(tmp_path / f"{named}", filename, data, encoding=named)
+        assert converted.report.rows == 5_001
+        assert converted.rows["name"][at] == "Café"
+        assert converted.report.warnings == []

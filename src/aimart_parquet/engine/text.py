@@ -38,15 +38,20 @@ class TextInfo:
 
 def utf8_size(chunks: Iterable[bytes]) -> int | None:
     """How many bytes ``chunks`` hold when they are all UTF-8; else None, read no further."""
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
-    size = 0
     try:
-        for chunk in chunks:
-            decoder.decode(chunk)
-            size += len(chunk)
-        decoder.decode(b"", final=True)
+        return _checked_size(chunks)
     except UnicodeDecodeError:
         return None
+
+
+def _checked_size(chunks: Iterable[bytes]) -> int:
+    """How many bytes ``chunks`` hold; UnicodeDecodeError at the first that is not UTF-8."""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+    size = 0
+    for chunk in chunks:
+        decoder.decode(chunk)
+        size += len(chunk)
+    decoder.decode(b"", final=True)
     return size
 
 
@@ -221,7 +226,12 @@ def undecodable(encoding: str, exc: UnicodeError) -> InvalidInput:
 
 
 def to_utf8(
-    path: Path, workdir: Path, forced_encoding: str | None = None, *, replace: bool = False
+    path: Path,
+    workdir: Path,
+    forced_encoding: str | None = None,
+    *,
+    replace: bool = False,
+    check_forced: bool = False,
 ) -> TextInfo:
     """Return a UTF-8 version of ``path`` (the same path when it already is UTF-8).
 
@@ -231,6 +241,11 @@ def to_utf8(
     gzip held its upload, the decompressed text and the copy at once, 508 MB of files, and was
     stopped at the 700 MB cap (413) where its UTF-8 twin converted. Without it ``path`` is
     never touched: it may be a caller's file.
+
+    A forced 'utf-8' is passed through unchecked: the CSV reader's DuckDB refuses bytes that
+    are not UTF-8 itself, typed. With ``check_forced`` all of it is checked first, and such
+    bytes are ``undecodable``'s 422. The JSON reader needs that: DuckDB's lenient NDJSON pass
+    skipped a line that was not UTF-8, and the rest was charged for.
     """
     if forced_encoding:
         # Refused before the quote only when the input is known to be text then (a url's file,
@@ -239,6 +254,11 @@ def to_utf8(
         if refusal is not None:
             raise refusal
         if codecs.lookup(forced_encoding).name == "utf-8":
+            if check_forced:
+                try:
+                    _checked_size(_chunks(lambda: path.open("rb")))
+                except UnicodeDecodeError as exc:
+                    raise undecodable(forced_encoding, exc) from exc
             return TextInfo(path, "utf-8", 0)
     elif utf8_size(_chunks(lambda: path.open("rb"))) is not None:
         return TextInfo(path, "utf-8", 0)
