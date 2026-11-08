@@ -169,6 +169,15 @@ class Settings(BaseSettings):
 
     # ---------------------------------------------------------------- artifacts
     artifact_dir: Path = Path("/tmp/aimart-artifacts")  # noqa: S108 - ephemeral by design
+    work_dir: Path | None = Field(
+        default=None,
+        description=(
+            "Where each call's temporary files go; unset, artifact_dir/.work. Set it apart when "
+            "artifact_dir is persistent network storage (Modal's Volume): a job's inputs, "
+            "decompressed streams and spill files then stay on the instance's local disk, and "
+            "only the finished output is moved into the store (copied across filesystems)."
+        ),
+    )
     artifact_ttl_s: int = 3600
     artifact_max_total_bytes: int = Field(
         default=512 * 1024 * 1024,
