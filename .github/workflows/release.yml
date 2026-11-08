@@ -122,7 +122,7 @@ jobs:
           path: dist/
       # PEP 740 attestations are on by default in this action: each file is signed with this
       # run's identity and the attestation is uploaded to PyPI alongside it.
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
 
   image:
     name: image (amd64 + arm64 -> GHCR)

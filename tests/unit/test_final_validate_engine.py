@@ -8,6 +8,7 @@ report looking up a column by a name DuckDB had renamed (KeyError: 'A').
 
 from __future__ import annotations
 
+import codecs
 from typing import TYPE_CHECKING, Any
 
 import pyarrow.parquet as pq
@@ -161,19 +162,39 @@ def test_to_utf8_refuses_them_too(encoding: str, tmp_path: Path) -> None:
         to_utf8(src, tmp_path, encoding)
 
 
+def _decoder_says(encoding: str, data: bytes) -> str:
+    """What the running interpreter's own decoder says about ``data``, as ``undecodable`` reads it.
+
+    The wording is the interpreter's: 3.13 raises UnicodeDecodeError, reason 'Stream does not
+    start with BOM'; 3.12 a plain UnicodeError, 'UTF-16 stream does not start with BOM'.
+    """
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    with pytest.raises(UnicodeError) as info:
+        decoder.decode(data, final=True)
+    exc = info.value
+    return exc.reason if isinstance(exc, UnicodeDecodeError) else str(exc)
+
+
 @pytest.mark.parametrize("encoding", ["utf-16", "utf-32"])
 def test_a_forced_encoding_the_bytes_do_not_fit_is_invalid_input(
     encoding: str, tmp_path: Path
 ) -> None:
     # Before: UnicodeDecodeError ('Stream does not start with BOM'), a bare 500 after payment.
+    # This test pinned 3.13's wording, so it failed on 3.12 (the requires-python floor), and that
+    # failure showed a real gap: 3.12's plain UnicodeError was reported as "decoding failed",
+    # with the hint to pass the file's actual encoding instead of naming the byte order. The
+    # reason is now the running decoder's, and the byte-order hint is asserted whole, on every
+    # version.
     data = "a,b\n1,2\n".encode(encoding.replace("-", "_") + "_le")
+    reason = _decoder_says(encoding, data)
+    assert "BOM" in reason
     with pytest.raises(InvalidInput) as info:
         kit.convert_bytes(tmp_path, "x.csv", data, encoding=encoding)
-    assert (
-        info.value.message
-        == f"The file cannot be decoded as {encoding}: Stream does not start with BOM."
+    assert info.value.message == f"The file cannot be decoded as {encoding}: {reason}."
+    assert info.value.hint == (
+        f"Name the byte order, e.g. '{encoding}-le' or '{encoding}-be', "
+        "or omit encoding to detect it."
     )
-    assert f"'{encoding}-le'" in (info.value.hint or "")
 
 
 def test_a_bom_file_still_decodes_with_the_generic_name(tmp_path: Path) -> None:

@@ -45,9 +45,29 @@ _buf = io.BytesIO()
 pq.write_table(pa.table({"k": [1, 2], "v": ["a", "b"]}), _buf)
 PARQUET = _buf.getvalue()
 DRIP_S = 0.6  # each file takes this long to arrive, well inside any one fetch's deadline
+# One call's download allowance in these tests: four drips. These tests gave 0.9 s (1.5 drips),
+# and on a CI macOS runner one 0.6 s file took longer than that to arrive: the server's sleeps
+# fire late on a loaded Mac (under background QoS here, about 0.2 s each), so the first,
+# correct, download was refused. Every bound below now either has a second or more of slack
+# or compares the test's own measurements, which a slow machine moves together.
+ALLOW_S = 2.4
+
+
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self) -> None:
+        super().__init__(("127.0.0.1", 0), Drip)
+        self.released = threading.Event()  # set when the test ends: /hang/ answers stop waiting
 
 
 class Drip(BaseHTTPRequestHandler):
+    """PARQUET at once under /fast/; under /hang/, half of it and then nothing more; otherwise
+    half, a DRIP_S pause and the rest (one pause: each sleep is a timer a loaded machine fires
+    late, and four of them made a 0.6 s file take 1.4 s)."""
+
+    server: _Server
+
     def do_GET(self) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
@@ -56,11 +76,14 @@ class Drip(BaseHTTPRequestHandler):
         if self.path.startswith("/fast/"):
             self.wfile.write(PARQUET)
             return
-        step = len(PARQUET) // 4 + 1
-        for i in range(0, len(PARQUET), step):
-            time.sleep(DRIP_S / 4)
-            self.wfile.write(PARQUET[i : i + step])
-            self.wfile.flush()
+        half = len(PARQUET) // 2
+        self.wfile.write(PARQUET[:half])
+        self.wfile.flush()
+        if self.path.startswith("/hang/"):
+            self.server.released.wait(60)  # only a deadline ends the download
+            return
+        time.sleep(DRIP_S)
+        self.wfile.write(PARQUET[half:])
 
     def log_message(self, *args: Any) -> None:
         pass
@@ -68,8 +91,7 @@ class Drip(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def base(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Drip)
-    httpd.daemon_threads = True
+    httpd = _Server()
     port = httpd.server_address[1]
     monkeypatch.setattr(sources, "ALLOWED_PORTS", frozenset({80, 443, port}))
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -77,50 +99,55 @@ def base(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     try:
         yield f"http://127.0.0.1:{port}"
     finally:
+        httpd.released.set()
         httpd.shutdown()
         httpd.server_close()
         thread.join(5)
 
 
+async def _fetch(url: str, dest: Path) -> sources.Fetched:
+    """One URL input with a deadline of its own (30 s) that no test here comes near."""
+    return await sources.fetch_url(url, dest, max_bytes=10**6, deadline_s=30, allow_private=True)
+
+
 async def test_downloads_inside_one_deadline_share_it(base: str, tmp_path: Path) -> None:
-    started = time.monotonic()
-    with sources.downloads_deadline(DRIP_S * 1.5):
-        first = await sources.fetch_url(
-            f"{base}/a.parquet", tmp_path / "a", max_bytes=10**6, deadline_s=30, allow_private=True
-        )
+    with sources.downloads_deadline(ALLOW_S):
+        call = sources._CALL_DOWNLOADS.get()
+        assert call is not None
+        first = await _fetch(f"{base}/a.parquet", tmp_path / "a")
+        left = call.remaining
+        started = anyio.current_time()
         with pytest.raises(FetchFailed) as info:
-            await sources.fetch_url(
-                f"{base}/b.parquet",
-                tmp_path / "b",
-                max_bytes=10**6,
-                deadline_s=30,
-                allow_private=True,
-            )
+            await _fetch(f"{base}/hang/b.parquet", tmp_path / "b")
+        cut = anyio.current_time() - started
     assert first.size == len(PARQUET)
-    assert info.value.message == "Downloading this call's URL inputs took longer than 0.9 s in all."
+    assert left < ALLOW_S - DRIP_S + 0.01  # the first file's time came out of the allowance
+    assert info.value.message == "Downloading this call's URL inputs took longer than 2.4 s in all."
     assert "artifact_id" in info.value.hint
-    assert time.monotonic() - started < DRIP_S * 1.5 + 0.5
+    # The second download stopped when what the first left ran out. An allowance of its own
+    # would have let it run ALLOW_S, and before, it ran DRIP_S and was served. The gap is the
+    # first download's time, which a slow machine only makes longer.
+    assert left - 0.01 < cut < ALLOW_S
 
 
 async def test_time_not_spent_downloading_is_not_charged_to_the_downloads(
     base: str, tmp_path: Path
 ) -> None:
-    with sources.downloads_deadline(DRIP_S * 1.5):
-        await anyio.sleep(DRIP_S * 2)  # the sweep, or a stored artifact fetched from GCS
-        first = await sources.fetch_url(
-            f"{base}/a.parquet", tmp_path / "a", max_bytes=10**6, deadline_s=30, allow_private=True
-        )
+    with sources.downloads_deadline(ALLOW_S):
         call = sources._CALL_DOWNLOADS.get()
         assert call is not None
-        assert DRIP_S * 0.3 < call.remaining < DRIP_S * 0.95  # 0.9 s less what the fetch took
-        with pytest.raises(FetchFailed, match=r"took longer than 0\.9 s in all"):
-            await sources.fetch_url(
-                f"{base}/b.parquet",
-                tmp_path / "b",
-                max_bytes=10**6,
-                deadline_s=30,
-                allow_private=True,
-            )
+        # The sweep, or a stored artifact fetched from GCS. With the allowance running from the
+        # slot, less than one file's time was left after this, and the first fetch failed.
+        await anyio.sleep(ALLOW_S - DRIP_S / 2)
+        assert call.remaining == ALLOW_S
+        started = anyio.current_time()
+        first = await _fetch(f"{base}/a.parquet", tmp_path / "a")
+        took = anyio.current_time() - started
+        # Charged the fetch's own time: no less than the file took to arrive, no more than the
+        # test saw it take. (These asserted 0.33-0.72 s of 0.9 s, a bound on the machine.)
+        assert ALLOW_S - took - 1e-6 <= call.remaining < ALLOW_S - DRIP_S + 0.01
+        with pytest.raises(FetchFailed, match=r"took longer than 2\.4 s in all"):
+            await _fetch(f"{base}/hang/b.parquet", tmp_path / "b")
     assert first.size == len(PARQUET)
 
 
@@ -168,15 +195,21 @@ async def test_a_slow_gcs_sweep_does_not_make_a_fast_url_fail(
 
 
 async def test_without_a_call_deadline_each_fetch_keeps_its_own(base: str, tmp_path: Path) -> None:
-    for name in ("a", "b"):
+    # Four files of DRIP_S, each fetch given 2 s: more than 2 s of downloads in all, which only
+    # fits because each fetch has a deadline of its own. (Before: two files, 0.9 s each, and on
+    # a CI macOS runner one file alone took longer than its 0.9 s.)
+    own_s = 2.0
+    started = anyio.current_time()
+    for name in "abcd":
         got = await sources.fetch_url(
             f"{base}/{name}.parquet",
             tmp_path / name,
             max_bytes=10**6,
-            deadline_s=DRIP_S * 1.5,
+            deadline_s=own_s,
             allow_private=True,
         )
         assert got.size == len(PARQUET)
+    assert anyio.current_time() - started > own_s
 
 
 async def test_a_paid_query_over_url_tables_stops_downloading_at_fetch_timeout_s(

@@ -18,12 +18,14 @@ import base64
 import codecs
 import encodings
 import json
+import pkgutil
 import secrets
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
 import aimart_testkit as kit
+from aimart_parquet.engine.text import encoding_problem
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -243,8 +245,22 @@ async def test_long_encoding_names_over_mcp_are_refused_unquoted(
     assert facilitator.verified == []
 
 
+def _stdlib_codec_names() -> list[str]:
+    """Every name the running interpreter's ``encodings`` package has for a codec a text reader
+    can use (its aliases, their targets and its codec modules), longest first."""
+    names = set(encodings.aliases.aliases) | set(encodings.aliases.aliases.values())
+    names |= {module.name for module in pkgutil.iter_modules(encodings.__path__)}
+    return sorted((n for n in names if encoding_problem(n) is None), key=lambda n: (-len(n), n))
+
+
 async def test_every_stdlib_codec_name_still_fits(paid_app: kit.AppHarness) -> None:
-    for name in ("pc_multilingual_850_euro", "ISO-8859-15", "utf_16_le", "cp1252", "latin-1"):
+    # This test sent 'pc_multilingual_850_euro', 3.13's longest name (24 characters), and failed
+    # on 3.12, which has no such alias: the names are the interpreter's, so they are read from
+    # the one running. A 402 for the longest ones shows the 64-character cap and the codec check
+    # both let them through, and every shorter name fits the cap too.
+    names = _stdlib_codec_names()
+    assert len(names) > 100, names  # read from the package, not an empty list that proves nothing
+    for name in (*names[:3], "ISO-8859-15", "utf_16_le", "cp1252", "latin-1"):
         body = {"content_base64": kit.b64(CSV), "options": {"encoding": name}}
         r = await paid_app.http.post("/v1/convert", json=body)
         assert r.status_code == 402, (name, r.text)

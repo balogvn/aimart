@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from charset_normalizer import from_bytes
 
-from aimart_parquet.errors import InvalidInput, InvalidRequest
+from aimart_parquet.errors import InvalidInput, InvalidRequest, without_paths
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
@@ -215,8 +215,16 @@ def undecodable(encoding: str, exc: UnicodeError) -> InvalidInput:
     """The error for text the forced ``encoding`` cannot decode, wherever it is decoded: here,
     and in a reader that decodes what to_utf8 passed through unchecked (options.encoding
     'utf-8')."""
+    # Python 3.12's generic 'utf-16'/'utf-32' decoders raise a plain UnicodeError ('UTF-16
+    # stream does not start with BOM'), 3.13's a UnicodeDecodeError whose reason says so. Read
+    # only as a UnicodeDecodeError, a 3.12 caller was told "decoding failed" and to pass the
+    # file's actual encoding, which utf-16 was: the byte order was what was missing. A codec's
+    # own message names no file content and no path; without_paths keeps it to one line.
+    if isinstance(exc, UnicodeDecodeError):
+        reason = exc.reason
+    else:
+        reason = without_paths(exc) if str(exc) else "decoding failed"
     name = codecs.lookup(encoding).name
-    reason = exc.reason if isinstance(exc, UnicodeDecodeError) else "decoding failed"
     hint = (
         f"Name the byte order, e.g. '{name}-le' or '{name}-be', or omit encoding to detect it."
         if "BOM" in reason

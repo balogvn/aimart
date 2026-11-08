@@ -12,7 +12,7 @@
 # $PORT by default). Locally, `curl localhost:8080/health`. A HEALTHCHECK would also fork a
 # Python process every interval for nothing on a scale-to-zero host.
 
-ARG PYTHON_IMAGE=python:3.13.16-slim-trixie@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f
+ARG PYTHON_IMAGE=python:3.13.18-slim-trixie@sha256:09a17cad02668ae61ece136b4fd36ac3849e14f670ebedb637ea3e15580525bc
 
 # ----------------------------------------------------------------------------- uv binary
 FROM ghcr.io/astral-sh/uv:0.13.0@sha256:cdc6093146eb3ff6a40107b38f008b789e050e77ad87865e381d9917da55a168 AS uv
@@ -71,6 +71,17 @@ LABEL org.opencontainers.image.title="aimart-parquet" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.vendor="Kayode Balogun" \
       io.modelcontextprotocol.server.name="io.github.balogvn/aimart-parquet"
+
+# zlib1g 1:1.3.dfsg+really1.3.1-1+deb13u1 (CVE-2026-85091, a heap overflow in gz_vacate(), and
+# CVE-2026-76844) is in trixie-security, but the newest python:3.13-slim-trixie still ships
+# -1+b1, and Trivy fails the CI on it. Just that package is upgraded, to that exact version.
+# Remove this step once a base image carries it: it is a no-op then, and the build fails loudly
+# when the pin goes stale (apt refuses it as a downgrade under a newer base, and cannot find it
+# once trixie-security supersedes it).
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+       --only-upgrade zlib1g=1:1.3.dfsg+really1.3.1-1+deb13u1 \
+    && rm -rf /var/lib/apt/lists/*
 
 # The official python images ship the stdlib without .pyc files (size), so compile it here for
 # the same reason as above. pip is removed: nothing at runtime installs packages, and an unused
