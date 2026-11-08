@@ -228,7 +228,7 @@ class Service:
         self.demand = demand or DemandSignals()
         self.limits = Limits.from_settings(settings)
         self._limiter = anyio.CapacityLimiter(max(1, settings.max_concurrent_jobs))
-        self._workroot = settings.artifact_dir / ".work"
+        self._workroot = settings.work_dir or settings.artifact_dir / ".work"
         self._workroot.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------ plumbing

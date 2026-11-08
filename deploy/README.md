@@ -1,26 +1,33 @@
 # Deploying AImart Parquet
 
-The hosted service runs on **Google Cloud Run** (us-central1, request-based billing, scale to
-zero), pulled straight from the public image `ghcr.io/balogvn/aimart-parquet`. GitHub Actions
-deploys it with no stored credential: Workload Identity Federation (WIF) exchanges the job's OIDC
-token for a short-lived Google token. The secrets live in Secret Manager and never pass
-through GitHub.
+The hosted service runs on **Modal** (section 0): the Starter plan's $30 of monthly credits pay
+for it, it scales to zero, and the workspace budget stops it rather than billing past them.
+GitHub Actions deploys it with a Modal token kept in the `production` environment; the signing
+keys live in Modal and never pass through GitHub. **Google Cloud Run** (section 1) is the
+alternative: set the repository variable `DEPLOY_HOST=cloudrun` and a release deploys the
+released image there instead, with Workload Identity Federation (no stored credential) and
+Secret Manager.
 
 ```
 merge release PR ─► release.yml ─► PyPI, GHCR (+ provenance, SBOM), MCP Registry
-                                └► deploy.yml (image by digest) ─► Cloud Run
-                                      └► scripts/smoke.py decodes live 402s ─► pass, or roll back
+                                └► deploy-modal.yml ─► modal-deploy.sh: build from uv.lock + wheel,
+                                      deploy, URL check, selftest on Modal
+                                      └► scripts/smoke.py decodes live 402s
+                                   (DEPLOY_HOST=cloudrun: deploy.yml, image by digest ─► Cloud Run)
 synthetic.yml (every 6 h) ─► scripts/smoke.py against production ─► issue on failure
 ```
 
 | File | What it is |
 |---|---|
-| `setup-gcp.sh` | One-time, idempotent Google Cloud setup (APIs, service accounts, WIF, secrets, optional bucket and admin token). Prints the GitHub variables to set. |
-| `smoke-flags.sh` | Turns the deploy configuration into `scripts/smoke.py` expectations; shared by deploy and synthetic checks. |
-| `modal_app.py` | Untested sketch for the Modal fallback. |
-| `../.github/workflows/deploy.yml` | The deploy: digest in, verified revision out, rollback on failure. |
+| `modal_app.py` | The Modal app: the web function (the ASGI app) and the deploy's selftest. |
+| `modal-deploy.sh` | Builds `dist/modal/`, makes the signing keys once, deploys, checks the URL, runs the selftest. Run by `deploy-modal.yml`, or by hand. |
+| `modal_keys.py` | Creates the Modal secret `aimart-parquet-keys` once (values generated, never printed). |
+| `setup-gcp.sh` | Cloud Run only: one-time, idempotent Google Cloud setup (APIs, service accounts, WIF, secrets, optional bucket and admin token). Prints the GitHub variables to set. |
+| `smoke-flags.sh` | Turns the deploy configuration into `scripts/smoke.py` expectations; shared by both deploys and the synthetic check. |
+| `../.github/workflows/deploy-modal.yml` | The Modal deploy, after every release or by hand. |
+| `../.github/workflows/deploy.yml` | The Cloud Run deploy: digest in, verified revision out, rollback on failure. |
 
-Service shape (set by `deploy.yml`): 1 vCPU, 2 GiB, `concurrency=4`, `max-instances=1`,
+Cloud Run's service shape (set by `deploy.yml`): 1 vCPU, 2 GiB, `concurrency=4`, `max-instances=1`,
 `min-instances=0`, 300 s request timeout, startup CPU boost, CPU billed only during requests.
 The request timeout is the payment window (`PAYMENT_WINDOW_S`, the 300 s a payment authorization
 is valid for): a paid call may wait for a job slot, download its inputs and run its job inside
@@ -44,9 +51,85 @@ in-flight call.
 
 ---
 
+## 0. Deploy on Modal (the current host), step by step
+
+What runs: one container of 1 CPU core and 2 GiB (`deploy/modal_app.py`), up to 4 requests at
+once, at most one container, stopped 2 minutes after the last request and started again by the
+next one (a cold start of several seconds). Stored outputs live on the Modal Volume
+`aimart-artifacts`, so download links last their full hour across restarts (1 GiB budget by
+default); each call's temporary files stay on the container's local disk. Modal gives a web
+request at most 150 s, then answers with a redirect a paying client must not see, so the paid
+timeouts are tighter than on Cloud Run: 60 s per conversion, 30 s for all of a call's
+downloads, 15 s waiting for a job slot (`RUNTIME_ENV` in `modal_app.py`;
+`tests/unit/test_modal_deploy.py` checks they fit).
+
+Cost: a running container uses about $0.06 an hour (1 core at $0.0000131/s, 2 GiB at
+$0.00000222/GiB-s), from the $30 of monthly credits, and nothing while stopped. The Volume
+holds at most the 1 GiB budget of outputs, each for an hour.
+
+### 0.1 Modal account and budget
+
+1. Sign up at modal.com (GitHub login works). The Starter plan is $0 a month plus usage, with
+   $30 of compute credits each month.
+2. In Modal's settings, under usage and billing, set the **workspace budget** so nothing is
+   billed beyond the free credits. Check on that page that the budget is in place.
+3. Note your **workspace name** (in the dashboard's URLs). The service will be at
+   `https://<workspace>--aimart-parquet.modal.run`.
+
+### 0.2 GitHub configuration
+
+1. **Settings → Environments → New environment** `production`: deployment branches **main only**.
+   In it, add two **environment secrets** from a Modal token (Modal's settings → API tokens →
+   new token): `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`.
+2. **Settings → Secrets and variables → Actions → Variables**:
+
+| Variable | Required | Value |
+|---|---|---|
+| `AIMART_PUBLIC_BASE_URL` | yes | `https://<workspace>--aimart-parquet.modal.run` |
+| `PRODUCTION_URL` | yes, for the synthetic check | the same URL |
+| `AIMART_PAY_TO_EVM` | one of the two | Base address that receives USDC (receive-only) |
+| `AIMART_PAY_TO_SVM` | one of the two | Solana address that receives USDC (receive-only) |
+| `AIMART_NETWORK_MODE` | no | `testnet` (default) or `mainnet` |
+| `AIMART_ENABLE_QUANTUM` | no | `true` serves the premium quantum tools (off by default) |
+| `AIMART_FACILITATOR_URLS`, `AIMART_JOB_MEMORY_LIMIT_MB`, `AIMART_ARTIFACT_MAX_TOTAL_BYTES` | no | as in section 1.4 |
+| `SMOKE_SIGNING_KEY_SHA256` | no, recommended | pins the public signing key (section 1.7) |
+
+Every deploy passes these whole: a setting changed by hand in Modal is replaced by the next
+deploy. `DEPLOY_HOST` stays unset (Modal).
+
+3. The branch protection ruleset, PyPI Trusted Publishing and the GHCR visibility step are the
+   same as for Cloud Run: sections 1.4 (last paragraph), 1.5 and 1.6 step 3.
+
+### 0.3 First deploy
+
+**Actions → Deploy to Modal → Run workflow** on `main`. After that, every release deploys by
+itself. The run builds the image from `uv.lock` and the commit's wheel, creates the signing keys
+secret `aimart-parquet-keys` the first time (never printed, never rotated by a re-run), deploys,
+checks that Modal serves the app at `AIMART_PUBLIC_BASE_URL` (if not, it prints the URL to set),
+runs the selftest (a real conversion through the isolated job child, and the memory watchdog
+stopping a job), then smoke tests the public URL as the Cloud Run deploy does.
+
+By hand: `modal token new` once, then
+`AIMART_PUBLIC_BASE_URL=https://<workspace>--aimart-parquet.modal.run AIMART_PAY_TO_EVM=0x... deploy/modal-deploy.sh`.
+
+Then pin the signing key as in section 1.7.
+
+### 0.4 Operating it on Modal
+
+- **Redeploy** (after changing a variable): Actions → Deploy to Modal → Run workflow.
+- **Roll back**: the Starter plan has no rollbacks. Run the workflow from the previous
+  release's tag (Use workflow from → Tags).
+- **Logs**: the app's page on modal.com (kept 1 day on Starter).
+- **Mainnet**: as in "Switching to mainnet" (section 2), deploying with Deploy to Modal.
+- **Client addresses**: Modal passes the caller's address itself, so `X-Forwarded-For` is not
+  trusted (`AIMART_TRUST_FORWARDED_FOR=false`).
+
+---
+
 ## 1. First deploy, step by step
 
-Do these in order. Budgets come before anything that can bill.
+This section is for Google Cloud Run, the alternative host: set the repository variable
+`DEPLOY_HOST=cloudrun` so a release deploys there instead of Modal. Do these in order. Budgets come before anything that can bill.
 
 ### 1.1 Google Cloud project and billing
 
@@ -432,9 +515,7 @@ more memory, and set `AIMART_GCS_BUCKET` so stored artifacts leave the RAM disk.
 
 - **Hugging Face Spaces (Docker)** is no longer free for this (Docker Spaces stopped being free
   on 2026-07-21).
-- **Modal Starter:** $30 of monthly credits; set the workspace spend limit to $0 so it stops
-  when the credits run out instead of billing. `modal_app.py` is an **untested** sketch of the
-  service there; the same image runs unchanged.
+- **Modal Starter** is now the host (section 0).
 - **Oracle Cloud Always Free (Ampere A1):** up to 4 Arm OCPUs and 24 GB RAM, free indefinitely.
   The release publishes an arm64 image, so `docker run` it on the VM behind Caddy (automatic
   TLS) and set `AIMART_PUBLIC_BASE_URL` to that hostname. You operate the VM yourself: updates,
