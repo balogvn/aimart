@@ -238,14 +238,21 @@ def read_delimited(
     columns_sql = "{" + ", ".join(f"{literal(s)}: 'VARCHAR'" for s in sources) + "}"
     # buffer_size defaults to 16 x max_line_size: at our line cap DuckDB read a 200 MB file
     # through 256 MB of buffers. One line cap's worth still parses a 16 MB line.
+    # compression: DuckDB reads the bytes the dialect was sniffed from, the gzip or the text.
+    # Left to guess, it inflates a file named '.gz' or '.zst', and the reader's file keeps the
+    # caller's suffixes ('input.csv.gz', a zip member's 'unzipped.csv.zst'). Once 1886f60
+    # renamed the UTF-8 version over that file (d83c738 wrote 'utf8.txt'), cp1252 text under
+    # such a name but not compressed (a browser keeps '.gz' once it has undone Content-Encoding:
+    # gzip) was a 422, 'Input is not a GZIP stream', where d83c738 converted it. And a zip's
+    # gzip member sent with encoding 'utf-8' was inflated while its dialect and header came from
+    # the compressed bytes: a 200 under columns named from them, a 422 now.
+    compression = "gzip" if size is not None else "uncompressed"
     csv_args = (
         f"{literal(str(info.path))}, delim={literal(dialect.delimiter)}, quote='\"', "
         f"escape='\"', header={str(header).lower()}, skip={dialect.skip}, auto_detect=false, "
         f"columns={columns_sql}, null_padding=true, max_line_size={_MAX_LINE}, "
-        f"buffer_size={_MAX_LINE}"
+        f"buffer_size={_MAX_LINE}, compression={literal(compression)}"
     )
-    if size is not None:
-        csv_args += ", compression='gzip'"
     stage = workdir / _STAGE_FILE
     try:
         # Staged, not loaded. CREATE TABLE raw held every cell as an uncompressed VARCHAR (1.6x

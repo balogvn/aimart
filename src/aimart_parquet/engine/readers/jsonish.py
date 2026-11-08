@@ -67,11 +67,19 @@ _KeyPath = tuple[str | None, ...]
 _Kind = DuckDBPyType | None
 
 
+# DuckDB reads only text here: the reader's file once it starts with '[' or '{' (a compressed
+# stream never does), or one the reader wrote. Left to guess, DuckDB inflates a file named '.gz'
+# or '.zst', and the reader's file keeps the caller's suffixes ('input.ndjson.gz', a zip
+# member's 'unzipped.json.gz'): such text fell back to the Python parser, with its own warnings
+# ('skipped 1 malformed JSON lines'), and over its 100 MB a 413.
+_TEXT = "compression='uncompressed'"
+
+
 def _read_json_sql(path: Path, fmt: str, *, strict: bool = False) -> str:
     return (
         f"read_json({literal(str(path))}, format={literal(fmt)}, sample_size=-1, "
         f"maximum_object_size={_MAX_OBJECT}, ignore_errors={str(not strict).lower()}, "
-        "maximum_depth=-1)"
+        f"maximum_depth=-1, {_TEXT})"
     )
 
 
@@ -79,7 +87,7 @@ def _objects_sql(path: Path, fmt: str) -> str:
     """Each record as JSON text, no schema; a malformed NDJSON line is NULL."""
     return (
         f"read_json_objects({literal(str(path))}, format={literal(fmt)}, "
-        f"maximum_object_size={_MAX_OBJECT}, ignore_errors=true)"
+        f"maximum_object_size={_MAX_OBJECT}, ignore_errors=true, {_TEXT})"
     )
 
 

@@ -151,7 +151,8 @@ def keep_gzip(
     fmt = format_from_start(head, name, forced, whole=len(head) < START_BYTES)
     if fmt not in {InputFormat.CSV, InputFormat.TSV}:
         return None
-    # No '.gz': read_csv takes the name for gzip, and the reader may unpack text over it.
+    # No '.gz': the reader may unpack or transcode text over it (and it tells read_csv whether
+    # it reads a gzip or text, never leaving that to the name).
     return _link(src, workdir, "input"), name, fmt
 
 
