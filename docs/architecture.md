@@ -95,8 +95,9 @@ flowchart LR
    it is a view over a compressed Parquet copy of the text, so memory stays flat as files
    grow, and DuckDB's memory limit sits under the job's cap (`limits.py`). Because `/tmp` is
    RAM on Cloud Run, a gzip of CSV or TSV of one member is not decompressed at all (DuckDB
-   reads it, once a Python pass has counted it against the bomb cap), and any decompressed or
-   transcoded input is deleted as soon as the reader returns. A gzip DuckDB would read otherwise is
+   reads it, once a Python pass has counted all of it against the bomb cap; text that is not
+   UTF-8 is transcoded from the stream after that pass), and any decompressed or transcoded
+   input is deleted as soon as the reader returns. A gzip DuckDB would read otherwise is
    unpacked: one of more members, as DuckDB 1.5 can stop before the last of them with no error,
    or with a header DuckDB refuses. Next come type inference in SQL (`infer.py`),
    name normalization (`names.py`), and the writer (`writer.py`): DuckDB `COPY` to zstd

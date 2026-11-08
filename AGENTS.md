@@ -69,8 +69,8 @@ Module docstrings explain the why; read the one you are about to change.
 - `engine/`: the pure conversion engine. `detect.py` (magic bytes over extensions; a `%PDF-` header
   anywhere in the first 1 KB), `safety.py` (gzip/zip bomb caps; `gzip_chunks`, the pass that lets
   DuckDB read a gzip only where it reads it as Python does: one member), `text.py` (UTF-8
-  transcoding, from a file or a gzip stream; `replace=True` renames the UTF-8 version over the
-  reader's input),
+  transcoding, from a file or, with `transcode`, a gzip stream counted to its end first;
+  `replace=True` renames the UTF-8 version over the reader's input),
   `duck.py` (sandboxed DuckDB; `NOWHERE` for every `$HOME`-derived setting), `readers/` (delimited,
   jsonish, excel, statistical, columnar, pdf; the `READERS` map is in `convert.py`), `infer.py`
   (type ladder in SQL; the number convention is decided per column, then by the file's other number
@@ -397,7 +397,12 @@ each pinned in `tests/unit/test_fix_csv_memory.py`:
   (`gzip_chunks` re-sliced its read buffer for every member, and DuckDB starts each member
   afresh on each of its two reads), and DuckDB refuses a later member's header of 32,760 bytes
   or more (`unit/test_fix_csv_followup_safety.py`, CS5 and CS1; `unit/test_fix_csv_followup.py`,
-  CF2). What gzip, pigz, Python and pandas write is one member.
+  CF2). What gzip, pigz, Python and pandas write is one member. Text that is not UTF-8 is
+  transcoded from the stream only after that pass has counted all of it against the cap
+  (`text.transcode`), and is not checked again: transcoding first capped only its input, and a
+  gzip of cp1252 0x80 bytes ('€', three bytes of UTF-8) wrote 3x the cap before the job's
+  watchdog stopped it, a 413 that blamed the job's memory where d83c738 refused the stream (CS2,
+  and `integration/test_final_integrate_stream_cap.py`).
 
 ## Bug classes guarded since the review of 6f99145
 

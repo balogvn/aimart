@@ -28,7 +28,7 @@ from aimart_parquet.engine import safety
 from aimart_parquet.engine.duck import ident, literal
 from aimart_parquet.engine.models import InputFormat, delimiter_refusal
 from aimart_parquet.engine.readers import RAW_TABLE, RawColumn, RawTable
-from aimart_parquet.engine.text import TextInfo, codec_name, to_utf8, utf8_size
+from aimart_parquet.engine.text import TextInfo, codec_name, size_and_utf8, to_utf8, transcode
 from aimart_parquet.errors import InputTooLarge, InvalidInput, without_paths
 
 if TYPE_CHECKING:
@@ -159,32 +159,39 @@ def _gzip_text(
 ) -> tuple[TextInfo, int | None]:
     """The text of the gzip ``path``, and its size where DuckDB is to read it from the gzip.
 
-    UTF-8 stays in the gzip: one pass counts it against the stream cap (InputTooLarge with
-    unwrap's message: DuckDB has no cap of its own) and checks it, unless options.encoding says
-    UTF-8 (to_utf8 would not check either). Other text is transcoded from the stream: only its
-    UTF-8 version is written. A gzip DuckDB could read differently from Python, or an encoding
+    One pass counts the whole stream against the stream cap (InputTooLarge with unwrap's
+    message: DuckDB has no cap of its own) and checks it is UTF-8, unless options.encoding
+    names a codec (to_utf8 checks no named one for this reader either: DuckDB refuses bytes
+    that are not UTF-8). UTF-8 stays in the gzip. Other text is then transcoded from the
+    stream, not checked again: only its UTF-8 version is written, and only once the whole
+    stream is known to be within the cap. Transcoding first (1886f60) capped only the input,
+    and 0x80 bytes, cp1252's '€', are three bytes in UTF-8: a gzip bomb wrote 3x the cap, and
+    the isolated job's 700 MB watchdog stopped it, a 413 that blamed its memory where d83c738
+    refused the stream itself. A gzip DuckDB could read differently from Python, or an encoding
     to_utf8 refuses, is unpacked over ``path`` first, as unwrap did, so its errors come in the
     same order.
     """
     encoding, cap = options.encoding, limits.max_decompressed_bytes
-    codec = codec_name(encoding) if encoding else "utf-8"
-    unpack = codec is None
-    if codec == "utf-8":
+    codec = codec_name(encoding) if encoding else None
+    if codec is not None or not encoding:
         chunks = safety.gzip_chunks(path, cap)
         try:
             with closing(chunks):
-                size = sum(map(len, chunks)) if encoding else utf8_size(chunks)
+                if codec:
+                    size, utf8 = sum(map(len, chunks)), codec == "utf-8"
+                else:
+                    size, utf8 = size_and_utf8(chunks)
         except safety.GzipMismatch:
-            size, unpack = None, True
-        if size is not None:
-            return TextInfo(path, "utf-8", 0), size
-    if unpack:
-        unpacked = workdir / safety.DECOMPRESSED
-        safety.decompress_stream(path, unpacked, "gzip", cap)
-        unpacked.replace(path)
-        return to_utf8(path, workdir, encoding, replace=True), None
-    opener = partial(safety.open_gzip, path, cap)
-    return to_utf8(path, workdir, encoding, replace=True, opener=opener), None
+            pass
+        else:
+            if utf8:
+                return TextInfo(path, "utf-8", 0), size
+            opener = partial(safety.open_gzip, path, cap)
+            return transcode(path, workdir, encoding or None, replace=True, opener=opener), None
+    unpacked = workdir / safety.DECOMPRESSED
+    safety.decompress_stream(path, unpacked, "gzip", cap)
+    unpacked.replace(path)
+    return to_utf8(path, workdir, encoding, replace=True), None
 
 
 def read_delimited(
