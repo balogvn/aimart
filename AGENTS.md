@@ -377,13 +377,17 @@ each pinned in `tests/unit/test_fix_csv_memory.py`:
   to a file in the work directory, a copy of one elsewhere: a local caller's file is never
   linked), the UTF-8 version is renamed over it (`to_utf8(replace=True)`), and `convert_file`
   deletes it once the reader returns. The source, a caller's file or a stored artifact, is
-  never deleted or written.
+  never deleted or written. That file keeps the caller's suffixes ('input.csv.gz', a zip
+  member's 'unzipped.csv.zst'), and DuckDB inflates a '.gz' or '.zst' name unless told: the
+  readers pass `compression` ('uncompressed', or 'gzip' for a checked gzip), or cp1252 text
+  under such a name was a 422 (`unit/test_fix_csv_followup.py`).
 - **A gzip of CSV/TSV is never unpacked**: DuckDB reads it (`keep_gzip`, the format decided by
   `format_from_start` over the first KB it holds), and other text is transcoded from the
   stream. DuckDB 1.5 does not check a member's CRC or length (a truncated or corrupt file reads
-  as far as it inflates) and refuses FTEXT, FHCRC, FCOMMENT and the zero padding Python skips,
-  so `safety.gzip_chunks` lets it read only members that both read the same way, and counts
-  them against the 256 MB stream cap; anything else is unpacked as before.
+  as far as it inflates) and refuses FTEXT, FHCRC, FCOMMENT, the zero padding Python skips and
+  a later member's header of 32,760 bytes or more (its 32 KiB buffer), so `safety.gzip_chunks`
+  lets it read only members that both read the same way, and counts them against the 256 MB
+  stream cap; anything else is unpacked as before.
 
 ## Bug classes guarded since the review of 6f99145
 
@@ -414,8 +418,10 @@ each test's docstring has the incident.
 - **Host paths readable from SQL** through DuckDB settings. (`unit/test_fix_money_duck.py`)
 - **Inflate errors that are not `OSError`.** zlib's 'invalid block type', zipfile's bad CRC, an
   encrypted or deflate64 member: each escaped `decompress_stream` or `extract_single_member`
-  as the 500 that says retry. They are 422s (`safety._CORRUPT`).
-  (`unit/test_final_integrate_corrupt_streams.py`)
+  as the 500 that says retry. They are 422s (`safety._CORRUPT`). So is text a forced
+  `encoding` does not fit, wherever it is decoded (`text.undecodable`): `to_utf8` passes
+  'utf-8' unchecked, and the JSON reader's own decoding raised UnicodeDecodeError.
+  (`unit/test_final_integrate_corrupt_streams.py`, `unit/test_fix_csv_followup.py`)
 - **Numbers in the wrong convention** ('1.5' as 15 in an EU column, '1.234' as 1.234 in a
   semicolon file). Casts are gated on the style's own pattern (`_style_fit`; never `TRY_CAST` an
   unmatched value: DuckDB reads '1_000' as 1000), the convention is decided per column
@@ -450,7 +456,10 @@ each test's docstring has the incident.
   test fails on any join in a column expression)
 - **`expected_schema` rewriting values.** Scale 0 is not "unset" (check `is None`), a decimal
   never rounds and a bool is only 0 or 1 (else a counted reject), a column declared string keeps
-  its text, and `strict` counts values inference nulled. (`unit/test_fix_infer_schema.py`)
+  its text, and `strict` counts values inference nulled. `count_if` is NULL, not 0, when no row
+  gives it a value (a CSV that is only its header, a column nobody filled in): read it as
+  `int(x or 0)`, or the schema is a 500. (`unit/test_fix_infer_schema.py`,
+  `unit/test_fix_csv_followup.py`)
 - **Readers losing values.** Nested keys that differ only by case (DuckDB matches STRUCT fields
   ignoring ASCII case and silently dropped every `K`) are renamed (`K_2`) with a warning, only
   where DuckDB reads a STRUCT: MAP keys and JSON text are data. `read_csv` skips exactly the blank
@@ -522,10 +531,14 @@ its only sign, a row naming every typed column, is also what a first suppressed 
 'Area5', 'x', 'x' looks like), and a short one-cell title above a numeric header printed atop
 every page is taken as the header, the numeric header then a data row on each page (123 rows for
 120; at 07fa450 too). A page whose table text alignment cannot read (its first column wraps, as
-long survey statements do) is not converted, and no warning names it (07fa450 too). (The 422 for a
-time past 9999 in preview and query and the 413 for `read_csv` running out of memory are tested in
-`integration/test_final_isolate_gaps.py`; DuckDB's `memory_limit` no longer sits above the job
-cap, `unit/test_fix_csv_memory.py`.)
+long survey statements do) is not converted, and no warning names it (07fa450 too). A bz2 or zip
+of text that is not UTF-8 is unpacked, and its UTF-8 version written beside the unpacked text
+before replacing it: 230 MiB of cp1252 orders peaked at 574-664 MiB of the 700 MB job cap on
+macOS, as at d83c738 (deploy/README.md), likely a 413 on Linux, whose RSS counts the
+forkserver's shared pages; transcoding from the bz2 or zip stream, as from a gzip, would drop
+the unpacked text. (The 422 for a time past 9999 in preview and query and the 413 for
+`read_csv` running out of memory are tested in `integration/test_final_isolate_gaps.py`;
+DuckDB's `memory_limit` no longer sits above the job cap, `unit/test_fix_csv_memory.py`.)
 
 ## Agent tooling
 
