@@ -311,14 +311,27 @@ jobs:
           echo "::error::mcp-publisher publish failed 4 times"
           exit 1
 
+  # The host is Modal (deploy/README.md, section 0). Set the repository variable DEPLOY_HOST to
+  # `cloudrun` to deploy the released image to Google Cloud Run instead (section 1).
   deploy:
-    name: deploy
+    name: deploy (Modal)
+    needs: [release-please, build]
+    if: needs.release-please.outputs.release_created == 'true' && vars.DEPLOY_HOST != 'cloudrun'
+    permissions:
+      contents: read
+    # The newer "$/..." self-repository form is what zizmor suggests, but actionlint 1.7.12 (the
+    # latest release) rejects it as an invalid reusable-workflow reference; switch once it parses.
+    uses: ./.github/workflows/deploy-modal.yml # zizmor: ignore[self-repository]
+    with:
+      version: ${{ needs.release-please.outputs.version }} # /health must then report it
+
+  deploy-cloudrun:
+    name: deploy (Cloud Run)
     needs: [release-please, image]
+    if: vars.DEPLOY_HOST == 'cloudrun'
     permissions:
       contents: read
       id-token: write # Workload Identity Federation to Google Cloud
-    # The newer "$/..." self-repository form is what zizmor suggests, but actionlint 1.7.12 (the
-    # latest release) rejects it as an invalid reusable-workflow reference; switch once it parses.
     uses: ./.github/workflows/deploy.yml # zizmor: ignore[self-repository]
     with:
       image_digest: ${{ needs.image.outputs.digest }}

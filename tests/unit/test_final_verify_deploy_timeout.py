@@ -63,8 +63,4 @@ def test_the_deploy_readme_states_the_timeout_deploy_sets() -> None:
     assert f"{_deploy_timeout()} s request timeout" in readme
 
 
-def test_the_modal_app_times_out_with_cloud_run() -> None:
-    """deploy/modal_app.py is the other host: it had the same 120 s."""
-    source = (ROOT / "deploy" / "modal_app.py").read_text(encoding="utf-8")
-    [timeout] = re.findall(r"^\s+timeout=(\d+),", source, flags=re.MULTILINE)
-    assert int(timeout) == _deploy_timeout()
+# Modal's own request limit (150 s, then a redirect) is checked in test_modal_deploy.py.

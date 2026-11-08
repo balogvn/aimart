@@ -1,6 +1,7 @@
 # 0004: Host on Cloud Run's free tier with a hard spend cap
 
-- Status: accepted (supersedes the Hugging Face Spaces plan from the original handoff)
+- Status: superseded as the default host by Modal on 2026-11-08 (see the amendment at the end);
+  Cloud Run stays supported with `DEPLOY_HOST=cloudrun`
 - Date: 2026-10-17 (built in commit 40b6380; recorded 2026-10-18)
 
 ## Context and problem statement
@@ -40,3 +41,22 @@ The image stays portable: plain Docker, `$PORT`, no Cloud Run-only APIs in the a
 - Good: cold starts are survivable because facilitator initialization is lazy (ADR 0002).
 - Bad: a card is on file, so the spend cap is load-bearing. Test it.
 - Bad: cold starts add latency to the first call after idle.
+
+## Amendment (2026-11-08): Modal is the default host
+
+The owner cannot use Google Cloud or AWS. Of the hosts with a free allowance large enough for a
+2 GiB job (most free container tiers give 512 MB and a tenth of a CPU), Modal's Starter plan
+fits without a card: $30 of compute credits a month, scale to zero, a workspace budget that
+stops it instead of billing. `deploy/modal_app.py` and `deploy-modal.yml` deploy it; a release
+goes there unless `DEPLOY_HOST=cloudrun`. Differences that matter:
+
+- Modal answers a web request still running after 150 s with a 303 redirect, so the paid
+  timeouts are tighter there (60 s per conversion, 30 s of downloads per call, 15 s of queue),
+  checked by `tests/unit/test_modal_deploy.py`. Cloud Run's 300 s window is unchanged.
+- Outputs live on a Modal Volume, so download links outlive a scale-down; each call's temporary
+  files stay on local disk (`AIMART_WORK_DIR`). On Cloud Run without a bucket they lived in RAM.
+- Modal bills a container while it runs (about $0.06 an hour at 1 core and 2 GiB), not per
+  request: idle time after a call (2 minutes) costs credits too.
+- The Starter plan has no rollbacks: a failed deploy is fixed forward or redeployed from the
+  previous release's tag.
+

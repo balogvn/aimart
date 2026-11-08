@@ -55,10 +55,17 @@ def variables_read(name: str) -> set[str]:
     return set(re.findall(r"\$\{\{\s*vars\.([A-Z0-9_]+)\s*\}\}", (WORKFLOWS / name).read_text()))
 
 
-def documented_variables() -> set[str]:
-    """Every backticked name in the first column of deploy/README's variables table."""
+VARIABLE_TABLES = {
+    "modal": "### 0.2 GitHub configuration",  # the host
+    "cloudrun": "### 1.4 GitHub configuration",  # the alternative, DEPLOY_HOST=cloudrun
+}
+
+
+def documented_variables(host: str = "cloudrun") -> set[str]:
+    """Every backticked name in the first column of a host's variables table in deploy/README."""
     text = DEPLOY_README.read_text(encoding="utf-8")
-    table = text[text.index("| Variable | Required | Value |") :].split("\n\n", 1)[0]
+    section = text[text.index(VARIABLE_TABLES[host]) :]
+    table = section[section.index("| Variable | Required | Value |") :].split("\n\n", 1)[0]
     names: set[str] = set()
     for row in table.splitlines()[2:]:
         names |= set(re.findall(r"`([A-Z0-9_]+)`", row.split("|")[1]))
@@ -73,9 +80,17 @@ def smoke_flag_inputs() -> set[str]:
 
 
 # ------------------------------------------------------------------ D5 / D7: every variable documented
-@pytest.mark.parametrize("name", ["deploy.yml", "synthetic.yml"])
-def test_every_github_variable_a_workflow_reads_is_documented(name: str) -> None:
-    missing = variables_read(name) - documented_variables()
+@pytest.mark.parametrize(
+    ("name", "host"),
+    [
+        ("deploy.yml", "cloudrun"),
+        ("deploy-modal.yml", "modal"),
+        ("synthetic.yml", "cloudrun"),  # the synthetic check runs against whichever host serves
+        ("synthetic.yml", "modal"),
+    ],
+)
+def test_every_github_variable_a_workflow_reads_is_documented(name: str, host: str) -> None:
+    missing = variables_read(name) - documented_variables(host)
     assert not missing, f"{name} reads vars missing from deploy/README.md: {sorted(missing)}"
 
 

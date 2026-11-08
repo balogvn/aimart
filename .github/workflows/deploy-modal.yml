@@ -1,0 +1,98 @@
+# Deploy AImart Parquet to Modal, the current host (deploy/README.md, section 0).
+#
+# Called by release.yml after every release, with the release commit checked out, so Modal builds
+# that commit's uv.lock pins and wheel. Or run by hand (Actions -> Deploy to Modal -> Run workflow)
+# to redeploy a branch or tag, e.g. after changing a variable: every deploy passes the variables
+# below whole, so a value changed by hand in Modal is replaced (as deploy.yml does on Cloud Run).
+#
+# deploy/modal-deploy.sh does the work: build, signing keys (made once, never printed), deploy,
+# check Modal serves AIMART_PUBLIC_BASE_URL, and a selftest that runs a real conversion through
+# the isolated job child on Modal. Then scripts/smoke.py checks the public URL as for Cloud Run.
+#
+# Authentication: the production environment's secrets MODAL_TOKEN_ID and MODAL_TOKEN_SECRET (a
+# token from Modal's settings). Modal's Starter plan has no rollbacks: if a deploy fails its
+# checks, fix forward, or run this workflow on the previous release's tag.
+
+name: Deploy to Modal
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Package version the deployment must report (optional)
+        type: string
+        required: false
+        default: ""
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version /health must then report, e.g. 0.2.0 (optional)"
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: deploy to Modal
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # One deploy at a time, and never cancel one halfway.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    environment:
+      name: production
+      url: ${{ vars.AIMART_PUBLIC_BASE_URL }}
+    permissions:
+      contents: read
+    env:
+      UV_VERSION: "0.13.0"
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: "3.13"
+          enable-cache: false
+
+      - name: Deploy, check the URL, run the selftest
+        id: deploy
+        # Every value arrives through env, never `${{ }}` inside the script.
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          AIMART_PUBLIC_BASE_URL: ${{ vars.AIMART_PUBLIC_BASE_URL }}
+          AIMART_NETWORK_MODE: ${{ vars.AIMART_NETWORK_MODE }}
+          AIMART_PAY_TO_EVM: ${{ vars.AIMART_PAY_TO_EVM }}
+          AIMART_PAY_TO_SVM: ${{ vars.AIMART_PAY_TO_SVM }}
+          AIMART_FACILITATOR_URLS: ${{ vars.AIMART_FACILITATOR_URLS }}
+          AIMART_ENABLE_QUANTUM: ${{ vars.AIMART_ENABLE_QUANTUM }}
+          AIMART_JOB_MEMORY_LIMIT_MB: ${{ vars.AIMART_JOB_MEMORY_LIMIT_MB }}
+          AIMART_ARTIFACT_MAX_TOTAL_BYTES: ${{ vars.AIMART_ARTIFACT_MAX_TOTAL_BYTES }}
+        run: deploy/modal-deploy.sh
+
+      - name: Smoke test the live service (decode real 402s)
+        env:
+          URL: ${{ vars.AIMART_PUBLIC_BASE_URL }}
+          EXPECT_VERSION: ${{ inputs.version }}
+          AIMART_NETWORK_MODE: ${{ vars.AIMART_NETWORK_MODE }}
+          AIMART_PAY_TO_EVM: ${{ vars.AIMART_PAY_TO_EVM }}
+          AIMART_PAY_TO_SVM: ${{ vars.AIMART_PAY_TO_SVM }}
+          AIMART_PUBLIC_BASE_URL: ${{ vars.AIMART_PUBLIC_BASE_URL }}
+          SMOKE_SIGNING_KEY_SHA256: ${{ vars.SMOKE_SIGNING_KEY_SHA256 }}
+          AIMART_ENABLE_QUANTUM: ${{ vars.AIMART_ENABLE_QUANTUM }}
+        run: |
+          set -euo pipefail
+          flags="$(deploy/smoke-flags.sh)" # a failure here stops the step (set -e)
+          args=()
+          while IFS= read -r flag; do args+=("$flag"); done <<< "$flags"
+          if [ -n "$EXPECT_VERSION" ]; then args+=(--expect-version "$EXPECT_VERSION"); fi
+          # --wait covers the cold start (scale to zero).
+          uv run --script scripts/smoke.py "$URL" "${args[@]}" --wait 180

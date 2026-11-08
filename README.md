@@ -34,7 +34,7 @@ notes and, on the hosted service, a provenance block with a 3,309-byte ML-DSA-65
 
 > **Status:** v0.1.0. It is not yet deployed or published to PyPI. Every
 > `https://YOUR-SERVICE.run.app` below is a **placeholder** for your own deployment's URL
-> ([self-hosting](#self-hosting-on-cloud-run)). Until the PyPI release, run the local server
+> ([hosting](#hosting)). Until the PyPI release, run the local server
 > from a checkout with `make mcp`.
 
 ## Contents
@@ -46,7 +46,7 @@ notes and, on the hosted service, a provenance block with a 3,309-byte ML-DSA-65
 - [Premium quantum tier](#premium-quantum-tier)
 - [Post-quantum provenance](#post-quantum-provenance)
 - [Security model](#security-model)
-- [Self-hosting on Cloud Run](#self-hosting-on-cloud-run)
+- [Hosting](#hosting)
 - [Development](#development)
 - [Documentation](#documentation)
 
@@ -385,7 +385,11 @@ In short:
 
 The details and how to report a vulnerability are in [SECURITY.md](SECURITY.md).
 
-## Self-hosting on Cloud Run
+## Hosting
+
+The hosted service runs on Modal; Google Cloud Run is the alternative (set `DEPLOY_HOST=cloudrun`).
+Both deploys, the free-tier budgets and the spend caps are in [deploy/README.md](deploy/README.md).
+To run the container yourself:
 
 The container image (`Dockerfile`: multi-stage, digest-pinned bases, non-root) serves REST and
 MCP on `$PORT`. The minimum configuration is `AIMART_PAY_TO_EVM` and/or `AIMART_PAY_TO_SVM`

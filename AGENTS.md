@@ -167,11 +167,14 @@ Module docstrings explain the why; read the one you are about to change.
 Outside `src/`: `tests/` (`aimart_testkit.py` helpers, `unit/`, `integration/`, `quantum/`),
 `scripts/smoke.py` (live 402 decoder), `Dockerfile`, `.github/workflows/` (`ci.yml`,
 `codeql.yml`, `release.yml`, `deploy.yml`, `synthetic.yml`, `mutation.yml`, `scorecard.yml`,
-`claude-review.yml`), `deploy/` (Cloud Run: `setup-gcp.sh`, `smoke-flags.sh` shared by the
-deploy and synthetic smoke steps), `server.json` (MCP Registry manifest; prices and tools there
-must match `OPERATIONS`), `docs/examples/agent_pays.py` (paying client example). `deploy.yml`
-overwrites the service's env vars and secrets on every deploy: a runtime setting it does not
-pass (from a GitHub variable) does not exist in production.
+`claude-review.yml`, `deploy-modal.yml`), `deploy/` (Modal, the host: `modal_app.py` with the
+web function and the deploy's selftest, `modal-deploy.sh`, `modal_keys.py`; Cloud Run, the
+alternative with `DEPLOY_HOST=cloudrun`: `setup-gcp.sh`; `smoke-flags.sh` shared by both deploys'
+and the synthetic smoke steps), `server.json` (MCP Registry manifest; prices and tools there
+must match `OPERATIONS`), `docs/examples/agent_pays.py` (paying client example). Both deploys
+pass the service's whole configuration on every deploy: a runtime setting they do not pass (from
+a GitHub variable, or `RUNTIME_ENV` in `deploy/modal_app.py`) does not exist in production. On
+Modal a web request may last 150 s; `tests/unit/test_modal_deploy.py` keeps paid calls inside it.
 
 Docs: [architecture](docs/architecture.md), [payments](docs/payments.md), [privacy](docs/privacy.md),
 [agents guide](docs/agents-guide.md), [quantum tier](docs/quantum.md),
