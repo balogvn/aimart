@@ -176,13 +176,16 @@ def _transcode(read: Opener, dst: Path, encoding: str) -> int:
         except UnicodeError as exc:
             # Errors that "replace" cannot absorb: the generic 'utf-16' and 'utf-32' decoders
             # refuse a stream without a byte-order mark. It used to escape as a bare 500.
-            raise _undecodable(encoding, exc) from exc
+            raise undecodable(encoding, exc) from exc
         replaced += tail.count("�")
         fout.write(tail)
     return replaced
 
 
-def _undecodable(encoding: str, exc: UnicodeError) -> InvalidInput:
+def undecodable(encoding: str, exc: UnicodeError) -> InvalidInput:
+    """The error for text the forced ``encoding`` cannot decode, wherever it is decoded: here,
+    and in a reader that decodes what to_utf8 passed through unchecked (options.encoding
+    'utf-8')."""
     name = codecs.lookup(encoding).name
     reason = exc.reason if isinstance(exc, UnicodeDecodeError) else "decoding failed"
     hint = (

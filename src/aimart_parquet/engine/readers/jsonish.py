@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import string
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import duckdb
@@ -30,7 +31,7 @@ from json_repair import repair_json
 from aimart_parquet.engine.duck import ident, literal
 from aimart_parquet.engine.models import InputFormat
 from aimart_parquet.engine.readers import RAW_TABLE, RawColumn, RawTable
-from aimart_parquet.engine.text import to_utf8
+from aimart_parquet.engine.text import to_utf8, undecodable
 from aimart_parquet.errors import (
     AimartError,
     InputTooLarge,
@@ -40,6 +41,7 @@ from aimart_parquet.errors import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
     from aimart_parquet.engine.limits import Limits
@@ -371,8 +373,21 @@ def _find_records(doc: Any, path: str | None) -> tuple[list[Any], str | None]:
     return [doc], None  # a single object is a one-row table
 
 
+@contextmanager
+def _utf8_decoding() -> Iterator[None]:
+    """Where the reader decodes its file itself, which is UTF-8 unless options.encoding said
+    'utf-8' of bytes that are not: to_utf8 passes those through unchecked. A cp1252 export sent
+    so raised UnicodeDecodeError here, a bare 500 after the payment (the CSV reader's DuckDB
+    refuses the same bytes, typed). It is the 422 the transcoder gives such an encoding."""
+    try:
+        yield
+    except UnicodeDecodeError as exc:
+        raise undecodable("utf-8", exc) from exc
+
+
 def _load_python(path: Path, limits: Limits, warnings: list[str]) -> Any:
-    text = path.read_text(encoding="utf-8")
+    with _utf8_decoding():
+        text = path.read_text(encoding="utf-8")
     try:
         return json.loads(text)
     except RecursionError as exc:
@@ -415,7 +430,7 @@ def _load_python(path: Path, limits: Limits, warnings: list[str]) -> Any:
 def _looks_like_ndjson(path: Path) -> bool:
     """The first two non-empty lines are each a complete JSON object."""
     seen = 0
-    with path.open("r", encoding="utf-8") as fh:
+    with _utf8_decoding(), path.open("r", encoding="utf-8") as fh:
         for line in fh:
             stripped = line.strip()
             if not stripped:

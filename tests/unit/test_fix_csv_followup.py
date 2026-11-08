@@ -23,11 +23,17 @@ header, an empty sheet or Parquet file), or casting a column with no values to a
 crashed: DuckDB's ``count_if`` is NULL, not 0, when no row gives it a value, and ``int(None)``
 raised TypeError, the 500 that says "Retry" after the payment, for a file that converts without
 the schema. It is the same table now, typed as declared.
+
+CF4, at d83c738 too. JSON or NDJSON whose bytes are not UTF-8, sent with options.encoding
+'utf-8' (which to_utf8 trusts, unchecked), raised UnicodeDecodeError in the JSON reader's own
+decoding (``_looks_like_ndjson``, ``_load_python``): a bare 500 after the payment. It is the 422
+the transcoder gives a forced encoding the bytes do not fit, whose hint says to omit encoding.
 """
 
 from __future__ import annotations
 
 import gzip
+import json
 from typing import TYPE_CHECKING, Any
 
 import duckdb
@@ -298,3 +304,47 @@ def test_expected_schema_over_other_readers_with_no_rows(tmp_path: Path) -> None
     typed = kit.convert_path(empty, expected_schema=schema)
     assert typed.report.rows == 0
     assert typed.table.schema == pa.schema([("id", pa.decimal128(10, 2)), ("name", pa.int64())])
+
+
+# ------------------------------------------- CF4: JSON that is not the UTF-8 it was sent as
+_RECORDS = [{"id": i, "name": n} for i, n in enumerate(_NAMES[:30])]
+_JSON_LAYOUTS = {
+    "array": ("records.json", json.dumps(_RECORDS, ensure_ascii=False)),
+    "ndjson": (
+        "records.ndjson",
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in _RECORDS),
+    ),
+    "envelope": ("records.json", json.dumps({"data": {"items": _RECORDS}}, ensure_ascii=False)),
+    "broken": ("records.json", json.dumps(_RECORDS, ensure_ascii=False)[:-1] + ",]"),
+}
+
+
+def _wrapped(wrap: str, name: str, data: bytes) -> tuple[str, bytes]:
+    if wrap == "gz":
+        return name + ".gz", gzip.compress(data)
+    if wrap == "zip":
+        return "records.zip", kit.zip_bytes({name: data})
+    return name, data
+
+
+@pytest.mark.parametrize("wrap", ["plain", "gz", "zip"])
+@pytest.mark.parametrize("layout", list(_JSON_LAYOUTS))
+def test_json_that_is_not_the_utf8_it_was_sent_as_is_an_unpaid_422(
+    tmp_path: Path, layout: str, wrap: str
+) -> None:
+    # d83c738 and 4510071: UnicodeDecodeError ('utf-8' codec can't decode byte 0xe9 ...), the
+    # untyped 500. The CSV reader's DuckDB refuses the same bytes itself, typed.
+    name, text = _JSON_LAYOUTS[layout]
+    filename, data = _wrapped(wrap, name, text.encode("cp1252"))
+    with pytest.raises(InvalidInput) as info:
+        _in_the_call_directory(tmp_path / "forced", filename, data, encoding="utf-8")
+    assert info.value.http_status == 422
+    assert info.value.message == "The file cannot be decoded as utf-8: invalid continuation byte."
+    assert info.value.hint == "Pass the file's actual encoding, or omit encoding to detect it."
+    # What the hint says works: the bytes' own encoding, detected or named.
+    for encoding in (None, "cp1252"):
+        converted = _in_the_call_directory(
+            tmp_path / f"{encoding}", filename, data, encoding=encoding
+        )
+        assert converted.rows["name"] == _NAMES[:30]
+        assert converted.report.encoding == "cp1252"
