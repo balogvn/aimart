@@ -52,6 +52,10 @@ Pass exactly one input:
 - REST only: `POST /v1/convert/upload` as multipart (`file`, plus optional `options` as a
   JSON string).
 
+A file may be gzip-, bz2- or zip-compressed, once or twice: a zip of `data.csv.gz` is read as
+the CSV. Compressed three times, or with xz, zstd, lz4, 7z or rar, it is refused with 415
+`unsupported_format` ("The file is xz-compressed, which is not read here."), unpaid.
+
 Over MCP, `inspect_parquet`, `preview_parquet` and `query_parquet` take an `artifact_id` or a
 `url`, not `content_base64`: convert the file first.
 

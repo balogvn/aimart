@@ -34,12 +34,20 @@ the transcoder gives a forced encoding the bytes do not fit, whose hint says to 
 XA2, at d83c738 too. Where those bytes came after the first 8 KB of NDJSON, Python never decoded
 them: DuckDB's lenient pass skipped their line, and the rest was a 200 with a warning, charged.
 For the JSON reader to_utf8 now checks a forced 'utf-8' to the end (``check_forced``).
+
+XA1, at d83c738 too. ``convert.unwrap`` removed one layer of compression, and the next one's
+compressed bytes were read as text: a zip of data.csv.gz, sent without options.encoding, was a
+200 of 10 rows of cp1252 garbage, and so was a gzip of a gzip. It removes up to two layers now,
+each to the same cap and checks, and refuses a third, and compression no reader reads (xz,
+zstd), typed and unpaid. bz2 is known by more than its 'BZh': a CSV beginning so was a 422.
 """
 
 from __future__ import annotations
 
+import bz2
 import gzip
 import json
+import lzma
 from typing import TYPE_CHECKING, Any
 
 import duckdb
@@ -52,7 +60,7 @@ from aimart_parquet.engine import convert as convert_module
 from aimart_parquet.engine import safety
 from aimart_parquet.engine.limits import Limits
 from aimart_parquet.engine.models import ConvertOptions
-from aimart_parquet.errors import InvalidInput
+from aimart_parquet.errors import InputTooLarge, InvalidInput, UnsupportedFormat
 from aimart_parquet.service import Service
 
 if TYPE_CHECKING:
@@ -139,17 +147,18 @@ def test_json_under_a_compressed_name_is_read_by_duckdb_as_text(
 _CSV500 = "id,name\n" + "".join(f"{i},n{i}\n" for i in range(500))
 
 
-def test_a_gzip_member_sent_as_utf8_is_refused_not_misread(tmp_path: Path) -> None:
+def test_a_gzip_member_sent_as_utf8_is_read_not_misread(tmp_path: Path) -> None:
     # A zip's member that is itself a gzip, with encoding 'utf-8' (agents send it by default),
     # is neither checked nor transcoded. d83c738 and 4510071 let DuckDB inflate it by its name
     # while the dialect and header were sniffed from its compressed bytes: a paid 200 with 500
-    # rows under three columns named from that binary ('j_1r_9_e_e_3_s_f_...'). DuckDB reads the
-    # bytes that were sniffed now, and they are not text: a 422, unpaid.
+    # rows under three columns named from that binary ('j_1r_9_e_e_3_s_f_...'). f3231a2 made
+    # DuckDB read the bytes that were sniffed, which are not text, and this asserted that 422
+    # ('Could not parse the file as delimited text'), unpaid. Since XA1 unwrap inflates the
+    # member too, and its 500 rows convert.
     archive = kit.zip_bytes({"data.csv.gz": gzip.compress(_CSV500.encode())})
-    with pytest.raises(InvalidInput, match="Could not parse the file as delimited text") as info:
-        _in_the_call_directory(tmp_path / "call", "data.zip", archive, encoding="utf-8")
-    assert info.value.http_status == 422
-    assert "options.encoding" in (info.value.hint or "")
+    result = _in_the_call_directory(tmp_path / "call", "data.zip", archive, encoding="utf-8")
+    assert result.rows["id"] == list(range(500))
+    assert result.rows["name"] == [f"n{i}" for i in range(500)]
 
 
 # ------------------------------------------------ CF2: a later member's header past 32 KiB
@@ -391,3 +400,164 @@ def test_ndjson_sent_as_utf8_that_is_not_all_utf8_is_refused_not_cut(
         assert converted.report.rows == 5_001
         assert converted.rows["name"][at] == "Café"
         assert converted.report.warnings == []
+
+
+# --------------------------------------------- XA1: a compressed file inside a zip or a gzip
+_PLAIN = _CSV500.encode()
+_NESTED: dict[str, tuple[str, bytes]] = {
+    "zip-of-gzip": ("data.zip", kit.zip_bytes({"data.csv.gz": gzip.compress(_PLAIN)})),
+    "zip-of-gzip-named-csv": ("data.zip", kit.zip_bytes({"data.csv": gzip.compress(_PLAIN)})),
+    "zip-of-bz2": ("data.zip", kit.zip_bytes({"data.csv.bz2": bz2.compress(_PLAIN)})),
+    "zip-of-zip": ("data.zip", kit.zip_bytes({"data.csv.zip": kit.zip_bytes({"d.csv": _PLAIN})})),
+    "gzip-of-gzip": ("data.csv.gz.gz", gzip.compress(gzip.compress(_PLAIN))),
+    "gzip-of-gzip-named-once": ("data.csv.gz", gzip.compress(gzip.compress(_PLAIN))),
+    "gzip-of-bz2": ("data.csv.bz2.gz", gzip.compress(bz2.compress(_PLAIN))),
+    "bz2-of-gzip": ("data.csv.gz.bz2", bz2.compress(gzip.compress(_PLAIN))),
+    "gzip-of-zip": ("data.zip.gz", gzip.compress(kit.zip_bytes({"data.csv": _PLAIN}))),
+}
+
+
+@pytest.mark.parametrize(
+    "options", [{}, {"encoding": "cp1252"}, {"format": "csv"}], ids=["auto", "cp1252", "csv"]
+)
+@pytest.mark.parametrize("layout", list(_NESTED))
+def test_a_compressed_file_inside_a_zip_or_a_gzip_is_inflated(
+    tmp_path: Path, layout: str, options: dict[str, str]
+) -> None:
+    # d83c738 and 0a0f26d removed one layer and read the next one's compressed bytes as cp1252
+    # text: for a zip of data.csv.gz, a 200 with 10 rows under three columns named from the
+    # binary ('y_1r_9_œa_e_e_3_...') and a warning that 35 characters could not be decoded.
+    filename, data = _NESTED[layout]
+    result = _in_the_call_directory(tmp_path / "call", filename, data, **options)
+    assert result.rows["id"] == list(range(500))
+    assert result.rows["name"] == [f"n{i}" for i in range(500)]
+    assert result.report.warnings == []
+    # Neither layer outlives its read (the work directory is on Cloud Run's RAM disk).
+    left = {p.name for p in (tmp_path / "call").rglob("*") if p.is_file()}
+    assert left == {"upload", "raw_text.parquet", "out.parquet"}
+
+
+@pytest.mark.parametrize("wrap", ["zip", "gzip"])
+def test_cp1252_and_json_inside_two_layers_read_as_in_one(tmp_path: Path, wrap: str) -> None:
+    once = {
+        "csv": kit.convert_bytes(tmp_path, "export.csv.gz", gzip.compress(_CSV.encode("cp1252"))),
+        "json": kit.convert_bytes(tmp_path, "r.ndjson.gz", gzip.compress(_NDJSON.encode())),
+    }
+    twice = {
+        "csv": ("export.csv.gz", gzip.compress(_CSV.encode("cp1252"))),
+        "json": ("r.ndjson.gz", gzip.compress(_NDJSON.encode())),
+    }
+    for kind, (member, data) in twice.items():
+        if wrap == "zip":
+            filename, outer = "export.zip", kit.zip_bytes({member: data})
+        else:
+            filename, outer = member + ".gz", gzip.compress(data)
+        result = _in_the_call_directory(tmp_path / f"{kind}-{wrap}", filename, outer)
+        assert result.rows == once[kind].rows
+        assert result.report.encoding == once[kind].report.encoding
+        assert result.report.warnings == once[kind].report.warnings
+
+
+_MB = 1024 * 1024
+_BOMB = gzip.compress(b"0" * 3 * _MB)  # 3 MB of zeros in 3 KB
+
+
+@pytest.mark.parametrize(
+    ("filename", "data", "error", "message"),
+    [
+        (
+            "data.zip",
+            kit.zip_bytes({"data.csv.gz": _BOMB}),
+            InputTooLarge,
+            "Decompressed input exceeds the 1 MB limit.",
+        ),
+        ("data.csv.gz.gz", gzip.compress(_BOMB), InputTooLarge, "Decompressed input exceeds"),
+        (
+            "data.zip",
+            kit.zip_bytes({"data.csv.gz": gzip.compress(_PLAIN)[:-20]}),
+            InvalidInput,
+            "The gzip stream is corrupt or truncated: Compressed file ended before the "
+            "end-of-stream marker was reached",
+        ),
+        (
+            "data.zip",
+            kit.zip_bytes({"inner.zip": kit.zip_bytes({"a.csv": _PLAIN, "b.csv": _PLAIN})}),
+            InvalidInput,
+            "Zip archive must contain exactly one data file; found 2.",
+        ),
+    ],
+    ids=["zip-of-a-gzip-bomb", "gzip-of-a-gzip-bomb", "zip-of-a-cut-gzip", "zip-of-a-zip-of-two"],
+)
+def test_the_second_layer_meets_the_caps_and_checks_of_the_first(
+    tmp_path: Path, filename: str, data: bytes, error: type[Exception], message: str
+) -> None:
+    # Unpacked as a top-level stream is: the same cap (a 1 MB one here), the same typed errors,
+    # and no layer written past the cap.
+    work = tmp_path / "call"
+    upload = kit.write(work / "upload", data)
+    with pytest.raises(error) as info:
+        convert_module.convert_file(
+            upload,
+            work / "out.parquet",
+            filename=filename,
+            options=ConvertOptions(),
+            workdir=work,
+            limits=Limits(max_decompressed_bytes=_MB),
+        )
+    assert str(info.value).startswith(message)
+    assert all(p.stat().st_size <= _MB for p in work.rglob("*") if p.is_file())
+
+
+def test_a_third_layer_is_refused_naming_each(tmp_path: Path) -> None:
+    # d83c738 and 0a0f26d: '422 The file contains no rows.', from the binary of the second.
+    data = kit.zip_bytes({"data.csv.gz.gz": gzip.compress(gzip.compress(_PLAIN))})
+    with pytest.raises(UnsupportedFormat) as info:
+        _in_the_call_directory(tmp_path / "call", "data.zip", data)
+    assert info.value.http_status == 415
+    assert info.value.message == (
+        "The file is compressed three times over (a gzip inside a gzip inside a zip); "
+        "two layers at most are unpacked."
+    )
+    assert info.value.hint == "Send it compressed once, e.g. data.csv.gz or a zip of data.csv."
+
+
+_XZ = lzma.compress(_PLAIN)
+_ZSTD = b"\x28\xb5\x2f\xfd" + bytes(range(256)) * 4  # its frame magic, then anything
+
+
+@pytest.mark.parametrize(
+    ("filename", "data", "kind"),
+    [
+        ("data.csv", _XZ, "xz"),
+        ("data.zip", kit.zip_bytes({"data.csv": _XZ}), "xz"),
+        ("data.csv", _ZSTD, "zstd"),
+        ("data.csv.gz", gzip.compress(_ZSTD), "zstd"),
+    ],
+    ids=["xz-named-csv", "zip-of-xz", "zstd-named-csv", "gzip-of-zstd"],
+)
+@pytest.mark.parametrize("options", [{}, {"format": "csv"}], ids=["auto", "csv"])
+def test_compression_no_reader_reads_is_refused_not_read_as_text(
+    tmp_path: Path, filename: str, data: bytes, kind: str, options: dict[str, str]
+) -> None:
+    # d83c738 and 0a0f26d read xz named data.csv as cp1252 text: a 200 with 128 rows of garbage.
+    with pytest.raises(UnsupportedFormat) as info:
+        _in_the_call_directory(tmp_path / "call", filename, data, **options)
+    assert info.value.http_status == 415
+    assert info.value.message == f"The file is {kind}-compressed, which is not read here."
+    assert info.value.hint == "Send it uncompressed, or compressed with gzip, bz2 or zip."
+
+
+@pytest.mark.parametrize("wrap", ["plain", "gzip", "zip"])
+def test_text_that_begins_like_bz2_is_read_as_text(tmp_path: Path, wrap: str) -> None:
+    # bz2 begins 'BZh', its block size and its first block's magic. On 'BZh' alone, d83c738 and
+    # 0a0f26d refused this CSV as a corrupt bz2 stream (422), and converted its gzip and zip.
+    text = b"BZh_code,amount\n" + b"".join(b"BZ%d,%d.5\n" % (i, i) for i in range(50))
+    filename, data = {
+        "plain": ("codes.csv", text),
+        "gzip": ("codes.csv.gz", gzip.compress(text)),
+        "zip": ("codes.zip", kit.zip_bytes({"codes.csv": text})),
+    }[wrap]
+    result = _in_the_call_directory(tmp_path / "call", filename, data)
+    codes, amounts = result.rows.values()
+    assert codes == [f"BZ{i}" for i in range(50)]
+    assert amounts == [i + 0.5 for i in range(50)]

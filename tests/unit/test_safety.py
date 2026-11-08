@@ -20,10 +20,17 @@ MB = 1024 * 1024
     ("magic", "expected"),
     [
         (b"\x1f\x8b\x08\x00", "gzip"),
-        (b"BZh91AY", "bz2"),
+        (b"BZh91AY&SY", "bz2"),
+        (b"BZh1\x17rE8P\x90", "bz2"),  # an empty stream: its end, where a block would be
         (b"PK\x03\x04", "zip"),
         (b"a,b\n", None),
         (b"", None),
+        # Until XA1 'BZh' alone was bz2, and this case was b"BZh91AY" (7 bytes): text may begin
+        # 'BZh' (a CSV header 'BZh_code' was refused as a corrupt bz2 stream), and a stream is
+        # known by its block size and its first block's magic, SNIFF_BYTES in all.
+        (b"BZh_code,a", None),
+        (b"BZh91AY", None),
+        (b"BZh01AY&SY", None),
     ],
 )
 def test_sniff_compression(magic: bytes, expected: str | None) -> None:

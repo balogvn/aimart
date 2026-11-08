@@ -235,8 +235,9 @@ must be switched on explicitly by the operator. See [docs/payments.md](docs/paym
 | Parquet | `.parquet` `.pq` | re-typed and re-compressed |
 | PDF (digital) | `.pdf` | tables with or without borders; tables continuing across pages are merged; pick pages with `pdf_pages` (`"1-3,7"`) and a table with `pdf_table`; the report lists every table found. Scanned PDFs (images, no text layer) are rejected: no OCR. Password-protected PDFs are rejected with an error that says so |
 
-Any of these can also arrive gzip-, bz2- or zip-compressed. Detection uses magic bytes before
-extensions. Every column in the report carries its type, null count, rejected values with
+Any of these can also arrive gzip-, bz2- or zip-compressed, once or twice (a zip of
+`data.csv.gz` is read as the CSV); xz, zstd, lz4, 7z and rar, and a third layer, are refused
+with 415 `unsupported_format`. Detection uses magic bytes before extensions. Every column in the report carries its type, null count, rejected values with
 examples, and notes on anything the service assumed: "assumed day-first", "ambiguous
 thousands/decimal separator; assumed a decimal comma, so '1.234' is 1234" (the column's own
 values decide, then the file's other number columns when they agree and one writes a thousands group with a

@@ -67,20 +67,22 @@ Module docstrings explain the why; read the one you are about to change.
   report it. You were not charged.". `without_paths()` strips server paths from any message
   built from a library's exception text.
 - `engine/`: the pure conversion engine. `detect.py` (magic bytes over extensions; a `%PDF-` header
-  anywhere in the first 1 KB), `safety.py` (gzip/zip bomb caps; `gzip_chunks`, the pass that lets
-  DuckDB read a gzip only where it reads it as Python does: one member), `text.py` (UTF-8
-  transcoding, from a file or, with `transcode`, a gzip stream counted to its end first;
-  `replace=True` renames the UTF-8 version over the reader's input; a forced 'utf-8' is checked
-  only with `check_forced`, which the JSON reader passes),
+  anywhere in the first 1 KB), `safety.py` (gzip/zip bomb caps; `sniff_compression` and
+  `unread_compression`, the compression a file starts with, bz2 by its block magic, not 'BZh'
+  alone; `gzip_chunks`, the pass that lets DuckDB read a gzip only where it reads it as Python
+  does: one member), `text.py` (UTF-8 transcoding, from a file or, with `transcode`, a gzip
+  stream counted to its end first; `replace=True` renames the UTF-8 version over the reader's
+  input; a forced 'utf-8' is checked only with `check_forced`, which the JSON reader passes),
   `duck.py` (sandboxed DuckDB; `NOWHERE` for every `$HOME`-derived setting), `readers/` (delimited,
   jsonish, excel, statistical, columnar, pdf; the `READERS` map is in `convert.py`), `infer.py`
   (type ladder in SQL; the number convention is decided per column, then by the file's other number
   columns when they agree and one writes '1,234.5' or '1.234,5', else by the dialect; text with a
   zone only ever becomes TIMESTAMPTZ; constant lists go through `_one_of`, never `IN`), `names.py`,
   `convert.py` (pipeline, `expected_schema`, report; CSV/TSV jobs run DuckDB on one thread; a gzip
-  of CSV/TSV of one member is read by DuckDB as it is, `keep_gzip`; `unwrap` hands a reader a
-  file of the pipeline's own, deleted once it returns), `writer.py` (DuckDB `COPY` by default,
-  pyarrow when labels exist), `inspect.py` (footer-only stats), `tabular.py` (preview
+  of CSV/TSV of one member is read by DuckDB as it is, `keep_gzip`; `unwrap` removes up to two
+  layers of gzip, bz2 or zip, refusing a third and compression no reader reads, and hands a
+  reader a file of the pipeline's own, deleted once it returns), `writer.py` (DuckDB `COPY` by
+  default, pyarrow when labels exist), `inspect.py` (footer-only stats), `tabular.py` (preview
   and SELECT-only query: inputs are views over DuckDB's own Parquet reader (`_native_view`), long
   cells are cut inside DuckDB, rows are built by position, results over `MAX_RESULT_BYTES` are
   refused), `isolate.py`
@@ -440,6 +442,13 @@ each test's docstring has the incident.
   (`check_forced`): its own decoding raised UnicodeDecodeError, and DuckDB's lenient NDJSON
   pass skipped a later line, a 200 for the rest (XA2).
   (`unit/test_final_integrate_corrupt_streams.py`, `unit/test_fix_csv_followup.py`)
+- **Compressed bytes read as text.** `unwrap` removed one layer, and the next one's compressed
+  bytes were read as cp1252 text: a zip of data.csv.gz, sent without `encoding`, was a 200 of
+  10 garbage rows (d83c738 too), and xz named data.csv one of 128. It removes up to two layers
+  of gzip, bz2 or zip, each to the same cap and checks as the first, and refuses a third and
+  compression no reader reads (xz, zstd, lz4, 7z, rar), 415. bz2 is known by its block size and
+  block magic: 'BZh' alone begins text too, and a CSV whose header began so was a 422.
+  (`unit/test_fix_csv_followup.py`, XA1)
 - **Numbers in the wrong convention** ('1.5' as 15 in an EU column, '1.234' as 1.234 in a
   semicolon file). Casts are gated on the style's own pattern (`_style_fit`; never `TRY_CAST` an
   unmatched value: DuckDB reads '1_000' as 1000), the convention is decided per column
@@ -526,8 +535,9 @@ each test's docstring has the incident.
   files: a 1.5 MB gzip CSV wrote 500 MB into the work directory while RSS alone stayed under it.
   (`integration/test_final_isolate_disk.py`, `integration/test_final_integrate_stream_cap.py`)
   No input outlives its read: a gzip of UTF-8 CSV of one member is never unpacked, a
-  non-UTF-8 text's UTF-8 version replaces its input, and the caller's file or a stored artifact
-  is never deleted or written (`unit/test_final_integrate_transcode_files.py`,
+  non-UTF-8 text's UTF-8 version replaces its input, a second layer's compressed file is
+  deleted once unpacked, and the caller's file or a stored artifact is never deleted or written
+  (`unit/test_final_integrate_transcode_files.py`,
   `unit/test_fix_csv_memory.py`, `unit/test_final_isolate_service.py`).
 - **Charged for a response nobody received.** Cloud Run's 120 s request timeout answered 504
   to paid calls the payment window lets run 300 s, and the x402 middleware settled one that
@@ -556,7 +566,8 @@ macOS, as at d83c738 (deploy/README.md), likely a 413 on Linux, whose RSS counts
 forkserver's shared pages; transcoding from the bz2 or zip stream, as from a gzip, would drop
 the unpacked text. A gzip of more than one member (concatenated, appended to a row at a time,
 bgzip's blocks) is unpacked too, as at d83c738, so it holds the unpacked text while it is read,
-as a bz2 does. (The 422 for a time past 9999 in preview and query and the 413 for
+as a bz2 does; a file compressed twice also holds its second layer while that is unpacked.
+(The 422 for a time past 9999 in preview and query and the 413 for
 `read_csv` running out of memory are tested in `integration/test_final_isolate_gaps.py`;
 DuckDB's `memory_limit` no longer sits above the job cap, `unit/test_fix_csv_memory.py`.)
 

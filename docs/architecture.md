@@ -90,10 +90,11 @@ flowchart LR
    a workbook's XML parts, every sheet counted though one is parsed, have their own
    `max_workbook_xml_bytes` (512 MB). See [ADR 0005](adr/0005-job-isolation-forkserver.md).
 5. **Engine** (`engine/`). Detection by magic bytes (`detect.py`) is followed by bomb-safe
-   decompression (`safety.py`) and UTF-8 transcoding (`text.py`). A reader (`readers/`)
-   produces a raw table in a locked-down DuckDB connection (`duck.py`); for delimited text
-   it is a view over a compressed Parquet copy of the text, so memory stays flat as files
-   grow, and DuckDB's memory limit sits under the job's cap (`limits.py`). Because `/tmp` is
+   decompression (`safety.py`: gzip, bz2 or zip, and one more layer inside, such as a zip of a
+   gzip; xz, zstd and a third layer are refused) and UTF-8 transcoding (`text.py`). A reader
+   (`readers/`) produces a raw table in a locked-down DuckDB connection (`duck.py`); for
+   delimited text it is a view over a compressed Parquet copy of the text, so memory stays
+   flat as files grow, and DuckDB's memory limit sits under the job's cap (`limits.py`). Because `/tmp` is
    RAM on Cloud Run, a gzip of CSV or TSV of one member is not decompressed at all (DuckDB
    reads it, once a Python pass has counted all of it against the bomb cap; text that is not
    UTF-8 is transcoded from the stream after that pass), and any decompressed or transcoded

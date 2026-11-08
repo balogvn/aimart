@@ -243,9 +243,14 @@ def test_a_gzip_is_kept_only_as_what_its_unpacked_text_is_read_as(tmp_path, name
 def test_a_kept_gzip_takes_a_forced_format(tmp_path) -> None:
     work = tmp_path / "work"
     work.mkdir()
-    zipped = kit.write(tmp_path / "a.gz", gzip.compress(b"PK\x03\x04" + b"\0" * 40))
-    kept = keep_gzip(zipped, "a.xlsx.gz", work, F.CSV)
+    records = kit.write(tmp_path / "a.gz", gzip.compress(b'[{"a": 1}]'))
+    kept = keep_gzip(records, "a.json.gz", work, F.CSV)
     assert kept is not None
-    assert kept[1:] == ("a.xlsx", F.CSV)
+    assert kept[1:] == ("a.json", F.CSV)
     text = kit.write(tmp_path / "b.gz", gzip.compress(_CSV))
     assert keep_gzip(text, "a.csv.gz", work, F.JSON) is None
+    # This asserted that a gzip of a zip's signature was kept as CSV too, its bytes read as
+    # text. Since XA1 compressed bytes inside a gzip are unwrapped whatever the format: a gzip
+    # of a zip of data.csv, sent with format 'csv', converted as cp1252 garbage.
+    zipped = kit.write(tmp_path / "c.gz", gzip.compress(b"PK\x03\x04" + b"\0" * 40))
+    assert keep_gzip(zipped, "a.xlsx.gz", work, F.CSV) is None

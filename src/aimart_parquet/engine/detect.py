@@ -12,7 +12,7 @@ import zipfile
 from pathlib import Path
 
 from aimart_parquet.engine.models import InputFormat
-from aimart_parquet.engine.safety import MAGIC_BYTES, sniff_compression
+from aimart_parquet.engine.safety import MAGIC_BYTES, SNIFF_BYTES, sniff_compression
 from aimart_parquet.errors import UnsupportedFormat
 
 _SAS7BDAT_MAGIC = bytes.fromhex("000000000000000000000000c2ea8160b31411cfbd92080009c7318c181f1011")
@@ -229,7 +229,7 @@ def format_from_start(
     """
     if forced is not None:
         return forced
-    if sniff_compression(start[:8]) is not None:
+    if sniff_compression(start[:SNIFF_BYTES]) is not None:
         return None
     magic = start[:MAGIC_BYTES]
     if not whole and (

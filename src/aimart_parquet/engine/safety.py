@@ -44,14 +44,42 @@ def read_magic(path: Path, n: int = MAGIC_BYTES) -> bytes:
         return fh.read(n)
 
 
+# The bytes ``sniff_compression`` and ``unread_compression`` judge a file's start by.
+SNIFF_BYTES = 10
+# After 'BZh', a bz2 stream's block size, then its first block's magic (or its end's, when it
+# holds nothing).
+_BZ2_LEVELS = tuple(bytes([b]) for b in b"123456789")
+_BZ2_BLOCKS = (b"1AY&SY", b"\x17rE8P\x90")
+
+
 def sniff_compression(magic: bytes) -> Compression | None:
+    """The compression ``convert.unwrap`` removes that ``magic``, a file's first SNIFF_BYTES,
+    begins with."""
     if magic.startswith(b"\x1f\x8b"):
         return "gzip"
-    if magic.startswith(b"BZh"):
+    # 'BZh' alone is text a CSV may begin with (a header 'BZh_code'), which was then refused as
+    # a corrupt bz2 stream; inside a gzip it converted.
+    if magic[:3] == b"BZh" and magic[3:4] in _BZ2_LEVELS and magic[4:10] in _BZ2_BLOCKS:
         return "bz2"
     if magic.startswith(b"PK\x03\x04"):
         return "zip"
     return None
+
+
+# Compression no reader here reads, by its magic. Read as text, xz named data.csv was a 200 of
+# cp1252 garbage; now it is refused, as is any of these inside a zip or a gzip.
+_UNREAD = {
+    b"\xfd7zXZ\x00": "xz",
+    b"\x28\xb5\x2f\xfd": "zstd",
+    b"\x04\x22\x4d\x18": "lz4",
+    b"7z\xbc\xaf\x27\x1c": "7z",
+    b"Rar!\x1a\x07": "rar",
+}
+
+
+def unread_compression(magic: bytes) -> str | None:
+    """The name of the compression no reader here reads that ``magic`` begins with, or None."""
+    return next((kind for start, kind in _UNREAD.items() if magic.startswith(start)), None)
 
 
 class Readable(Protocol):

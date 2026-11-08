@@ -56,7 +56,12 @@ from aimart_parquet.engine.readers.jsonish import read_json
 from aimart_parquet.engine.readers.pdf import read_pdf
 from aimart_parquet.engine.readers.statistical import labels_json, read_statistical
 from aimart_parquet.engine.writer import copy_to_parquet, write_parquet
-from aimart_parquet.errors import InputTooLarge, InvalidRequest, SchemaViolation
+from aimart_parquet.errors import (
+    InputTooLarge,
+    InvalidRequest,
+    SchemaViolation,
+    UnsupportedFormat,
+)
 
 if TYPE_CHECKING:
     from aimart_parquet.engine.limits import Limits
@@ -109,10 +114,19 @@ class _Output:
     extra_rejects: int = 0
 
 
+# The layers of compression unwrap removes: a gzip or bz2 stream or a zip, and one more inside
+# it (a zip of data.csv.gz, a gzip of a gzip). With one removed, the next one's compressed bytes
+# were read as text: a zip of data.csv.gz, sent without options.encoding, converted as cp1252,
+# a 200 of 10 rows under columns named from the binary (at d83c738 too). A third is refused.
+_LAYERS = 2
+
+
 def unwrap(
     src: Path, filename: str | None, workdir: Path, limits: Limits
 ) -> tuple[Path, str | None]:
-    """Remove one layer of gzip/bz2/zip. Office documents are zips too and are left alone.
+    """Remove the compression: a gzip or bz2 stream or a zip's one data file, and one more such
+    layer inside it. Office documents are zips too and are left alone; compression no reader
+    reads (xz, zstd) is refused.
 
     The result is always a new file inside ``workdir``, never ``src``: DuckDB is sandboxed to
     that directory, and the result is the pipeline's own (a reader may replace it, and
@@ -120,16 +134,53 @@ def unwrap(
     archive is unpacked from where it lies (Python reads it; only DuckDB is held to
     ``workdir``): every input outside the work directory used to be copied in first, and that
     copy (up to 50 MB) sat on Cloud Run's RAM disk for the whole job next to the text unpacked
-    from it.
+    from it. A second layer is unpacked like the first, to the same cap, and the file it was
+    in is deleted once it is.
     """
-    kind = safety.sniff_compression(safety.read_magic(src, 8))
-    if kind in {"gzip", "bz2"}:
-        dst = workdir / safety.DECOMPRESSED
-        safety.decompress_stream(src, dst, kind, limits.max_decompressed_bytes)
-        return dst, _without_compression(filename)
-    if kind == "zip" and _zip_office_format(src) is None:
-        return safety.extract_single_member(src, workdir, limits.max_decompressed_bytes)
-    return _link(src, workdir, "input" + "".join(src.suffixes[-2:])), filename
+    path, name = src, filename
+    layers: list[str] = []
+    while (kind := _compression(path)) is not None:
+        layers.append(kind)
+        if len(layers) > _LAYERS:
+            inside = " inside ".join(f"a {layer}" for layer in reversed(layers))
+            raise UnsupportedFormat(
+                f"The file is compressed three times over ({inside}); two layers at most are "
+                "unpacked.",
+                hint="Send it compressed once, e.g. data.csv.gz or a zip of data.csv.",
+            )
+        into = workdir if path == src else Path(tempfile.mkdtemp(dir=workdir))
+        inner, name = _unpack(path, name, kind, into, limits.max_decompressed_bytes)
+        if path != src:
+            path.unlink()
+        path = inner
+    if path == src:
+        return _link(src, workdir, "input" + "".join(src.suffixes[-2:])), filename
+    return path, name
+
+
+def _compression(path: Path) -> safety.Compression | None:
+    """The compression unwrap removes from ``path``; UnsupportedFormat for one none reads."""
+    magic = safety.read_magic(path, safety.SNIFF_BYTES)
+    kind = safety.sniff_compression(magic)
+    if kind == "zip" and _zip_office_format(path) is not None:
+        return None
+    if kind is None and (unread := safety.unread_compression(magic)) is not None:
+        raise UnsupportedFormat(
+            f"The file is {unread}-compressed, which is not read here.",
+            hint="Send it uncompressed, or compressed with gzip, bz2 or zip.",
+        )
+    return kind
+
+
+def _unpack(
+    path: Path, name: str | None, kind: safety.Compression, into: Path, cap: int
+) -> tuple[Path, str | None]:
+    """``path`` unpacked into the directory ``into``, and the name of what it held."""
+    if kind == "zip":
+        return safety.extract_single_member(path, into, cap)
+    dst = into / safety.DECOMPRESSED
+    safety.decompress_stream(path, dst, kind, cap)
+    return dst, _without_compression(name)
 
 
 def keep_gzip(
@@ -143,12 +194,16 @@ def keep_gzip(
     it), and so is a gzip whose first KB does not settle its format: ``format_from_start``
     decides it, the one answer the checks before the quote use too.
     """
-    if safety.sniff_compression(safety.read_magic(src, 8)) != "gzip":
+    if safety.sniff_compression(safety.read_magic(src, safety.SNIFF_BYTES)) != "gzip":
         return None
     name = _without_compression(filename)
     head = safety.gzip_head(src, START_BYTES)
     if head is None:
         return None  # corrupt where it starts: unwrap says so, as before
+    if safety.sniff_compression(head) or safety.unread_compression(head):
+        # Compressed again: unwrap unpacks that layer too, or refuses it. format_from_start does
+        # not look at the bytes under a forced format, and names xz in a gzip by its name.
+        return None
     fmt = format_from_start(head, name, forced, whole=len(head) < START_BYTES)
     if fmt not in {InputFormat.CSV, InputFormat.TSV}:
         return None
