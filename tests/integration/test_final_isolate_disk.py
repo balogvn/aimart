@@ -12,9 +12,9 @@ These tests pin the child's RSS at zero in the parent (the watchdog runs there),
 files can trip the cap: before the fix every one of them that expects ``InputTooLarge``
 converted or queried successfully.
 
-Since 1886f60 (merged after these tests) a gzip of UTF-8 CSV is never unpacked: DuckDB reads
-it, so the incident's file no longer writes its text anywhere and converts within the files
-budget (``test_the_incidents_gzip_no_longer_lands_in_the_work_directory``). A gzip CSV that
+Since 1886f60 (merged after these tests) a gzip of UTF-8 CSV of one member is never unpacked:
+DuckDB reads it, so the incident's file no longer writes its text anywhere and converts within
+the files budget (``test_the_incidents_gzip_no_longer_lands_in_the_work_directory``). A gzip CSV that
 is not UTF-8 still writes its UTF-8 version there, so the tests that need the job's files to
 reach the cap send that one.
 """

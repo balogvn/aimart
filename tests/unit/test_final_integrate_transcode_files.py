@@ -9,9 +9,10 @@ exists, is now deleted then (``safety.unwrapped``). Not a regression: 07fa450 re
 
 Since 1886f60 (merged after this file) the reader is handed a file of the pipeline's own and
 the UTF-8 version is renamed over it (``to_utf8(replace=True)``), a gzip of CSV is transcoded
-straight from the stream, and a gzip of UTF-8 CSV is never unpacked at all. The tests below
-assert the same thing, one copy of the text while it is read and the caller's file untouched,
-by what the files hold rather than by the names 65183f0 gave them.
+straight from the stream, and a gzip of UTF-8 CSV of one member (what gzip.compress writes) is
+never unpacked at all. The tests below assert the same thing, one copy of the text while it is
+read and the caller's file untouched, by what the files hold rather than by the names 65183f0
+gave them.
 """
 
 from __future__ import annotations
@@ -120,5 +121,5 @@ def test_the_callers_own_file_and_utf8_text_are_left_alone(
     utf8 = kit.convert_bytes(tmp_path, "u.csv.gz", gz)
     assert utf8.report.encoding == "utf-8"
     # At 65183f0: 'decompressed' (read in place, no second copy to save). Since 1886f60 a gzip
-    # of UTF-8 CSV is never unpacked: DuckDB reads the gzip itself.
+    # of UTF-8 CSV of one member is never unpacked: DuckDB reads the gzip itself.
     assert seen[-1] == {"input": gz}

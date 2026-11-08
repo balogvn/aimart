@@ -356,7 +356,7 @@ polls every 0.1 s, so a job allocating fast passes the cap by what it gains in o
 | a job, process and files together | ≤ 700 MB (`AIMART_JOB_MEMORY_LIMIT_MB`) |
 | a job's process | a CSV conversion measured 150-330 MiB whatever the file size; with `sort_by`, up to ~500 MiB |
 | DuckDB inside a job | limit = the job cap minus 300 MB (400 MiB), so sorts spill instead of being killed; spill cap = the rest of the job cap (300 MiB), so DuckDB's memory and its spill together never pass the cap |
-| a job's files in `/tmp` | the upload (≤ 50 MB) + the staged text (18-31% of the CSV) + the output (20-33%) + spill (`sort_by` only, ≤ 300 MiB). A gzip of CSV or TSV is never unpacked: DuckDB reads UTF-8 from it, and other text is transcoded from it, its UTF-8 version on disk while it is read. A bz2 or zip is unpacked (≤ 256 MB, `AIMART_MAX_DECOMPRESSED_BYTES`), plus a UTF-8 version while one that is not UTF-8 is transcoded, which then replaces the unpacked text. Whatever the reader read is deleted once it returns |
+| a job's files in `/tmp` | the upload (≤ 50 MB) + the staged text (18-31% of the CSV) + the output (20-33%) + spill (`sort_by` only, ≤ 300 MiB). A gzip of CSV or TSV is read by DuckDB where it lies: DuckDB reads UTF-8 from it, and other text is transcoded from it, its UTF-8 version on disk while it is read. A gzip DuckDB would read differently from Python is unpacked instead, as at d83c738: more than one member (DuckDB can stop before the last of them, and refuses a later member's header of 32,760 bytes or more), FTEXT, FHCRC, FCOMMENT or zero padding. That gzip, a bz2 and a zip are unpacked (≤ 256 MB, `AIMART_MAX_DECOMPRESSED_BYTES`), plus a UTF-8 version while one that is not UTF-8 is transcoded, which then replaces the unpacked text. Whatever the reader read is deleted once it returns |
 | stored artifacts without a bucket | ≤ `AIMART_ARTIFACT_MAX_TOTAL_BYTES` (256 MiB) |
 
 Measured at faaeaed in the isolated child with the defaults, beside d83c738 (before a gzip was
@@ -366,7 +366,8 @@ not measured; there the child's resident memory also counts the ~160 MB of pages
 with the forkserver, which macOS counts elsewhere. The first five ran with the input caps as
 they are, the rest with `AIMART_MAX_INPUT_BYTES` and `AIMART_MAX_DECOMPRESSED_BYTES` raised so
 the file reached the engine. Each input was written into the call's work directory, as an
-upload is, and counted.
+upload is, and counted. Each gzip is of one member, as Python's gzip module, gzip and pigz write
+one; a gzip of more members is unpacked, as at d83c738, and holds its text as a bz2 does.
 
 | CSV (decompressed), as sent | result | process | files | in all | at d83c738 (files) | seconds |
 |---|---|---|---|---|---|---|
@@ -407,8 +408,9 @@ What that means for the default deploy (1 vCPU, 2 GiB, `AIMART_MAX_CONCURRENT_JO
   pages counted such a file may be a 413, unpaid. The 6-column test CSV compressed 3.3:1, so as
   gzip it is refused at the 50 MB cap from about 165 MB.
 - **A job's files, not its process, decide what converts:** for a gzip, the upload plus about
-  0.4-0.65 times the CSV (its staged copy and the output); for a bz2, zip or uncompressed CSV,
-  the unpacked text or the upload as well. With the input caps raised a 446 MiB CSV sent as
+  0.4-0.65 times the CSV (its staged copy and the output); for a bz2, a zip, a gzip DuckDB
+  would read differently (more than one member) or an uncompressed CSV, the unpacked text or
+  the upload as well. With the input caps raised a 446 MiB CSV sent as
   159 MiB of gzip converts (it was a 413 at d83c738, its unpacked text on disk), while 450 MB
   sent uncompressed reaches the cap; past it the call is a 413, unpaid, never an instance out
   of memory.

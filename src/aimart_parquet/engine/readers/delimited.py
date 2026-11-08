@@ -197,8 +197,9 @@ def read_delimited(
     *,
     gzipped: bool = False,
 ) -> RawTable:
-    """``gzipped``: ``path`` is still a gzip (convert.keep_gzip), whose text never lands on the
-    RAM disk unpacked: DuckDB reads UTF-8 from the gzip, and other text is transcoded from it.
+    """``gzipped``: ``path`` is still a gzip (convert.keep_gzip). The text of one member that
+    DuckDB reads as Python does never lands on the RAM disk unpacked: DuckDB reads UTF-8 from
+    the gzip, and other text is transcoded from it. Any other gzip is unpacked (_gzip_text).
     """
     if options.delimiter is not None:
         # csv.reader refuses these ("bad delimiter or quotechar value", a bare 500 after the

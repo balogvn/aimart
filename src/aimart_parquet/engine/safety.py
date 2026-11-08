@@ -138,68 +138,65 @@ class GzipMismatch(Exception):
 
 
 # The header flags DuckDB 1.5 reads: FEXTRA and FNAME. It refuses FTEXT, FHCRC, FCOMMENT and
-# the reserved bits, which Python's gzip module reads.
+# the reserved bits, which Python's gzip module reads. It reads the header from the file, at
+# any length; this check reads up to 1 MiB of it.
 _FEXTRA, _FNAME = 0x04, 0x08
 _MAX_GZIP_HEADER = _CHUNK
-# DuckDB parses the header of every member after the first from its 32 KiB input buffer, which
-# then starts at the previous member's 8-byte trailer, and refuses one that reaches the
-# buffer's end, 32,760 bytes or more (an FNAME of 32,749, an FEXTRA of 32,748), with an
-# InternalException ('Filename resulting in GZIP header larger than defined maximum (32768)').
-# 1886f60 let it read such a gzip, which Python reads whole: a 422 where d83c738 unpacked the
-# file and converted it. The first member's header it reads from the file, at any length.
-_MAX_LATER_HEADER = 32 * 1024 - 8 - 1
 
 
 def gzip_chunks(path: Path, cap: int) -> Generator[bytes]:
-    """What a gzip file holds, in chunks, checked for DuckDB to read the file itself after.
+    """What a gzip file of one member holds, in chunks, checked for DuckDB to read it after.
 
     DuckDB reads gzip without checking a member's CRC or length (a corrupt or truncated file
-    reads as whatever inflates) and refuses some headers, a later member's header past its
-    32 KiB buffer, and the zero padding Python skips. Wherever the two could differ this raises
-    GzipMismatch, and decompress_stream unpacks the file, or reports what is wrong with it, as
-    before. Past ``cap`` it raises InputTooLarge.
+    reads as whatever inflates) and refuses some headers. Wherever the two could read the file
+    differently this raises GzipMismatch, and decompress_stream unpacks it, or reports what is
+    wrong with it, as d83c738 did with every gzip. Past ``cap`` it raises InputTooLarge.
+
+    Anything after the first member is a mismatch: another member, or the zero padding Python
+    skips. DuckDB 1.5.6 refills its 32 KiB input buffer when a member ends; once a refill has
+    read exactly to the end of the file, the refill at the next member's end reads nothing and
+    DuckDB stops, dropping the members still in its buffer, with no error. A gzip of one member
+    per CSV line (what appending a row at a time writes) lost its last 712 rows of 9,000: a 200
+    for wrong data. Such files also converted 2.7-3.5x slower than d83c738 unpacked them, a 504
+    on a slow core: this pass re-sliced its 1 MiB read buffer for every member, and DuckDB
+    starts each member afresh on each of its two reads. And DuckDB refuses a later member's
+    header of 32,760 bytes or more (3298e73). A gzip written in one go (gzip, pigz, Python's
+    gzip module, pandas) has one member.
     """
-    total = 0
     with path.open("rb") as fh:
-        buf = b""
-        most = _MAX_GZIP_HEADER
         try:
-            while True:
-                buf = _past_header(fh, buf, most)
-                most = _MAX_LATER_HEADER
-                inflate = zlib.decompressobj(-zlib.MAX_WBITS)
-                crc = size = 0
-                while not inflate.eof:
-                    data = buf or fh.read(_CHUNK)
-                    # At most _CHUNK out per call: a 1 MB read of a bomb inflates to 1 GB.
-                    out = inflate.decompress(data, _CHUNK)
-                    buf = inflate.unconsumed_tail
-                    if not data and not out:
-                        raise GzipMismatch("truncated")
-                    size += len(out)
-                    if total + size > cap:
-                        raise _too_large(cap)
-                    crc = zlib.crc32(out, crc)
-                    if out:
-                        yield out
-                total += size
-                buf = _fill(fh, inflate.unused_data, 8)
-                if buf[:8] != struct.pack("<II", crc, size & 0xFFFFFFFF):
-                    raise GzipMismatch("CRC or length")
-                buf = buf[8:] or fh.read(_CHUNK)
-                if not buf:
-                    return
+            buf = _past_header(fh)
+            inflate = zlib.decompressobj(-zlib.MAX_WBITS)
+            crc = size = 0
+            while not inflate.eof:
+                data = buf or fh.read(_CHUNK)
+                # At most _CHUNK out per call: a 1 MB read of a bomb inflates to 1 GB.
+                out = inflate.decompress(data, _CHUNK)
+                buf = inflate.unconsumed_tail
+                if not data and not out:
+                    raise GzipMismatch("truncated")
+                size += len(out)
+                if size > cap:
+                    raise _too_large(cap)
+                crc = zlib.crc32(out, crc)
+                if out:
+                    yield out
+            buf = _fill(fh, inflate.unused_data, 8)
+            if buf[:8] != struct.pack("<II", crc, size & 0xFFFFFFFF):
+                raise GzipMismatch("CRC or length")
+            if buf[8:] or fh.read(1):
+                raise GzipMismatch("more than one member")  # or padding, or trailing bytes
         except zlib.error as exc:
             raise GzipMismatch(str(exc)) from exc
 
 
-def _past_header(fh: Readable, buf: bytes, most: int) -> bytes:
-    """What follows a member header, of at most ``most`` bytes, that ``buf`` (and then ``fh``)
-    begins with."""
-    buf = _fill(fh, buf, 10)
+def _past_header(fh: Readable) -> bytes:
+    """What ``fh`` has read past the gzip header it begins with, one DuckDB reads as Python does
+    and of at most _MAX_GZIP_HEADER bytes."""
+    buf = _fill(fh, b"", 10)
     flags = buf[3]
     if buf[:3] != b"\x1f\x8b\x08" or flags & ~(_FEXTRA | _FNAME):
-        raise GzipMismatch("header")  # also zero padding or trailing bytes after a member
+        raise GzipMismatch("header")
     pos = 10
     if flags & _FEXTRA:
         buf = _fill(fh, buf, 12)
@@ -207,11 +204,11 @@ def _past_header(fh: Readable, buf: bytes, most: int) -> bytes:
     buf = _fill(fh, buf, pos)
     if flags & _FNAME:
         while (end := buf.find(b"\0", pos)) < 0:
-            if len(buf) > most:
+            if len(buf) > _MAX_GZIP_HEADER:
                 raise GzipMismatch("header")
             buf = _fill(fh, buf, len(buf) + 1)
         pos = end + 1
-    if pos > most:
+    if pos > _MAX_GZIP_HEADER:
         raise GzipMismatch("header")
     return buf[pos:]
 

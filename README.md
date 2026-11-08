@@ -280,10 +280,14 @@ loaded into a table, so a conversion's process stays at about 150-330 MiB whatev
 (it took about 3.5 times the file, and CSVs over about 120 MB were refused). The job's files still
 grow with it, and they count toward the 700 MB a job may use because `/tmp` is RAM on Cloud Run:
 the upload, the staged text and the output (those two about 0.4-0.65 times the CSV), and no input
-outlives its read. A gzip of CSV or TSV is not unpacked: DuckDB reads it once one pass has counted
-it against the 256 MB cap and checked that DuckDB reads it as Python does, and text that is not
-UTF-8 is transcoded straight from it, its UTF-8 version on disk while it is read. A bz2 or zip is
-unpacked, and one that is not UTF-8 also holds its UTF-8 version while it is transcoded, which then
+outlives its read. A gzip of CSV or TSV is not unpacked: DuckDB reads it where it lies, once one
+pass has counted all of it against the 256 MB cap and checked that DuckDB reads it as Python does,
+and text that is not UTF-8 is then transcoded straight from it, its UTF-8 version on disk while it
+is read. A gzip DuckDB would read otherwise is unpacked, as before: one of more than one member
+(concatenated, appended to a row at a time, or bgzip's blocks: DuckDB can stop before the last
+member, with no error), or with a header field DuckDB refuses (FTEXT, FHCRC, FCOMMENT) or zero
+padding after it. What gzip, pigz, Python and pandas write is one member. A bz2 or zip is unpacked
+too, and one that is not UTF-8 also holds its UTF-8 version while it is transcoded, which then
 replaces the unpacked text. Measured with the defaults, the input caps bind first: a 255 MiB CSV
 sent as 37 MiB of gzip converted at 245 MiB in all, and 230 MiB of orders in cp1252 sent as 45 MiB
 of gzip at 533 MiB; the same orders sent as bz2 or zip peaked at 574-664 MiB, close to the cap,

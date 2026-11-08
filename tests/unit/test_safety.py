@@ -87,33 +87,24 @@ class TestDecompressStream:
 
 
 class TestGzipChunks:
-    """What DuckDB is let read from a gzip: only what Python's gzip module reads the same way."""
+    """What DuckDB is let read from a gzip: only one member, which Python's gzip module reads
+    the same way."""
 
     @pytest.mark.parametrize(
         "data",
         [
             gzip.compress(b"a,b\n1,2\n"),
-            gzip.compress(b"a,b\n") + gzip.compress(b"") + gzip.compress(b"1,2\n"),
-            kit.gzip_member(b"a,b\n", 4) + kit.gzip_member(b"1,2\n", 8),
+            kit.gzip_member(b"a,b\n1,2\n", 4),
+            kit.gzip_member(b"a,b\n1,2\n", 4 | 8),
             gzip.compress(b""),
-            kit.gzip_member(b"a,b\n", 4 | 8, extra=b"e" * 65_535, name=b"n" * 500_000)
-            + gzip.compress(b"1,2\n"),
-            # A later member's header up to 32,759 bytes: DuckDB's 32 KiB buffer holds it and
-            # the 8-byte trailer before it (test_fix_csv_followup.py).
-            gzip.compress(b"a,b\n") + kit.gzip_member(b"1,2\n", 8, name=b"n" * 32_748),
-            gzip.compress(b"a,b\n") + kit.gzip_member(b"1,2\n", 4, extra=b"e" * 32_747),
+            kit.gzip_member(b"a,b\n1,2\n", 4 | 8, extra=b"e" * 65_535, name=b"n" * 500_000),
         ],
-        ids=[
-            "one",
-            "three-members",
-            "fextra-fname",
-            "empty",
-            "first-header-long",
-            "later-name-at-limit",
-            "later-extra-at-limit",
-        ],
+        ids=["one", "fextra", "fextra-fname", "empty", "header-long"],
     )
     def test_yields_what_python_reads(self, tmp_path, data) -> None:
+        # Until CS5 this also passed gzips of two or three members, and later headers of up to
+        # 32,759 bytes (the 'more-than-one-member' cases below now): DuckDB drops members when
+        # its buffer's refill ends the file (test_fix_csv_followup_safety.py).
         path = kit.write(tmp_path / "in.gz", data)
         assert b"".join(safety.gzip_chunks(path, MB)) == gzip.decompress(data)
 
@@ -145,6 +136,12 @@ class TestGzipChunks:
             gzip.compress(b"a\n")[:12],
             b"\x1f\x8b\x08\x08" + b"\0" * 6 + b"no end to the name" * 70_000,
             b"\x1f\x8b\x08\x00" + b"\0" * 6 + b"not deflate",
+            gzip.compress(b"a,b\n") + gzip.compress(b"") + gzip.compress(b"1,2\n"),
+            kit.gzip_member(b"a,b\n", 4) + kit.gzip_member(b"1,2\n", 8),
+            kit.gzip_member(b"a,b\n", 4 | 8, extra=b"e" * 65_535, name=b"n" * 500_000)
+            + gzip.compress(b"1,2\n"),
+            gzip.compress(b"a\n") + kit.gzip_member(b"b\n", 8, name=b"n" * 32_748),
+            gzip.compress(b"a\n") + kit.gzip_member(b"b\n", 4, extra=b"e" * 32_747),
             gzip.compress(b"a\n") + kit.gzip_member(b"b\n", 8, name=b"n" * 32_749),
             gzip.compress(b"a\n") + kit.gzip_member(b"b\n", 4, extra=b"e" * 32_748),
             gzip.compress(b"a\n")
@@ -166,6 +163,11 @@ class TestGzipChunks:
             "header-only",
             "endless-name",
             "not-deflate",
+            "three-members",
+            "two-members-fextra-fname",
+            "first-header-long-two-members",
+            "later-name-at-limit",
+            "later-extra-at-limit",
             "later-name-past-limit",
             "later-extra-past-limit",
             "later-fields-past-limit",
@@ -174,9 +176,11 @@ class TestGzipChunks:
     )
     def test_anything_duckdb_might_read_otherwise_is_a_mismatch(self, tmp_path, data) -> None:
         # Python reads the first four and skips the padding, which DuckDB refuses; DuckDB reads
-        # the next eight, which Python refuses, as whatever inflates. Python reads the last
-        # four, valid gzips whose later member has a header of 32,760 bytes or more, and DuckDB
-        # refuses them (InternalException; 1886f60 let it try, a 422 where d83c738 converted).
+        # the next eight, which Python refuses, as whatever inflates. Python reads the rest,
+        # gzips of more than one member, and DuckDB may stop before their end (no error, rows
+        # lost: CS5, test_fix_csv_followup_safety.py) or refuse a later member's header of
+        # 32,760 bytes or more (InternalException; a 422 where d83c738 converted). The first
+        # three and the two 'at-limit' cases passed this check until CS5.
         path = kit.write(tmp_path / "in.gz", data)
         with pytest.raises(safety.GzipMismatch):
             b"".join(safety.gzip_chunks(path, MB))

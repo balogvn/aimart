@@ -20,6 +20,8 @@ import bz2
 import datetime as dt
 import gzip
 import random
+import struct
+import zlib
 from typing import TYPE_CHECKING, Any
 
 import duckdb
@@ -471,20 +473,18 @@ def _inodes_during_read(monkeypatch: pytest.MonkeyPatch, root: Path) -> list[dic
     [
         ("a.csv.gz", gzip.compress(_TEXT.encode()), ","),
         ("a.tsv.gz", gzip.compress(_TEXT.replace(",", "\t").encode()), "\t"),
-        (
-            "a.gz",
-            kit.gzip_member(_TEXT[:5000].encode(), 8) + gzip.compress(_TEXT[5000:].encode()),
-            ",",
-        ),
+        ("a.gz", kit.gzip_member(_TEXT.encode(), 8), ","),
         ("a.csv.gz", kit.gzip_member(("\ufeff" + _TEXT).encode(), 4), ","),
     ],
-    ids=["csv", "tsv", "two-members-fname", "bom-fextra"],
+    ids=["csv", "tsv", "fname", "bom-fextra"],
 )
 def test_a_gzip_of_utf8_text_is_never_unpacked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, data: bytes, delimiter: str
 ) -> None:
     # unwrap wrote all of it to the RAM disk for DuckDB to read: a 446 MiB CSV gzipped to
     # 159 MiB held 526 MiB of files at the read, now the upload plus the staged text, 80 MiB.
+    # A gzip of one member: 'fname' was two members, an FNAME on the first, until CS5 (DuckDB
+    # may stop before the last member: test_fix_csv_followup_safety.py); it is unpacked now.
     work = tmp_path / "call"
     during = _inodes_during_read(monkeypatch, work)
     result = _convert_in_the_call_directory(work, name, data)
@@ -510,12 +510,14 @@ def test_a_gzip_of_utf8_text_is_never_unpacked(
         kit.gzip_member(_TEXT.encode(), 2),
         kit.gzip_member(_TEXT.encode(), 1),
         kit.gzip_member(_TEXT.encode("cp1252"), 16),
+        kit.gzip_member(_TEXT[:5000].encode(), 8) + gzip.compress(_TEXT[5000:].encode()),
     ],
-    ids=["zero-padding", "comment", "header-crc", "ftext", "comment-cp1252"],
+    ids=["zero-padding", "comment", "header-crc", "ftext", "comment-cp1252", "two-members"],
 )
 def test_a_gzip_duckdb_cannot_read_as_python_does_is_unpacked(tmp_path: Path, data: bytes) -> None:
-    # DuckDB 1.5 refuses these headers and the padding Python's gzip module skips: each is
-    # unpacked over the input, as unwrap did, and reads as it did.
+    # DuckDB 1.5 refuses these headers and the padding Python's gzip module skips, and may stop
+    # before the last of two members or more (CS5): each is unpacked over the input, as unwrap
+    # did, and reads as it did.
     result = kit.convert_bytes(tmp_path, "a.csv.gz", data)
     assert result.rows["city"] == [f"Zürich {i}" for i in range(3000)]
     assert result.report.warnings == []
@@ -591,20 +593,39 @@ def test_a_gzip_in_a_named_encoding_is_transcoded(tmp_path: Path) -> None:
     )
 
 
+def _stored_member(text: bytes) -> bytes:
+    """One gzip member of ``text`` in one stored deflate block (BFINAL, LEN, NLEN): its size is
+    exactly the text's plus 23 bytes."""
+    block = b"\x01" + struct.pack("<HH", len(text), len(text) ^ 0xFFFF) + text
+    trailer = struct.pack("<II", zlib.crc32(text), len(text))
+    return b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff" + block + trailer
+
+
+# A member that ends the file exactly where DuckDB's second refill of its 32 KiB buffer, from
+# the member's body at byte 10, ends: 10 + 2 x 32,768 bytes. Two members of that size lose
+# the second (test_fix_csv_followup_safety.py); one is read whole.
+_REFILL_TEXT = (b"id,city\n" + b"".join(b"%d,Zurich %d\n" % (i, i) for i in range(5000)))[
+    : 2 * 32_768 - 13 - 1
+] + b"\n"
+
+
 @pytest.mark.parametrize(
     "data",
     [
-        kit.gzip_member(_TEXT[:7].encode(), 8) + kit.gzip_member(_TEXT[7:].encode(), 4 | 8),
-        gzip.compress(b"") + gzip.compress(_TEXT.encode()) + gzip.compress(b""),
-        gzip.compress("\ufeff".encode()[:2]) + gzip.compress(("\ufeff" + _TEXT).encode()[2:]),
-        b"".join(gzip.compress(_TEXT[i : i + 997].encode()) for i in range(0, len(_TEXT), 997)),
+        kit.gzip_member(_TEXT.encode(), 4 | 8),
+        gzip.compress(("\ufeff" + _TEXT).encode()),
         gzip.compress(_TEXT.encode(), compresslevel=0),
+        gzip.compress(_TEXT.encode() * 40, compresslevel=9),
+        _stored_member(_REFILL_TEXT),
     ],
-    ids=["fields-in-every-member", "empty-members", "bom-split", "many-members", "stored"],
+    ids=["fields", "bom", "stored", "long", "ends-a-refill"],
 )
 def test_duckdb_reads_a_gzip_the_check_passes_as_python_does(tmp_path: Path, data: bytes) -> None:
     # What read_delimited relies on, on this DuckDB: an upgrade that reads one differently
-    # fails here, not in a caller's rows.
+    # fails here, not in a caller's rows. Until CS5 the check passed gzips of two members or
+    # more (fields in every member, empty members, a BOM split across two, 997-byte members),
+    # and DuckDB read those the same, but not every such layout: any gzip of more than one
+    # member is unpacked now, and this pins the one member DuckDB is let read.
     gz = kit.write(tmp_path / "t.gz", data)
     plain = kit.write(tmp_path / "t.csv", gzip.decompress(data))
     assert b"".join(safety.gzip_chunks(gz, 10**9)) == plain.read_bytes()
@@ -615,4 +636,4 @@ def test_duckdb_reads_a_gzip_the_check_passes_as_python_does(tmp_path: Path, dat
         for p, c in [(gz, ", compression='gzip'"), (plain, "")]
     ]
     assert rows[0] == rows[1]
-    assert len(rows[0]) == 3000
+    assert len(rows[0]) == plain.read_bytes().count(b"\n") - 1

@@ -3,7 +3,8 @@
     unwrap compression -> detect format -> read into DuckDB -> name columns -> infer types
     -> validate against expected_schema -> sort -> stream to Parquet -> report from the footer
 
-(A gzip of CSV or TSV is not unwrapped: DuckDB reads it as it is. See keep_gzip.)
+(A gzip of CSV or TSV is not unwrapped: the delimited reader lets DuckDB read one of a single
+member as it is, and unpacks any other. See keep_gzip.)
 
 The report is built from the file that was actually written (types and null counts come from
 the Parquet footer), not from what the pipeline intended to write.

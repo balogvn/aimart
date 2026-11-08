@@ -219,8 +219,8 @@ _PDF = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\nstartxref\n0\n%%EOF\n"
 )
 def test_a_gzip_is_kept_only_as_what_its_unpacked_text_is_read_as(tmp_path, name, content) -> None:
     # convert.keep_gzip decides from the first START_BYTES a gzip holds (format_from_start, the
-    # answer the checks before the quote use too): a CSV or TSV there is read from the gzip,
-    # never unpacked, so it must be what detect_format says of the unpacked file. A start that
+    # answer the checks before the quote use too): a CSV or TSV there goes to the delimited
+    # reader, not to unwrap, so it must be what detect_format says of the unpacked file. A start that
     # does not decide it (a zip, a '%PDF-' that may follow junk) is None, and gets unpacked.
     plain = kit.write(tmp_path / "file", content)
     try:

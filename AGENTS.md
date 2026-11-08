@@ -68,19 +68,21 @@ Module docstrings explain the why; read the one you are about to change.
   built from a library's exception text.
 - `engine/`: the pure conversion engine. `detect.py` (magic bytes over extensions; a `%PDF-` header
   anywhere in the first 1 KB), `safety.py` (gzip/zip bomb caps; `gzip_chunks`, the pass that lets
-  DuckDB read a gzip only where it reads it as Python does), `text.py` (UTF-8 transcoding, from a
-  file or a gzip stream; `replace=True` renames the UTF-8 version over the reader's input),
+  DuckDB read a gzip only where it reads it as Python does: one member), `text.py` (UTF-8
+  transcoding, from a file or a gzip stream; `replace=True` renames the UTF-8 version over the
+  reader's input),
   `duck.py` (sandboxed DuckDB; `NOWHERE` for every `$HOME`-derived setting), `readers/` (delimited,
   jsonish, excel, statistical, columnar, pdf; the `READERS` map is in `convert.py`), `infer.py`
   (type ladder in SQL; the number convention is decided per column, then by the file's other number
   columns when they agree and one writes '1,234.5' or '1.234,5', else by the dialect; text with a
   zone only ever becomes TIMESTAMPTZ; constant lists go through `_one_of`, never `IN`), `names.py`,
   `convert.py` (pipeline, `expected_schema`, report; CSV/TSV jobs run DuckDB on one thread; a gzip
-  of CSV/TSV is read by DuckDB as it is, `keep_gzip`; `unwrap` hands a reader a file of the
-  pipeline's own, deleted once it returns), `writer.py` (DuckDB `COPY` by default, pyarrow when
-  labels exist), `inspect.py` (footer-only stats), `tabular.py` (preview and SELECT-only query:
-  inputs are views over DuckDB's own Parquet reader (`_native_view`), long cells are cut inside
-  DuckDB, rows are built by position, results over `MAX_RESULT_BYTES` are refused), `isolate.py`
+  of CSV/TSV of one member is read by DuckDB as it is, `keep_gzip`; `unwrap` hands a reader a
+  file of the pipeline's own, deleted once it returns), `writer.py` (DuckDB `COPY` by default,
+  pyarrow when labels exist), `inspect.py` (footer-only stats), `tabular.py` (preview
+  and SELECT-only query: inputs are views over DuckDB's own Parquet reader (`_native_view`), long
+  cells are cut inside DuckDB, rows are built by position, results over `MAX_RESULT_BYTES` are
+  refused), `isolate.py`
   (forkserver child per job: deadline, a watchdog on RSS plus the job's temporary files (its temp
   directory and the `job_dirs` the service passes) for `job_memory_limit_mb`, a per-job temp
   directory the parent deletes; a crash is logged by type and frames, never its text), `limits.py`
@@ -381,13 +383,21 @@ each pinned in `tests/unit/test_fix_csv_memory.py`:
   member's 'unzipped.csv.zst'), and DuckDB inflates a '.gz' or '.zst' name unless told: the
   readers pass `compression` ('uncompressed', or 'gzip' for a checked gzip), or cp1252 text
   under such a name was a 422 (`unit/test_fix_csv_followup.py`).
-- **A gzip of CSV/TSV is never unpacked**: DuckDB reads it (`keep_gzip`, the format decided by
+- **A gzip of CSV/TSV is read by DuckDB where it lies** (`keep_gzip`, the format decided by
   `format_from_start` over the first KB it holds), and other text is transcoded from the
-  stream. DuckDB 1.5 does not check a member's CRC or length (a truncated or corrupt file reads
-  as far as it inflates) and refuses FTEXT, FHCRC, FCOMMENT, the zero padding Python skips and
-  a later member's header of 32,760 bytes or more (its 32 KiB buffer), so `safety.gzip_chunks`
-  lets it read only members that both read the same way, and counts them against the 256 MB
-  stream cap; anything else is unpacked as before.
+  stream, unless DuckDB would read it otherwise than Python: then it is unpacked, as d83c738
+  unpacked every gzip. DuckDB 1.5 does not check a member's CRC or length (a truncated or
+  corrupt file reads as far as it inflates) and refuses FTEXT, FHCRC, FCOMMENT and the zero
+  padding Python skips, so `safety.gzip_chunks` lets it read only a member that both read the
+  same way, and counts it against the 256 MB stream cap. Only one member: DuckDB 1.5.6 refills
+  its 32 KiB input buffer as each member ends, and once a refill has read exactly to the end of
+  the file the next refill reads nothing and it stops, dropping the members still in its
+  buffer, with no error. A gzip of one member per CSV line lost its last 712 rows of 9,000, a
+  200 for wrong data; such files also converted 2.7-3.5x slower than d83c738 unpacked them
+  (`gzip_chunks` re-sliced its read buffer for every member, and DuckDB starts each member
+  afresh on each of its two reads), and DuckDB refuses a later member's header of 32,760 bytes
+  or more (`unit/test_fix_csv_followup_safety.py`, CS5 and CS1; `unit/test_fix_csv_followup.py`,
+  CF2). What gzip, pigz, Python and pandas write is one member.
 
 ## Bug classes guarded since the review of 6f99145
 
@@ -507,9 +517,9 @@ each test's docstring has the incident.
   kept out of responses. (`integration/test_isolate.py`) The cap counts the job's temporary
   files: a 1.5 MB gzip CSV wrote 500 MB into the work directory while RSS alone stayed under it.
   (`integration/test_final_isolate_disk.py`, `integration/test_final_integrate_stream_cap.py`)
-  No input outlives its read: a gzip of UTF-8 CSV is never unpacked, a non-UTF-8 text's
-  UTF-8 version replaces its input, and the caller's file or a stored artifact is never
-  deleted or written (`unit/test_final_integrate_transcode_files.py`,
+  No input outlives its read: a gzip of UTF-8 CSV of one member is never unpacked, a
+  non-UTF-8 text's UTF-8 version replaces its input, and the caller's file or a stored artifact
+  is never deleted or written (`unit/test_final_integrate_transcode_files.py`,
   `unit/test_fix_csv_memory.py`, `unit/test_final_isolate_service.py`).
 - **Charged for a response nobody received.** Cloud Run's 120 s request timeout answered 504
   to paid calls the payment window lets run 300 s, and the x402 middleware settled one that
@@ -536,7 +546,9 @@ of text that is not UTF-8 is unpacked, and its UTF-8 version written beside the 
 before replacing it: 230 MiB of cp1252 orders peaked at 574-664 MiB of the 700 MB job cap on
 macOS, as at d83c738 (deploy/README.md), likely a 413 on Linux, whose RSS counts the
 forkserver's shared pages; transcoding from the bz2 or zip stream, as from a gzip, would drop
-the unpacked text. (The 422 for a time past 9999 in preview and query and the 413 for
+the unpacked text. A gzip of more than one member (concatenated, appended to a row at a time,
+bgzip's blocks) is unpacked too, as at d83c738, so it holds the unpacked text while it is read,
+as a bz2 does. (The 422 for a time past 9999 in preview and query and the 413 for
 `read_csv` running out of memory are tested in `integration/test_final_isolate_gaps.py`;
 DuckDB's `memory_limit` no longer sits above the job cap, `unit/test_fix_csv_memory.py`.)
 

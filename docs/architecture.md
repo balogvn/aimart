@@ -77,9 +77,9 @@ flowchart LR
    at the cap minus 300 MB (400 MiB) and may spill only the rest (300 MiB), so the two together
    never pass the cap. A CSV conversion's process stays at about 150-330 MiB whatever the
    file's size; its files (the upload, the staged copy of the text, the output) grow with it,
-   and no input outlives its read: a gzip of CSV or TSV is read by DuckDB where it lies, and
-   what is unpacked or transcoded is deleted once the reader returns. Measured with the
-   defaults, the input caps bind before the job cap: a 255 MiB CSV sent as 37 MiB of gzip
+   and no input outlives its read: a gzip of CSV or TSV of one member is read by DuckDB where
+   it lies, and what is unpacked or transcoded is deleted once the reader returns. Measured with
+   the defaults, the input caps bind before the job cap: a 255 MiB CSV sent as 37 MiB of gzip
    peaked at 245 MiB in all, and 230 MiB of cp1252 CSV sent as 45 MiB of gzip at 533 MiB (its
    UTF-8 version, transcoded from the stream, on disk while it is read); as bz2 or zip, its
    unpacked text beside that UTF-8 version, at 574-664 MiB. With the caps raised a 446 MiB CSV
@@ -94,9 +94,11 @@ flowchart LR
    produces a raw table in a locked-down DuckDB connection (`duck.py`); for delimited text
    it is a view over a compressed Parquet copy of the text, so memory stays flat as files
    grow, and DuckDB's memory limit sits under the job's cap (`limits.py`). Because `/tmp` is
-   RAM on Cloud Run, a gzip of CSV or TSV is not decompressed at all (DuckDB reads it, once a
-   Python pass has checked it against the bomb cap), and any decompressed or transcoded input
-   is deleted as soon as the reader returns. Next come type inference in SQL (`infer.py`),
+   RAM on Cloud Run, a gzip of CSV or TSV of one member is not decompressed at all (DuckDB
+   reads it, once a Python pass has counted it against the bomb cap), and any decompressed or
+   transcoded input is deleted as soon as the reader returns. A gzip DuckDB would read otherwise is
+   unpacked: one of more members, as DuckDB 1.5 can stop before the last of them with no error,
+   or with a header DuckDB refuses. Next come type inference in SQL (`infer.py`),
    name normalization (`names.py`), and the writer (`writer.py`): DuckDB `COPY` to zstd
    Parquet, or pyarrow when labels must be embedded
    ([ADR 0006](adr/0006-duckdb-copy-writer.md)).
