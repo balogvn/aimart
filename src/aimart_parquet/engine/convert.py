@@ -316,7 +316,10 @@ def _apply_expected_schema(
             f"SELECT count_if(({out.plan.expr}) IS NOT NULL AND ({expr}) IS NULL), "
             f"count_if(({expr}) IS NULL), count(({expr})) FROM {ident(table)}"
         ).fetchone()
-        rejects, nulls, kept = (int(row[0]), int(row[1]), int(row[2])) if row else (0, 0, 0)
+        # count_if over no rows is NULL, not 0: a CSV that is only its header, with any
+        # expected_schema, raised TypeError here (the 500 after the payment that says "Retry"),
+        # where without the schema it converted to an empty table.
+        rejects, nulls, kept = (int(x or 0) for x in row) if row else (0, 0, 0)
         # Values inference already nulled (the 98% tolerance) do not fit either. Counting only
         # this cast's rejects let strict=true pass, and charge, with 'oops' in an int64 column.
         misfits = out.plan.rejected_count + rejects

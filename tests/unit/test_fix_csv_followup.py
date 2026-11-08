@@ -17,6 +17,12 @@ has a header of 32,760 bytes or more (a long FNAME or FEXTRA). DuckDB 1.5.6 pars
 from its 32 KiB input buffer, which starts at the previous member's 8-byte trailer, and refuses
 it with an InternalException: a 422 that blamed options.delimiter, where d83c738 unpacked the
 file with Python and converted it. Python unpacks it as before now.
+
+CF3, at d83c738 too. ``expected_schema`` over a table with no rows (a CSV that is only its
+header, an empty sheet or Parquet file), or casting a column with no values to a number type,
+crashed: DuckDB's ``count_if`` is NULL, not 0, when no row gives it a value, and ``int(None)``
+raised TypeError, the 500 that says "Retry" after the payment, for a file that converts without
+the schema. It is the same table now, typed as declared.
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ import gzip
 from typing import TYPE_CHECKING, Any
 
 import duckdb
+import pyarrow as pa
 import pytest
 
 import aimart_testkit as kit
@@ -199,3 +206,95 @@ def test_the_check_refuses_exactly_the_headers_duckdb_refuses(tmp_path: Path, he
             b"".join(safety.gzip_chunks(path, 10**9))
         with pytest.raises(duckdb.Error, match="GZIP header larger than defined maximum"):
             con.execute(sql)
+
+
+# ------------------------------------------------------ CF3: expected_schema over no rows
+_DECLARED = {
+    "int64": pa.int64(),
+    "float64": pa.float64(),
+    "decimal": pa.decimal128(10, 2),
+    "string": pa.string(),
+    "bool": pa.bool_(),
+    "date": pa.date32(),
+    "timestamp": pa.timestamp("us"),
+    "timestamptz": pa.timestamp("us", tz="UTC"),
+}
+
+
+def _declared(name: str, type_name: str, **more: Any) -> dict[str, Any]:
+    if type_name == "decimal":
+        more = {"precision": 10, "scale": 2, **more}
+    return {"name": name, "type": type_name, **more}
+
+
+@pytest.mark.parametrize("type_name", list(_DECLARED))
+@pytest.mark.parametrize("header", ["id,amount\n", "id;amount\n", "id\tamount\n"])
+def test_expected_schema_over_a_header_only_csv_is_its_empty_table(
+    tmp_path: Path, header: str, type_name: str
+) -> None:
+    # d83c738 and 4510071: TypeError ('int() argument must be ... not NoneType') in
+    # TypeInferrer._text_style for a number type, in _apply_expected_schema for the others.
+    plain = kit.convert_bytes(tmp_path, "header.csv", header)
+    assert (plain.report.rows, [c.type for c in plain.report.columns]) == (0, ["string"] * 2)
+    schema = [_declared("id", type_name), _declared("amount", type_name, nullable=False)]
+    for strict in (False, True):
+        typed = kit.convert_bytes(
+            tmp_path, "header.csv", header, expected_schema=schema, strict=strict
+        )
+        assert typed.report.rows == 0
+        assert typed.table.schema == pa.schema(
+            [("id", _DECLARED[type_name]), ("amount", _DECLARED[type_name])]
+        )
+        assert all(c.rejected_count == 0 for c in typed.report.columns)
+
+
+@pytest.mark.parametrize("type_name", list(_DECLARED))
+def test_a_declared_column_missing_from_a_header_only_csv_is_added(
+    tmp_path: Path, type_name: str
+) -> None:
+    schema = [_declared("id", "string"), _declared("extra", type_name)]
+    typed = kit.convert_bytes(tmp_path, "header.csv", "id,amount\n", expected_schema=schema)
+    assert typed.report.rows == 0
+    assert typed.table.schema.names == ["id", "extra", "amount"]
+    assert typed.table.schema.field("extra").type == _DECLARED[type_name]
+    assert typed.column("extra").notes == ["added as all-null: missing from input"]
+
+
+@pytest.mark.parametrize("type_name", ["int64", "float64", "decimal"])
+def test_expected_schema_casting_a_column_with_no_values_to_a_number(
+    tmp_path: Path, type_name: str
+) -> None:
+    # An optional amount nobody filled in: rows, but count_if over its values is NULL as well
+    # (d83c738 and 4510071: TypeError in TypeInferrer._text_style).
+    body = "id,amount\n1,\n2, \n3,\n"
+    plain = kit.convert_bytes(tmp_path, "a.csv", body)
+    assert plain.column("amount").notes == ["all values empty"]
+    schema = [_declared("id", "int64"), _declared("amount", type_name)]
+    for strict in (False, True):
+        typed = kit.convert_bytes(tmp_path, "a.csv", body, expected_schema=schema, strict=strict)
+        assert typed.rows == {"id": [1, 2, 3], "amount": [None, None, None]}
+        assert typed.table.schema.field("amount").type == _DECLARED[type_name]
+        assert typed.column("amount").rejected_count == 0
+
+
+def test_expected_schema_over_other_readers_with_no_rows(tmp_path: Path) -> None:
+    # The same two crashes from an Excel sheet that is only its header and a Parquet file
+    # with no rows (d83c738 too).
+    import openpyxl
+
+    book = openpyxl.Workbook()
+    ws = book.active
+    assert ws is not None
+    ws.append(["id", "amount"])
+    book.save(tmp_path / "header.xlsx")
+    sheet = kit.convert_path(tmp_path / "header.xlsx", expected_schema=[_declared("id", "int64")])
+    assert sheet.report.rows == 0
+    assert sheet.table.schema == pa.schema([("id", pa.int64()), ("amount", pa.string())])
+    empty = kit.write_parquet(
+        tmp_path / "empty.parquet",
+        {"id": pa.array([], pa.int64()), "name": pa.array([], pa.string())},
+    )
+    schema = [_declared("id", "decimal"), _declared("name", "int64")]
+    typed = kit.convert_path(empty, expected_schema=schema)
+    assert typed.report.rows == 0
+    assert typed.table.schema == pa.schema([("id", pa.decimal128(10, 2)), ("name", pa.int64())])
