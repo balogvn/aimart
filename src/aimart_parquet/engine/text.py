@@ -14,11 +14,16 @@ from typing import TYPE_CHECKING
 
 from charset_normalizer import from_bytes
 
-from aimart_parquet.engine.safety import unwrapped
 from aimart_parquet.errors import InvalidInput, InvalidRequest
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator
+    from contextlib import AbstractContextManager
     from pathlib import Path
+
+    from aimart_parquet.engine.safety import Readable
+
+    Opener = Callable[[], AbstractContextManager[Readable]]
 
 _CHUNK = 1024 * 1024
 _DETECT_SAMPLE = 2 * 1024 * 1024
@@ -31,20 +36,36 @@ class TextInfo:
     replaced_chars: int
 
 
-def _is_valid_utf8(path: Path) -> bool:
+def utf8_size(chunks: Iterable[bytes]) -> int | None:
+    """How many bytes ``chunks`` hold when they are all UTF-8; else None, read no further."""
     decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+    size = 0
     try:
-        with path.open("rb") as fh:
-            while chunk := fh.read(_CHUNK):
-                decoder.decode(chunk)
-            decoder.decode(b"", final=True)
+        for chunk in chunks:
+            decoder.decode(chunk)
+            size += len(chunk)
+        decoder.decode(b"", final=True)
     except UnicodeDecodeError:
-        return False
-    return True
+        return None
+    return size
 
 
-def _detect(path: Path) -> str:
-    with path.open("rb") as fh:
+def codec_name(encoding: str) -> str | None:
+    """The codec's own name for ``encoding`` ('utf-8' for 'UTF8'); None for one to_utf8 refuses
+    (``encoding_problem``: 'utf-8\\x00' made ``codecs.lookup`` raise ValueError, a bare 500)."""
+    if encoding_problem(encoding) is not None:
+        return None
+    return codecs.lookup(encoding).name
+
+
+def _chunks(read: Opener) -> Iterator[bytes]:
+    with read() as fh:
+        while chunk := fh.read(_CHUNK):
+            yield chunk
+
+
+def _detect(read: Opener) -> str:
+    with read() as fh:
         sample = fh.read(_DETECT_SAMPLE)
     if sample.startswith((b"\xff\xfe", b"\xfe\xff")):
         return "utf-16"
@@ -137,7 +158,7 @@ def encoding_refusal(name: str) -> InvalidRequest | None:
     )
 
 
-def _transcode(src: Path, dst: Path, encoding: str) -> int:
+def _transcode(read: Opener, dst: Path, encoding: str) -> int:
     """Transcode to UTF-8; returns how many undecodable characters became U+FFFD.
 
     Counting U+FFFD in the output is exact for every single-byte source encoding (none of them
@@ -145,7 +166,7 @@ def _transcode(src: Path, dst: Path, encoding: str) -> int:
     """
     replaced = 0
     decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
-    with src.open("rb") as fin, dst.open("w", encoding="utf-8", newline="") as fout:
+    with read() as fin, dst.open("w", encoding="utf-8", newline="") as fout:
         try:
             while chunk := fin.read(_CHUNK):
                 text = decoder.decode(chunk)
@@ -172,15 +193,26 @@ def _undecodable(encoding: str, exc: UnicodeError) -> InvalidInput:
     return InvalidInput(f"The file cannot be decoded as {name}: {reason}.", hint=hint)
 
 
-def to_utf8(path: Path, workdir: Path, forced_encoding: str | None = None) -> TextInfo:
+def to_utf8(
+    path: Path,
+    workdir: Path,
+    forced_encoding: str | None = None,
+    *,
+    replace: bool = False,
+    opener: Opener | None = None,
+) -> TextInfo:
     """Return a UTF-8 version of ``path`` (the same path when it already is UTF-8).
 
-    A decompressed stream or zip member (``safety.unwrapped``) is deleted once its UTF-8 copy
-    is written: the job's files count toward its memory cap (on Cloud Run /tmp is RAM), and a
-    cp1252 CSV of 230 MiB sent as 44 MiB of gzip held its upload, the decompressed text and
-    the copy at once, 508 MB of files, and was stopped at the 700 MB cap (413) where its
-    UTF-8 twin converted.
+    With ``replace``, for a caller that owns ``path`` (a reader, given the pipeline's own file
+    by ``convert.unwrap``), the UTF-8 version takes its place: the job's files count toward
+    its memory cap (on Cloud Run /tmp is RAM), and a cp1252 CSV of 230 MiB sent as 44 MiB of
+    gzip held its upload, the decompressed text and the copy at once, 508 MB of files, and was
+    stopped at the 700 MB cap (413) where its UTF-8 twin converted. Without it ``path`` is
+    never touched: it may be a caller's file. ``opener`` reads the text where it is not
+    ``path``'s own bytes: a gzip's (safety.open_gzip), which is then never unpacked, only its
+    UTF-8 version written.
     """
+    read: Opener = opener or (lambda: path.open("rb"))
     if forced_encoding:
         # Refused before the quote only when the input is known to be text then (a url's file,
         # or compressed bytes, is not), so a request can reach here with one.
@@ -190,12 +222,12 @@ def to_utf8(path: Path, workdir: Path, forced_encoding: str | None = None) -> Te
         if codecs.lookup(forced_encoding).name == "utf-8":
             return TextInfo(path, "utf-8", 0)
         encoding = forced_encoding
-    elif _is_valid_utf8(path):
+    elif utf8_size(_chunks(read)) is not None:
         return TextInfo(path, "utf-8", 0)
     else:
-        encoding = _detect(path)
+        encoding = _detect(read)
     dst = workdir / "utf8.txt"
-    replaced = _transcode(path, dst, encoding)
-    if unwrapped(path, workdir):
-        path.unlink()
+    replaced = _transcode(read, dst, encoding)
+    if replace:
+        dst = dst.replace(path)
     return TextInfo(dst, codecs.lookup(encoding).name, replaced)

@@ -279,20 +279,24 @@ MCP error result; the full list is in the
 of loaded into a table, so a conversion's process stays at about 150-330 MiB whatever the
 file's size (it took about 3.5 times the file, and CSVs over about 120 MB were refused). The
 job's files still grow with it, and they count toward the 700 MB a job may use because `/tmp`
-is RAM on Cloud Run: the decompressed text, its staged copy and the output, up to about 1.6
-times the CSV. Measured with the defaults, the input caps bind first: a 255 MiB CSV sent as 39 MB
-of gzip converted at 481 MiB in all. A CSV that is not UTF-8 also holds its UTF-8 copy while it
-is transcoded (the decompressed text is deleted once the copy is written), about twice its text
-in files at that moment: 230 MiB of orders in cp1252, sent as 45 MB of gzip, converted at 659
-MiB (501 MiB of files at the peak), close to the cap, where the same data in UTF-8 took 475 MiB.
-With the input caps raised, a 200 MB CSV converts (430
-MiB), a 40-column 135 MiB one too (535 MiB), and a 450 MB one is stopped at the job cap (153 MiB
-in memory plus 547 MiB of files). `sort_by` sorts the whole file and spills to disk past 400 MiB;
-the spill counts too, and DuckDB may spill only the 300 MiB the cap leaves it: a 100 MB CSV
-sorts (461 MiB), a 200 MB one is refused. Over the cap the call fails with 413, unpaid: split
-such files, or convert them with the free local server, which applies the same defaults, with
-`AIMART_MAX_INPUT_BYTES`, `AIMART_MAX_DECOMPRESSED_BYTES` and `AIMART_JOB_MEMORY_LIMIT_MB`
-raised to suit your machine.
+is RAM on Cloud Run: the upload, the staged text and the output (those two about 0.4-0.65
+times the CSV), and no input outlives its read. A gzip of CSV or TSV is not unpacked: DuckDB
+reads it once one pass has counted it against the 256 MB cap and checked that DuckDB reads it
+as Python does, and text that is not UTF-8 is transcoded straight from it, its UTF-8 version on
+disk while it is read. A bz2 or
+zip is unpacked, and one that is not UTF-8 also holds its UTF-8 version while it is
+transcoded, which then replaces the unpacked text. Measured with the defaults, the input caps
+bind first: a 255 MiB CSV sent as 39 MB of gzip converted at 232 MiB in all, and 230 MiB of
+orders in cp1252 sent as 45 MB of gzip at 552 MiB; the same orders sent as bz2 or zip peaked at
+651 and 683 MiB, close to the cap, with the unpacked text and its UTF-8 version both on disk.
+With the input caps raised, a 446 MiB CSV sent as 159 MiB of gzip converts (489 MiB), and 450 MB
+sent uncompressed is stopped at the job cap (149 MiB in memory plus 562 MiB of files).
+`sort_by` sorts the whole file and spills to disk past 400 MiB; the spill counts too, and
+DuckDB may spill only the 300 MiB the cap leaves it: a 100 MB CSV sorts (469 MiB), and so does
+198 MiB sent as gzip (655 MiB), while 200 MB sent uncompressed is refused. Over the cap the call
+fails with 413, unpaid: split such files, or convert them with the free local server, which
+applies the same defaults, with `AIMART_MAX_INPUT_BYTES`, `AIMART_MAX_DECOMPRESSED_BYTES` and
+`AIMART_JOB_MEMORY_LIMIT_MB` raised to suit your machine.
 [deploy/README.md](deploy/README.md#memory-capacity-what-one-2-gib-instance-converts) has the
 numbers.
 

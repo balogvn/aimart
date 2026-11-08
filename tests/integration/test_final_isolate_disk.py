@@ -11,6 +11,12 @@ directories ``Service`` passes) to the RSS.
 These tests pin the child's RSS at zero in the parent (the watchdog runs there), so only the
 files can trip the cap: before the fix every one of them that expects ``InputTooLarge``
 converted or queried successfully.
+
+Since 1886f60 (merged after these tests) a gzip of UTF-8 CSV is never unpacked: DuckDB reads
+it, so the incident's file no longer writes its text anywhere and converts within the files
+budget (``test_the_incidents_gzip_no_longer_lands_in_the_work_directory``). A gzip CSV that
+is not UTF-8 still writes its UTF-8 version there, so the tests that need the job's files to
+reach the cap send that one.
 """
 
 from __future__ import annotations
@@ -149,28 +155,63 @@ def isolated(make_settings: Callable[..., Settings]) -> Service:
     return Service(settings, build_store(settings))
 
 
+_ROW = b"alpha,beta,gamma,delta,epsilon,zeta,eta,theta\n"
+
+
+def _incident_gzip(header: bytes = b"c1,c2,c3,c4,c5,c6,c7,c8\n") -> bytes:
+    """The incident's shape, scaled down: 64 MB of CSV text in under 1 MB of gzip."""
+    data = gzip.compress(header + _ROW * (64 * _MB // len(_ROW)), 9)
+    assert len(data) < _MB
+    return data
+
+
+# A cp1252 header: the text is not UTF-8, so its UTF-8 version is written to the work directory
+# (transcoded straight from the gzip since 1886f60), 64 MB of the job's files.
+_CP1252_HEADER = "c1,c2,c3,c4,c5,c6,c7,café\n".encode("cp1252")
+
+
 @pytest.mark.anyio
 async def test_convert_counts_its_decompressed_input(isolated: Service, files_only: None) -> None:
-    # The incident's shape, scaled down: a small gzip that inflates in the work directory.
-    row = b"alpha,beta,gamma,delta,epsilon,zeta,eta,theta\n"
-    data = gzip.compress(b"c1,c2,c3,c4,c5,c6,c7,c8\n" + row * (64 * _MB // len(row)), 9)
-    assert len(data) < _MB
-    src = SourceRef(content_base64=base64.b64encode(data).decode(), filename="big.csv.gz")
+    # Before 1886f60 this sent the incident's UTF-8 gzip, which unwrap inflated into the work
+    # directory; that one is now read from the gzip (the test below). The same text in cp1252
+    # still lands there, as its UTF-8 version, and counts.
+    src = SourceRef(
+        content_base64=base64.b64encode(_incident_gzip(_CP1252_HEADER)).decode(),
+        filename="big.csv.gz",
+    )
     with pytest.raises(errors.InputTooLarge, match="temporary files") as info:
-        await isolated.convert(src, ConvertOptions())
+        await isolated.convert(src, ConvertOptions(encoding="cp1252"))
     assert info.value.details["temp_file_bytes"] > 16 * _MB
     assert list((isolated.settings.artifact_dir / ".work").iterdir()) == []  # cleaned up
+
+
+@pytest.mark.anyio
+async def test_the_incidents_gzip_no_longer_lands_in_the_work_directory(
+    isolated: Service, files_only: None
+) -> None:
+    # The incident's own file: 64 MB of UTF-8 CSV text, 16 MB of files allowed. DuckDB reads the
+    # gzip after one in-memory pass, so the job's files are the upload, its link and the small
+    # staged text and output: it converts where it was a 413 (and, before the watchdog counted
+    # files, 501 MiB on the RAM disk).
+    data = _incident_gzip()
+    src = SourceRef(content_base64=base64.b64encode(data).decode(), filename="big.csv.gz")
+    result = await isolated.convert(src, ConvertOptions())
+    assert result.report.rows == 64 * _MB // len(_ROW)
+    assert result.report.estimated_tokens_raw == len(gzip.decompress(data)) // 4
 
 
 @pytest.mark.anyio
 async def test_the_incident_on_the_wire_is_an_unpaid_413(
     make_settings: Callable[..., Settings], files_only: None
 ) -> None:
+    # The cp1252 twin of the incident's file (see test_convert_counts_its_decompressed_input).
     settings = make_settings(isolate_jobs=True, job_memory_limit_mb=16)
     facilitator = kit.FakeFacilitator()
-    row = b"alpha,beta,gamma,delta,epsilon,zeta,eta,theta\n"
-    data = gzip.compress(b"c1,c2,c3,c4,c5,c6,c7,c8\n" + row * (64 * _MB // len(row)), 9)
-    body = {"content_base64": base64.b64encode(data).decode(), "filename": "big.csv.gz"}
+    body = {
+        "content_base64": base64.b64encode(_incident_gzip(_CP1252_HEADER)).decode(),
+        "filename": "big.csv.gz",
+        "options": {"encoding": "cp1252"},
+    }
     async with kit.running_app(settings, facilitator=facilitator) as h:
         r = await h.paying.post("/v1/convert", json=body)
     assert r.status_code == 413, r.text

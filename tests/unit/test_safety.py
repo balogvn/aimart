@@ -86,6 +86,86 @@ class TestDecompressStream:
         assert kind in info.value.message
 
 
+class TestGzipChunks:
+    """What DuckDB is let read from a gzip: only what Python's gzip module reads the same way."""
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            gzip.compress(b"a,b\n1,2\n"),
+            gzip.compress(b"a,b\n") + gzip.compress(b"") + gzip.compress(b"1,2\n"),
+            kit.gzip_member(b"a,b\n", 4) + kit.gzip_member(b"1,2\n", 8),
+            gzip.compress(b""),
+        ],
+        ids=["one", "three-members", "fextra-fname", "empty"],
+    )
+    def test_yields_what_python_reads(self, tmp_path, data) -> None:
+        path = kit.write(tmp_path / "in.gz", data)
+        assert b"".join(safety.gzip_chunks(path, MB)) == gzip.decompress(data)
+
+    def test_a_bomb_inflates_a_chunk_at_a_time(self, tmp_path) -> None:
+        path = kit.write(tmp_path / "bomb.gz", gzip.compress(b"\0" * (20 * MB)))
+        assert path.stat().st_size < 50_000  # one read of it holds the whole bomb
+        assert max(map(len, safety.gzip_chunks(path, 20 * MB))) <= MB
+
+    def test_past_the_cap_is_too_large(self, tmp_path) -> None:
+        path = kit.write(tmp_path / "bomb.gz", gzip.compress(b"\0" * (3 * MB)))
+        with pytest.raises(InputTooLarge) as info:
+            b"".join(safety.gzip_chunks(path, 2 * MB))
+        assert info.value.details == {"limit_bytes": 2 * MB}
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            kit.gzip_member(b"a\n", 1),
+            kit.gzip_member(b"a\n", 2),
+            kit.gzip_member(b"a\n", 16),
+            kit.gzip_member(b"a\n", 32),
+            gzip.compress(b"a\n") + b"\0",
+            gzip.compress(b"a\n") + b"\0" * 64,
+            gzip.compress(b"a\n") + b"junk after it",
+            gzip.compress(b"a\n")[:-8] + b"\0\0\0\0" + gzip.compress(b"a\n")[-4:],
+            gzip.compress(b"a\n")[:-4] + b"\x09\0\0\0",
+            gzip.compress(b"a\n")[:-3],
+            gzip.compress(b"a\n" * 1000)[:20],
+            gzip.compress(b"a\n")[:12],
+            b"\x1f\x8b\x08\x08" + b"\0" * 6 + b"no end to the name" * 70_000,
+            b"\x1f\x8b\x08\x00" + b"\0" * 6 + b"not deflate",
+        ],
+        ids=[
+            "ftext",
+            "fhcrc",
+            "fcomment",
+            "reserved",
+            "zero-byte",
+            "zero-padding",
+            "trailing",
+            "crc",
+            "length",
+            "trailer-cut",
+            "body-cut",
+            "header-only",
+            "endless-name",
+            "not-deflate",
+        ],
+    )
+    def test_anything_duckdb_might_read_otherwise_is_a_mismatch(self, tmp_path, data) -> None:
+        # Python reads the first four and skips the padding, which DuckDB refuses; DuckDB reads
+        # the rest, which Python refuses, as whatever inflates.
+        path = kit.write(tmp_path / "in.gz", data)
+        with pytest.raises(safety.GzipMismatch):
+            b"".join(safety.gzip_chunks(path, MB))
+
+
+def test_gzip_head(tmp_path) -> None:
+    path = kit.write(tmp_path / "in.gz", gzip.compress(b"x" * 5000))
+    assert safety.gzip_head(path, 1024) == b"x" * 1024
+    short = kit.write(tmp_path / "short.gz", gzip.compress(b"a,b\n"))
+    assert safety.gzip_head(short, 1024) == b"a,b\n"
+    cut = kit.write(tmp_path / "cut.gz", gzip.compress(b"a,b\n")[:12])
+    assert safety.gzip_head(cut, 1024) is None  # decompress_stream says what is wrong
+
+
 class TestCheckZip:
     def test_a_normal_zip_passes(self, tmp_path) -> None:
         path = kit.write(tmp_path / "a.zip", kit.zip_bytes({"a.csv": b"a,b\n1,2\n"}))
@@ -190,6 +270,31 @@ class TestEnsureSize:
 
 
 def test_copy_file(tmp_path) -> None:
+    # Still the engine's copy of a local caller's file, which is never linked (convert._link).
     src = kit.write(tmp_path / "a", b"abc")
     safety.copy_file(src, tmp_path / "b")
     assert (tmp_path / "b").read_bytes() == b"abc"
+
+
+def test_link_or_copy_links(tmp_path) -> None:
+    src = kit.write(tmp_path / "a", b"abc")
+    safety.link_or_copy(src, tmp_path / "b")
+    assert (tmp_path / "b").stat().st_ino == src.stat().st_ino  # no second copy of the bytes
+
+
+def test_link_or_copy_copies_across_filesystems(tmp_path, monkeypatch) -> None:
+    def cross_device(*_: object, **__: object) -> None:
+        raise OSError(18, "Invalid cross-device link")
+
+    monkeypatch.setattr(safety.os, "link", cross_device)
+    src = kit.write(tmp_path / "a", b"abc")
+    safety.link_or_copy(src, tmp_path / "b")
+    assert (tmp_path / "b").read_bytes() == b"abc"
+
+
+def test_link_or_copy_never_replaces_a_file(tmp_path) -> None:
+    src = kit.write(tmp_path / "a", b"abc")
+    theirs = kit.write(tmp_path / "b", b"keep")
+    with pytest.raises(FileExistsError):
+        safety.link_or_copy(src, theirs)
+    assert theirs.read_bytes() == b"keep"

@@ -76,13 +76,16 @@ flowchart LR
    `RLIMIT_AS`: a Linux child starts at about 2 GB of virtual memory. Inside it DuckDB is held
    at the cap minus 300 MB (400 MiB) and may spill only the rest (300 MiB), so the two together
    never pass the cap. A CSV conversion's process stays at about 150-330 MiB whatever the
-   file's size; its files (the decompressed text, its staged copy, the output) grow with it, up
-   to about 1.6 times the CSV. Measured with the defaults, the input caps bind before the job
-   cap: a 255 MiB CSV sent as 39 MB of gzip peaked at 481 MiB in all; text that is not UTF-8
-   also holds its UTF-8 copy while it is transcoded (`text.to_utf8` then deletes the
-   decompressed text), so 230 MiB of cp1252 CSV sent as 45 MB of gzip peaked at 659 MiB; with
-   the caps raised, a 450 MB CSV reached the job cap (a 413). A convert's input is on that disk once: an upload
-   is written into the work directory, and a stored artifact is hard-linked there, not copied.
+   file's size; its files (the upload, the staged copy of the text, the output) grow with it,
+   and no input outlives its read: a gzip of CSV or TSV is read by DuckDB where it lies, and
+   what is unpacked or transcoded is deleted once the reader returns. Measured with the
+   defaults, the input caps bind before the job cap: a 255 MiB CSV sent as 39 MB of gzip
+   peaked at 232 MiB in all, and 230 MiB of cp1252 CSV sent as 45 MB of gzip at 552 MiB (its
+   UTF-8 version, transcoded from the stream, on disk while it is read); as bz2 or zip, its
+   unpacked text beside that UTF-8 version, at 651-683 MiB. With the caps raised a 446 MiB CSV
+   sent as gzip converted (489 MiB), and 450 MB uncompressed reached the job cap (a 413). A
+   convert's input is on that disk once: an upload is written into the work directory, and a
+   stored artifact is hard-linked there, not copied; the reader gets a hard link of its own.
    A gzip/bz2/zip stream also stops as it inflates past `max_decompressed_bytes` (256 MB), and
    a workbook's XML parts, every sheet counted though one is parsed, have their own
    `max_workbook_xml_bytes` (512 MB). See [ADR 0005](adr/0005-job-isolation-forkserver.md).
@@ -90,9 +93,12 @@ flowchart LR
    decompression (`safety.py`) and UTF-8 transcoding (`text.py`). A reader (`readers/`)
    produces a raw table in a locked-down DuckDB connection (`duck.py`); for delimited text
    it is a view over a compressed Parquet copy of the text, so memory stays flat as files
-   grow, and DuckDB's memory limit sits under the job's cap (`limits.py`). Next come type
-   inference in SQL (`infer.py`), name normalization (`names.py`), and the writer
-   (`writer.py`): DuckDB `COPY` to zstd Parquet, or pyarrow when labels must be embedded
+   grow, and DuckDB's memory limit sits under the job's cap (`limits.py`). Because `/tmp` is
+   RAM on Cloud Run, a gzip of CSV or TSV is not decompressed at all (DuckDB reads it, once a
+   Python pass has checked it against the bomb cap), and any decompressed or transcoded input
+   is deleted as soon as the reader returns. Next come type inference in SQL (`infer.py`),
+   name normalization (`names.py`), and the writer (`writer.py`): DuckDB `COPY` to zstd
+   Parquet, or pyarrow when labels must be embedded
    ([ADR 0006](adr/0006-duckdb-copy-writer.md)).
 6. **Artifact store.** The output goes to `LocalArtifactStore` (TTL disk, HMAC-signed links)
    or `GcsArtifactStore` (V4 signed URLs). The caller gets a reference (`artifact_id` and

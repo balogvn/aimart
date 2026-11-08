@@ -3,6 +3,8 @@
     unwrap compression -> detect format -> read into DuckDB -> name columns -> infer types
     -> validate against expected_schema -> sort -> stream to Parquet -> report from the footer
 
+(A gzip of CSV or TSV is not unwrapped: DuckDB reads it as it is. See keep_gzip.)
+
 The report is built from the file that was actually written (types and null counts come from
 the Parquet footer), not from what the pipeline intended to write.
 """
@@ -11,15 +13,23 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import tempfile
 import time
 from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import duckdb
 
 from aimart_parquet import __version__
 from aimart_parquet.engine import safety
-from aimart_parquet.engine.detect import _zip_office_format, detect_format
+from aimart_parquet.engine.detect import (
+    START_BYTES,
+    _zip_office_format,
+    detect_format,
+    format_from_start,
+)
 from aimart_parquet.engine.duck import connect, ident
 from aimart_parquet.engine.infer import (
     INSTANT_TYPE,
@@ -48,8 +58,6 @@ from aimart_parquet.engine.writer import copy_to_parquet, write_parquet
 from aimart_parquet.errors import InputTooLarge, InvalidRequest, SchemaViolation
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from aimart_parquet.engine.limits import Limits
     from aimart_parquet.engine.readers import RawColumn, RawTable, Reader
 
@@ -105,26 +113,74 @@ def unwrap(
 ) -> tuple[Path, str | None]:
     """Remove one layer of gzip/bz2/zip. Office documents are zips too and are left alone.
 
-    The result always lives inside ``workdir``: DuckDB is sandboxed to that directory, so an
-    input elsewhere (local mode passes user paths) is copied in first.
+    The result is always a new file inside ``workdir``, never ``src``: DuckDB is sandboxed to
+    that directory, and the result is the pipeline's own (a reader may replace it, and
+    convert_file deletes it once read) while ``src`` is the caller's or the service's. An
+    archive is unpacked from where it lies (Python reads it; only DuckDB is held to
+    ``workdir``): every input outside the work directory used to be copied in first, and that
+    copy (up to 50 MB) sat on Cloud Run's RAM disk for the whole job next to the text unpacked
+    from it.
     """
-    if not src.resolve().is_relative_to(workdir.resolve()):
-        local = workdir / ("input" + "".join(src.suffixes[-2:]))
-        safety.copy_file(src, local)
-        src = local
     kind = safety.sniff_compression(safety.read_magic(src, 8))
     if kind in {"gzip", "bz2"}:
         dst = workdir / safety.DECOMPRESSED
         safety.decompress_stream(src, dst, kind, limits.max_decompressed_bytes)
-        name = filename
-        if name:
-            for suffix in (".gz", ".gzip", ".bz2"):
-                if name.lower().endswith(suffix):
-                    name = name[: -len(suffix)]
-        return dst, name
+        return dst, _without_compression(filename)
     if kind == "zip" and _zip_office_format(src) is None:
         return safety.extract_single_member(src, workdir, limits.max_decompressed_bytes)
-    return src, filename
+    return _link(src, workdir, "input" + "".join(src.suffixes[-2:])), filename
+
+
+def keep_gzip(
+    src: Path, filename: str | None, workdir: Path, forced: InputFormat | None
+) -> tuple[Path, str | None, InputFormat] | None:
+    """A gzip of CSV or TSV, linked into ``workdir`` still compressed, with its name and format.
+
+    DuckDB reads gzip, and the text unwrap unpacked sat on Cloud Run's RAM disk while it was
+    read: up to the 256 MB stream cap of a job's files. The delimited reader checks the stream
+    first, and unpacks it where DuckDB could read it differently. Anything else is None (unwrap
+    it), and so is a gzip whose first KB does not settle its format: ``format_from_start``
+    decides it, the one answer the checks before the quote use too.
+    """
+    if safety.sniff_compression(safety.read_magic(src, 8)) != "gzip":
+        return None
+    name = _without_compression(filename)
+    head = safety.gzip_head(src, START_BYTES)
+    if head is None:
+        return None  # corrupt where it starts: unwrap says so, as before
+    fmt = format_from_start(head, name, forced, whole=len(head) < START_BYTES)
+    if fmt not in {InputFormat.CSV, InputFormat.TSV}:
+        return None
+    # No '.gz': read_csv takes the name for gzip, and the reader may unpack text over it.
+    return _link(src, workdir, "input"), name, fmt
+
+
+def _without_compression(filename: str | None) -> str | None:
+    name = filename
+    if name:
+        for suffix in (".gz", ".gzip", ".bz2"):
+            if name.lower().endswith(suffix):
+                name = name[: -len(suffix)]
+    return name
+
+
+def _link(src: Path, workdir: Path, name: str) -> Path:
+    """``src`` as ``workdir / name``, the pipeline's own file: a reader may replace it, and
+    convert_file deletes it once read, leaving ``src`` as it was."""
+    local = workdir / name
+    if local.exists():  # src itself, or another file in the work directory
+        local = Path(tempfile.mkdtemp(dir=workdir)) / name
+    if src.resolve().is_relative_to(workdir.resolve()):
+        # The service's own file (an upload, a download, a stored artifact's link): a hard link
+        # costs no space, and deleting it, or renaming a UTF-8 version over it, leaves that
+        # file as it was. Nothing may write into it.
+        safety.link_or_copy(src, local)
+    else:
+        # Elsewhere is a local caller's own file (or a stored artifact the service could not
+        # link): copied in, as DuckDB reads only the work directory, and never linked, which
+        # would put the converter one bug away from writing to it.
+        safety.copy_file(src, local)
+    return local
 
 
 def _decimal(col: ExpectedColumn) -> tuple[int, int]:
@@ -331,8 +387,13 @@ def convert_file(
     started = time.monotonic()
     _check_expected_schema(options)
     source_bytes = safety.ensure_size(src, limits.max_input_bytes)
-    path, name = unwrap(src, filename, workdir, limits)
-    fmt = detect_format(path, safety.read_magic(path), name, options.format)
+    kept = keep_gzip(src, filename, workdir, options.format)
+    if kept is None:
+        path, name = unwrap(src, filename, workdir, limits)
+        fmt = detect_format(path, safety.read_magic(path), name, options.format)
+    else:
+        path, name, fmt = kept
+    read: Reader = partial(read_delimited, gzipped=True) if kept else READERS[fmt]
     tmp = workdir / "duck_tmp"
     tmp.mkdir(exist_ok=True)
     con = connect(
@@ -343,7 +404,12 @@ def convert_file(
         max_temp_size=limits.duckdb_max_temp_size,
     )
     try:
-        raw = READERS[fmt](con, path, workdir, options, fmt, limits)
+        raw = read(con, path, workdir, options, fmt, limits)
+        text_bytes = raw.text_bytes if raw.text_bytes is not None else path.stat().st_size
+        # Nothing reads the input again (raw is a table, or a view over the staged text), and
+        # /tmp is RAM on Cloud Run: a 446 MiB decompressed CSV stayed there through inference,
+        # the write and a sort's spill, 1.25 GiB of files at the peak.
+        path.unlink(missing_ok=True)
         report = _finish(con, raw, out_path, name, options, fmt)
     except duckdb.OutOfMemoryException as exc:
         # Reading, typing every column and the final COPY (a sort, with sort_by) all run in
@@ -358,7 +424,6 @@ def convert_file(
         con.close()
     report.source_bytes = source_bytes
     report.duration_ms = int((time.monotonic() - started) * 1000)
-    text_bytes = raw.text_bytes if raw.text_bytes is not None else path.stat().st_size
     report.estimated_tokens_raw = max(1, text_bytes // 4)
     return report
 

@@ -62,12 +62,17 @@ class TestUnwrap:
     def test_office_zips_are_left_alone(self, tmp_path) -> None:
         workdir = tmp_path / "work"
         book = kit.messy_workbook(workdir / "book.xlsx")
-        assert unwrap(book, "book.xlsx", workdir, Limits()) == (book, "book.xlsx")
+        data = book.read_bytes()
+        path, name = unwrap(book, "book.xlsx", workdir, Limits())
+        assert (path.read_bytes(), name) == (data, "book.xlsx")
+        assert path != book  # the pipeline's own: convert_file deletes it, never the caller's
 
     def test_plain_files_pass_through(self, tmp_path) -> None:
         workdir = tmp_path / "work"
         src = kit.write(workdir / "a.csv", b"a\n1\n")
-        assert unwrap(src, "a.csv", workdir, Limits()) == (src, "a.csv")
+        path, name = unwrap(src, "a.csv", workdir, Limits())
+        assert (path.read_bytes(), name) == (b"a\n1\n", "a.csv")
+        assert path != src
 
 
 class TestWrappedInputs:

@@ -10,10 +10,17 @@ from __future__ import annotations
 
 import bz2
 import gzip
+import os
 import shutil
+import struct
 import zipfile
+import zlib
+from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Literal, Protocol
+from typing import IO, TYPE_CHECKING, Literal, Protocol
+
+if TYPE_CHECKING:
+    from collections.abc import Generator, Iterator
 
 from aimart_parquet.errors import InputTooLarge, InvalidInput, without_paths
 
@@ -46,21 +53,25 @@ def sniff_compression(magic: bytes) -> Compression | None:
     return None
 
 
-class _Readable(Protocol):
+class Readable(Protocol):
     def read(self, size: int = ..., /) -> bytes: ...
 
 
-def copy_capped(src: _Readable, dst: IO[bytes], cap: int) -> int:
+def _too_large(cap: int) -> InputTooLarge:
+    return InputTooLarge(
+        f"Decompressed input exceeds the {cap // (1024 * 1024)} MB limit.",
+        hint="Split the file, or send a smaller extract.",
+        limit_bytes=cap,
+    )
+
+
+def copy_capped(src: Readable, dst: IO[bytes], cap: int) -> int:
     """Stream src to dst, raising InputTooLarge as soon as more than ``cap`` bytes appear."""
     total = 0
     while chunk := src.read(_CHUNK):
         total += len(chunk)
         if total > cap:
-            raise InputTooLarge(
-                f"Decompressed input exceeds the {cap // (1024 * 1024)} MB limit.",
-                hint="Split the file, or send a smaller extract.",
-                limit_bytes=cap,
-            )
+            raise _too_large(cap)
         dst.write(chunk)
     return total
 
@@ -73,10 +84,126 @@ def decompress_stream(
         with opener(src_path, "rb") as src, dst_path.open("wb") as dst:
             return copy_capped(src, dst, cap)
     except (OSError, EOFError) as exc:
-        raise InvalidInput(
-            f"The {kind} stream is corrupt or truncated: {without_paths(exc)}",
-            hint="Re-compress the file, or send it uncompressed.",
-        ) from exc
+        raise _corrupt(kind, exc) from exc
+
+
+def _corrupt(kind: str, exc: BaseException) -> InvalidInput:
+    return InvalidInput(
+        f"The {kind} stream is corrupt or truncated: {without_paths(exc)}",
+        hint="Re-compress the file, or send it uncompressed.",
+    )
+
+
+class _CappedGzip:
+    def __init__(self, fh: gzip.GzipFile, cap: int) -> None:
+        self._fh, self._cap, self._total = fh, cap, 0
+
+    def read(self, size: int = _CHUNK, /) -> bytes:
+        try:
+            chunk = self._fh.read(size)
+        except (OSError, EOFError) as exc:
+            raise _corrupt("gzip", exc) from exc
+        self._total += len(chunk)
+        if self._total > self._cap:
+            raise _too_large(self._cap)
+        return chunk
+
+
+@contextmanager
+def open_gzip(path: Path, cap: int) -> Iterator[Readable]:
+    """What a gzip file holds, failing as decompress_stream does: corrupt, or past ``cap``."""
+    with gzip.open(path, "rb") as fh:
+        yield _CappedGzip(fh, cap)
+
+
+def gzip_head(path: Path, n: int) -> bytes | None:
+    """The first ``n`` bytes a gzip file holds (all of them if fewer), or None where those are
+    corrupt: decompress_stream then says what is wrong."""
+    try:
+        with gzip.open(path, "rb") as fh:
+            return fh.read(n)
+    except (OSError, EOFError):
+        return None
+
+
+class GzipMismatch(Exception):
+    """A gzip file DuckDB might not read exactly as Python's gzip module does."""
+
+
+# The header flags DuckDB 1.5 reads: FEXTRA and FNAME. It refuses FTEXT, FHCRC, FCOMMENT and
+# the reserved bits, which Python's gzip module reads.
+_FEXTRA, _FNAME = 0x04, 0x08
+_MAX_GZIP_HEADER = _CHUNK
+
+
+def gzip_chunks(path: Path, cap: int) -> Generator[bytes]:
+    """What a gzip file holds, in chunks, checked for DuckDB to read the file itself after.
+
+    DuckDB reads gzip without checking a member's CRC or length (a corrupt or truncated file
+    reads as whatever inflates) and refuses some headers and the zero padding Python skips.
+    Wherever the two could differ this raises GzipMismatch, and decompress_stream unpacks the
+    file, or reports what is wrong with it, as before. Past ``cap`` it raises InputTooLarge.
+    """
+    total = 0
+    with path.open("rb") as fh:
+        buf = b""
+        try:
+            while True:
+                buf = _past_header(fh, buf)
+                inflate = zlib.decompressobj(-zlib.MAX_WBITS)
+                crc = size = 0
+                while not inflate.eof:
+                    data = buf or fh.read(_CHUNK)
+                    # At most _CHUNK out per call: a 1 MB read of a bomb inflates to 1 GB.
+                    out = inflate.decompress(data, _CHUNK)
+                    buf = inflate.unconsumed_tail
+                    if not data and not out:
+                        raise GzipMismatch("truncated")
+                    size += len(out)
+                    if total + size > cap:
+                        raise _too_large(cap)
+                    crc = zlib.crc32(out, crc)
+                    if out:
+                        yield out
+                total += size
+                buf = _fill(fh, inflate.unused_data, 8)
+                if buf[:8] != struct.pack("<II", crc, size & 0xFFFFFFFF):
+                    raise GzipMismatch("CRC or length")
+                buf = buf[8:] or fh.read(_CHUNK)
+                if not buf:
+                    return
+        except zlib.error as exc:
+            raise GzipMismatch(str(exc)) from exc
+
+
+def _past_header(fh: Readable, buf: bytes) -> bytes:
+    """What follows a member header that ``buf`` (and then ``fh``) begins with."""
+    buf = _fill(fh, buf, 10)
+    flags = buf[3]
+    if buf[:3] != b"\x1f\x8b\x08" or flags & ~(_FEXTRA | _FNAME):
+        raise GzipMismatch("header")  # also zero padding or trailing bytes after a member
+    pos = 10
+    if flags & _FEXTRA:
+        buf = _fill(fh, buf, 12)
+        pos = 12 + int.from_bytes(buf[10:12], "little")
+    buf = _fill(fh, buf, pos)
+    if flags & _FNAME:
+        while (end := buf.find(b"\0", pos)) < 0:
+            if len(buf) > _MAX_GZIP_HEADER:
+                raise GzipMismatch("header")
+            buf = _fill(fh, buf, len(buf) + 1)
+        pos = end + 1
+    return buf[pos:]
+
+
+def _fill(fh: Readable, buf: bytes, n: int) -> bytes:
+    """``buf``, grown from ``fh`` to at least ``n`` bytes; GzipMismatch if the file ends first."""
+    while len(buf) < n:
+        more = fh.read(max(_CHUNK, n - len(buf)))
+        if not more:
+            raise GzipMismatch("truncated")
+        buf += more
+    return buf
 
 
 def check_zip(path: Path, cap: int) -> list[zipfile.ZipInfo]:
@@ -123,15 +250,11 @@ def data_members(infos: list[zipfile.ZipInfo]) -> list[zipfile.ZipInfo]:
 
 
 # What ``convert.unwrap`` writes into a job's work directory: a decompressed gzip/bz2 stream
-# and a zip's one member. The readers read them once; ``text.to_utf8`` deletes one once its
-# UTF-8 copy is written, as nothing reads it again (``unwrapped``).
+# and a zip's one member. Like every input ``unwrap`` hands a reader, they are the pipeline's
+# own: a UTF-8 version replaces one (``text.to_utf8``), and ``convert_file`` deletes it once
+# read.
 DECOMPRESSED = "decompressed"
 UNZIPPED = "unzipped"
-
-
-def unwrapped(path: Path, workdir: Path) -> bool:
-    """Is ``path`` a file ``convert.unwrap`` made in ``workdir``, never the caller's input?"""
-    return path.parent == workdir and path.name.startswith((DECOMPRESSED, UNZIPPED))
 
 
 def extract_single_member(path: Path, dst_dir: Path, cap: int) -> tuple[Path, str]:
@@ -166,3 +289,16 @@ def ensure_size(path: Path, cap: int) -> int:
 
 def copy_file(src: Path, dst: Path) -> None:
     shutil.copyfile(src, dst)
+
+
+def link_or_copy(src: Path, dst: Path) -> None:
+    """Put ``src`` at ``dst``: a hard link, which takes no space, else (another filesystem) a copy.
+
+    Never over an existing ``dst``: that may be the caller's file.
+    """
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        raise
+    except OSError:
+        copy_file(src, dst)

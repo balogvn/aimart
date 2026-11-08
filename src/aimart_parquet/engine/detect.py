@@ -217,6 +217,9 @@ def format_from_start(
     named data.csv with encoding 'auto' (which agents send) and a JSON array named data.csv
     with delimiter '"' were refused before the quote, while 07fa450 converted and settled
     them: the bytes win over the name here, and the reader that runs never reads the option.
+    And for ``convert.keep_gzip``, over the first ``START_BYTES`` a gzip holds: a CSV or TSV
+    there is read from the gzip, never unpacked, so this must never name a format the
+    unpacked file would not be read as. None unpacks it, as before.
 
     None when the bytes say no more before the file is opened: gzip, bz2 and zip (``unwrap``
     inflates the first two and extracts a zip's member; only a zip's central directory, at its
