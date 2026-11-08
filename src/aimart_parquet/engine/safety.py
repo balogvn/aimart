@@ -141,22 +141,32 @@ class GzipMismatch(Exception):
 # the reserved bits, which Python's gzip module reads.
 _FEXTRA, _FNAME = 0x04, 0x08
 _MAX_GZIP_HEADER = _CHUNK
+# DuckDB parses the header of every member after the first from its 32 KiB input buffer, which
+# then starts at the previous member's 8-byte trailer, and refuses one that reaches the
+# buffer's end, 32,760 bytes or more (an FNAME of 32,749, an FEXTRA of 32,748), with an
+# InternalException ('Filename resulting in GZIP header larger than defined maximum (32768)').
+# 1886f60 let it read such a gzip, which Python reads whole: a 422 where d83c738 unpacked the
+# file and converted it. The first member's header it reads from the file, at any length.
+_MAX_LATER_HEADER = 32 * 1024 - 8 - 1
 
 
 def gzip_chunks(path: Path, cap: int) -> Generator[bytes]:
     """What a gzip file holds, in chunks, checked for DuckDB to read the file itself after.
 
     DuckDB reads gzip without checking a member's CRC or length (a corrupt or truncated file
-    reads as whatever inflates) and refuses some headers and the zero padding Python skips.
-    Wherever the two could differ this raises GzipMismatch, and decompress_stream unpacks the
-    file, or reports what is wrong with it, as before. Past ``cap`` it raises InputTooLarge.
+    reads as whatever inflates) and refuses some headers, a later member's header past its
+    32 KiB buffer, and the zero padding Python skips. Wherever the two could differ this raises
+    GzipMismatch, and decompress_stream unpacks the file, or reports what is wrong with it, as
+    before. Past ``cap`` it raises InputTooLarge.
     """
     total = 0
     with path.open("rb") as fh:
         buf = b""
+        most = _MAX_GZIP_HEADER
         try:
             while True:
-                buf = _past_header(fh, buf)
+                buf = _past_header(fh, buf, most)
+                most = _MAX_LATER_HEADER
                 inflate = zlib.decompressobj(-zlib.MAX_WBITS)
                 crc = size = 0
                 while not inflate.eof:
@@ -183,8 +193,9 @@ def gzip_chunks(path: Path, cap: int) -> Generator[bytes]:
             raise GzipMismatch(str(exc)) from exc
 
 
-def _past_header(fh: Readable, buf: bytes) -> bytes:
-    """What follows a member header that ``buf`` (and then ``fh``) begins with."""
+def _past_header(fh: Readable, buf: bytes, most: int) -> bytes:
+    """What follows a member header, of at most ``most`` bytes, that ``buf`` (and then ``fh``)
+    begins with."""
     buf = _fill(fh, buf, 10)
     flags = buf[3]
     if buf[:3] != b"\x1f\x8b\x08" or flags & ~(_FEXTRA | _FNAME):
@@ -196,10 +207,12 @@ def _past_header(fh: Readable, buf: bytes) -> bytes:
     buf = _fill(fh, buf, pos)
     if flags & _FNAME:
         while (end := buf.find(b"\0", pos)) < 0:
-            if len(buf) > _MAX_GZIP_HEADER:
+            if len(buf) > most:
                 raise GzipMismatch("header")
             buf = _fill(fh, buf, len(buf) + 1)
         pos = end + 1
+    if pos > most:
+        raise GzipMismatch("header")
     return buf[pos:]
 
 

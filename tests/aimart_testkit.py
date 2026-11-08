@@ -292,14 +292,16 @@ def zip_bytes(members: dict[str, bytes], *, compression: int = zipfile.ZIP_DEFLA
     return buf.getvalue()
 
 
-def gzip_member(data: bytes, flags: int = 0) -> bytes:
+def gzip_member(
+    data: bytes, flags: int = 0, *, extra: bytes = b"AB\x00\x00", name: bytes = b"data.csv"
+) -> bytes:
     """One gzip member with header ``flags`` (FTEXT 1, FHCRC 2, FEXTRA 4, FNAME 8, FCOMMENT 16)
-    and their fields: gzip.compress sets none of them."""
+    and their fields, ``extra`` and ``name`` for FEXTRA and FNAME: gzip.compress sets none."""
     header = bytearray(b"\x1f\x8b\x08" + bytes([flags]) + b"\0\0\0\0\0\xff")
     if flags & 4:
-        header += b"\x04\x00AB\x00\x00"
+        header += len(extra).to_bytes(2, "little") + extra
     if flags & 8:
-        header += b"data.csv\0"
+        header += name + b"\0"
     if flags & 16:
         header += b"a comment\0"
     if flags & 2:

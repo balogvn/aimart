@@ -11,6 +11,12 @@ path. The JSON reader fell back to its Python parser instead (other warnings; a 
 100 MB). Plain UTF-8 under such a name failed the same way at d83c738 already, and converts
 now too. The readers say what they read: compression 'uncompressed', or 'gzip' for a gzip the
 delimited reader checked.
+
+CF2, a regression. ``safety.gzip_chunks`` let DuckDB read a gzip whose second or later member
+has a header of 32,760 bytes or more (a long FNAME or FEXTRA). DuckDB 1.5.6 parses such a header
+from its 32 KiB input buffer, which starts at the previous member's 8-byte trailer, and refuses
+it with an InternalException: a 422 that blamed options.delimiter, where d83c738 unpacked the
+file with Python and converted it. Python unpacks it as before now.
 """
 
 from __future__ import annotations
@@ -18,11 +24,13 @@ from __future__ import annotations
 import gzip
 from typing import TYPE_CHECKING, Any
 
+import duckdb
 import pytest
 
 import aimart_testkit as kit
 from aimart_parquet.artifacts import build_store
 from aimart_parquet.engine import convert as convert_module
+from aimart_parquet.engine import safety
 from aimart_parquet.engine.limits import Limits
 from aimart_parquet.engine.models import ConvertOptions
 from aimart_parquet.errors import InvalidInput
@@ -123,3 +131,71 @@ def test_a_gzip_member_sent_as_utf8_is_refused_not_misread(tmp_path: Path) -> No
         _in_the_call_directory(tmp_path / "call", "data.zip", archive, encoding="utf-8")
     assert info.value.http_status == 422
     assert "options.encoding" in (info.value.hint or "")
+
+
+# ------------------------------------------------ CF2: a later member's header past 32 KiB
+_ROWS = "id,name,amount\n" + "".join(f"{i},n{i},{i * 1.5}\n" for i in range(20_000))
+_CUT = _ROWS.index("\n10000,") + 1
+_LIMIT = 32_768 - 8  # DuckDB's input buffer, less the trailer before a later member's header
+
+
+def _two_members(header: int, flags: int) -> bytes:
+    """A gzip of _ROWS in two members, the second with a header of ``header`` bytes."""
+    if flags == 8:
+        fields: dict[str, bytes] = {"name": b"n" * (header - 11)}
+    elif flags == 4:
+        fields = {"extra": b"e" * (header - 12)}
+    else:
+        fields = {"extra": b"e" * 20_000, "name": b"n" * (header - 12 - 20_000 - 1)}
+    first = gzip.compress(_ROWS[:_CUT].encode())
+    return first + kit.gzip_member(_ROWS[_CUT:].encode(), flags, **fields)
+
+
+def _unpacked(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    seen: list[Path] = []
+    real = safety.decompress_stream
+
+    def spy(src: Path, *args: Any) -> int:
+        seen.append(src)
+        return real(src, *args)
+
+    monkeypatch.setattr(safety, "decompress_stream", spy)
+    return seen
+
+
+@pytest.mark.parametrize("flags", [8, 4, 4 | 8], ids=["fname", "fextra", "both"])
+@pytest.mark.parametrize("header", [_LIMIT - 1, _LIMIT, _LIMIT + 1, 50_000])
+def test_a_later_member_header_duckdb_cannot_hold_is_unpacked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flags: int, header: int
+) -> None:
+    # 4510071: a 422, 'INTERNAL Error: Filename resulting in GZIP header larger than defined
+    # maximum (32768)' (or 'Extra field ...'), from a gzip that gunzip and d83c738 read whole.
+    # _LIMIT is an FNAME of 32,749 bytes, or an FEXTRA of 32,748.
+    data = _two_members(header, flags)
+    assert gzip.decompress(data) == _ROWS.encode()
+    unpacked = _unpacked(monkeypatch)
+    result = _in_the_call_directory(tmp_path / "call", "data.csv.gz", data)
+    assert result.report.rows == 20_000
+    assert result.rows["id"] == list(range(20_000))
+    assert result.rows["name"] == [f"n{i}" for i in range(20_000)]
+    assert result.rows["amount"] == [i * 1.5 for i in range(20_000)]
+    assert len(unpacked) == (header >= _LIMIT)  # else DuckDB read the gzip itself
+
+
+@pytest.mark.parametrize("header", [_LIMIT - 1, _LIMIT])
+def test_the_check_refuses_exactly_the_headers_duckdb_refuses(tmp_path: Path, header: int) -> None:
+    # What gzip_chunks relies on, on this DuckDB: an upgrade that moves the limit fails here.
+    path = kit.write(tmp_path / "t.gz", _two_members(header, 8))
+    con = duckdb.connect()
+    sql = (
+        f"SELECT count(*) FROM read_csv('{path}', header=true, auto_detect=false, "
+        "columns={'id': 'VARCHAR', 'name': 'VARCHAR', 'amount': 'VARCHAR'}, compression='gzip')"
+    )
+    if header < _LIMIT:
+        assert b"".join(safety.gzip_chunks(path, 10**9)) == _ROWS.encode()
+        assert con.execute(sql).fetchone() == (20_000,)
+    else:
+        with pytest.raises(safety.GzipMismatch):
+            b"".join(safety.gzip_chunks(path, 10**9))
+        with pytest.raises(duckdb.Error, match="GZIP header larger than defined maximum"):
+            con.execute(sql)

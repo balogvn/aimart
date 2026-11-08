@@ -96,8 +96,22 @@ class TestGzipChunks:
             gzip.compress(b"a,b\n") + gzip.compress(b"") + gzip.compress(b"1,2\n"),
             kit.gzip_member(b"a,b\n", 4) + kit.gzip_member(b"1,2\n", 8),
             gzip.compress(b""),
+            kit.gzip_member(b"a,b\n", 4 | 8, extra=b"e" * 65_535, name=b"n" * 500_000)
+            + gzip.compress(b"1,2\n"),
+            # A later member's header up to 32,759 bytes: DuckDB's 32 KiB buffer holds it and
+            # the 8-byte trailer before it (test_fix_csv_followup.py).
+            gzip.compress(b"a,b\n") + kit.gzip_member(b"1,2\n", 8, name=b"n" * 32_748),
+            gzip.compress(b"a,b\n") + kit.gzip_member(b"1,2\n", 4, extra=b"e" * 32_747),
         ],
-        ids=["one", "three-members", "fextra-fname", "empty"],
+        ids=[
+            "one",
+            "three-members",
+            "fextra-fname",
+            "empty",
+            "first-header-long",
+            "later-name-at-limit",
+            "later-extra-at-limit",
+        ],
     )
     def test_yields_what_python_reads(self, tmp_path, data) -> None:
         path = kit.write(tmp_path / "in.gz", data)
@@ -131,6 +145,11 @@ class TestGzipChunks:
             gzip.compress(b"a\n")[:12],
             b"\x1f\x8b\x08\x08" + b"\0" * 6 + b"no end to the name" * 70_000,
             b"\x1f\x8b\x08\x00" + b"\0" * 6 + b"not deflate",
+            gzip.compress(b"a\n") + kit.gzip_member(b"b\n", 8, name=b"n" * 32_749),
+            gzip.compress(b"a\n") + kit.gzip_member(b"b\n", 4, extra=b"e" * 32_748),
+            gzip.compress(b"a\n")
+            + kit.gzip_member(b"b\n", 4 | 8, extra=b"e" * 20_000, name=b"n" * 12_747),
+            gzip.compress(b"a\n") * 2 + kit.gzip_member(b"b\n", 8, name=b"n" * 40_000),
         ],
         ids=[
             "ftext",
@@ -147,11 +166,17 @@ class TestGzipChunks:
             "header-only",
             "endless-name",
             "not-deflate",
+            "later-name-past-limit",
+            "later-extra-past-limit",
+            "later-fields-past-limit",
+            "third-name-past-limit",
         ],
     )
     def test_anything_duckdb_might_read_otherwise_is_a_mismatch(self, tmp_path, data) -> None:
         # Python reads the first four and skips the padding, which DuckDB refuses; DuckDB reads
-        # the rest, which Python refuses, as whatever inflates.
+        # the next eight, which Python refuses, as whatever inflates. Python reads the last
+        # four, valid gzips whose later member has a header of 32,760 bytes or more, and DuckDB
+        # refuses them (InternalException; 1886f60 let it try, a 422 where d83c738 converted).
         path = kit.write(tmp_path / "in.gz", data)
         with pytest.raises(safety.GzipMismatch):
             b"".join(safety.gzip_chunks(path, MB))
