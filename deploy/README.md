@@ -74,18 +74,22 @@ holds at most the 1 GiB budget of outputs, each for an hour.
 2. In Modal's settings, under usage and billing, set the **workspace budget** so nothing is
    billed beyond the free credits. Check on that page that the budget is in place.
 3. Note your **workspace name** (in the dashboard's URLs). The service will be at
-   `https://<workspace>--aimart-parquet.modal.run`.
+   `https://<workspace>--aimart-parquet.modal.run`, or with a region in it, such as
+   `https://<workspace>--aimart-parquet.us-east.modal.run`: the first deploy prints the exact
+   address.
 
 ### 0.2 GitHub configuration
 
 1. **Settings → Environments → New environment** `production`: deployment branches **main only**.
-   In it, add two **environment secrets** from a Modal token (Modal's settings → API tokens →
-   new token): `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`.
+   In it, add two **environment secrets** from a Modal token (Modal's settings → API Tokens →
+   New Token). Modal may show the token inside a `modal token set ...` command; only two pieces
+   of it are wanted: `MODAL_TOKEN_ID` (it starts with `ak-`) and `MODAL_TOKEN_SECRET` (it starts
+   with `as-`). A Proxy Auth Token (`wk-`/`ws-`) is a different thing and does not work here.
 2. **Settings → Secrets and variables → Actions → Variables**:
 
 | Variable | Required | Value |
 |---|---|---|
-| `AIMART_PUBLIC_BASE_URL` | yes | `https://<workspace>--aimart-parquet.modal.run` |
+| `AIMART_PUBLIC_BASE_URL` | yes | the address Modal serves the app at, e.g. `https://<workspace>--aimart-parquet.us-east.modal.run`; start with `https://<workspace>--aimart-parquet.modal.run` and correct it from the first deploy's message |
 | `PRODUCTION_URL` | yes, for the synthetic check | the same URL |
 | `AIMART_PAY_TO_EVM` | one of the two | Base address that receives USDC (receive-only) |
 | `AIMART_PAY_TO_SVM` | one of the two | Solana address that receives USDC (receive-only) |
@@ -95,7 +99,9 @@ holds at most the 1 GiB budget of outputs, each for an hour.
 | `SMOKE_SIGNING_KEY_SHA256` | no, recommended | pins the public signing key (section 1.7) |
 
 Every deploy passes these whole: a setting changed by hand in Modal is replaced by the next
-deploy. `DEPLOY_HOST` stays unset (Modal).
+deploy. `DEPLOY_HOST` stays unset (Modal). Spaces and line breaks around a pasted value are
+ignored (the first deploy's wallet address ended with one), and the deploy checks every value's
+shape before it builds anything: `deploy/modal-deploy.sh --check` runs only those checks.
 
 3. The branch protection ruleset, PyPI Trusted Publishing and the GHCR visibility step are the
    same as for Cloud Run: sections 1.4 (last paragraph), 1.5 and 1.6 step 3.
@@ -105,12 +111,20 @@ deploy. `DEPLOY_HOST` stays unset (Modal).
 **Actions → Deploy to Modal → Run workflow** on `main`. After that, every release deploys by
 itself. The run builds the image from `uv.lock` and the commit's wheel, creates the signing keys
 secret `aimart-parquet-keys` the first time (never printed, never rotated by a re-run), deploys,
-checks that Modal serves the app at `AIMART_PUBLIC_BASE_URL` (if not, it prints the URL to set),
 runs the selftest (a real conversion through the isolated job child, and the memory watchdog
-stopping a job), then smoke tests the public URL as the Cloud Run deploy does.
+stopping a job), checks that Modal serves the app at `AIMART_PUBLIC_BASE_URL`, then smoke tests
+the public URL as the Cloud Run deploy does. The first run usually stops at the address check:
+it prints the address Modal serves the app at; set `AIMART_PUBLIC_BASE_URL` and `PRODUCTION_URL`
+to it and run the workflow again (the service names itself by that address in every price quote
+and download link). When a step fails, the run prints what the app logged, without its access
+log (`deploy/modal-deploy.sh --logs`).
 
 By hand: `modal token new` once, then
 `AIMART_PUBLIC_BASE_URL=https://<workspace>--aimart-parquet.modal.run AIMART_PAY_TO_EVM=0x... deploy/modal-deploy.sh`.
+
+If the deploy stops with "This version of the modal client supports the following image builder
+versions", the workspace builds images with a newer builder than the pinned client knows: raise
+`MODAL_VERSION` in `deploy/modal-deploy.sh` (and the same version in `modal_keys.py`'s usage line).
 
 Then pin the signing key as in section 1.7.
 

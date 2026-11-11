@@ -14,7 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Self
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _EVM_ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -230,13 +230,25 @@ class Settings(BaseSettings):
             return self.queue_wait_s
         return max(0.0, PAYMENT_WINDOW_S - SETTLE_MARGIN_S - self.fetch_timeout_s - work_s)
 
+    @field_validator("*", mode="before")
+    @classmethod
+    def _without_surrounding_whitespace(cls, value: object) -> object:
+        """A value pasted into a host's settings page often ends with a line break or a space.
+
+        The first Modal deploy's AIMART_PAY_TO_EVM ended with CR LF, pasted from a phone message.
+        Left in, a bare line feed passed the address check below (``$`` also matches before a
+        final newline) and the service would have named a payee nobody can pay; "true\n" is no
+        boolean and "mainnet\n" no network mode. No setting means anything by its outer spaces.
+        """
+        return value.strip() if isinstance(value, str) else value
+
     @model_validator(mode="after")
     def _validate(self) -> Self:
         self.public_base_url = self.public_base_url.rstrip("/")
-        if self.pay_to_evm and not _EVM_ADDRESS.match(self.pay_to_evm):
+        if self.pay_to_evm and not _EVM_ADDRESS.fullmatch(self.pay_to_evm):
             msg = "AIMART_PAY_TO_EVM must be a 0x-prefixed 40-hex-character address"
             raise ValueError(msg)
-        if self.pay_to_svm and not _SOLANA_ADDRESS.match(self.pay_to_svm):
+        if self.pay_to_svm and not _SOLANA_ADDRESS.fullmatch(self.pay_to_svm):
             msg = "AIMART_PAY_TO_SVM must be a base58 Solana address"
             raise ValueError(msg)
         for name in (
@@ -247,7 +259,7 @@ class Settings(BaseSettings):
             "price_quantum_compress",
             "price_quantum_portfolio",
         ):
-            if not _PRICE.match(getattr(self, name)):
+            if not _PRICE.fullmatch(getattr(self, name)):
                 msg = f"AIMART_{name.upper()} must look like '$0.01'"
                 raise ValueError(msg)
         # A missing payee is checked by the HTTP app factory, not here: the local stdio MCP mode

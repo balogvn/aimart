@@ -1,5 +1,6 @@
-"""Pure-ASGI middleware: request IDs and access logs, body-size caps, per-client rate limits,
-and a look at an upload form's small fields before the payment middleware quotes it.
+"""Pure-ASGI middleware: what a host may leave out of a request, request IDs and access logs,
+body-size caps, per-client rate limits, and a look at an upload form's small fields before the
+payment middleware quotes it.
 
 Pure ASGI (not BaseHTTPMiddleware) so request bodies stream through untouched — the multipart
 upload route must spool to disk, not buffer 50 MB in memory.
@@ -15,7 +16,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
-from urllib.parse import unquote_plus
+from urllib.parse import quote, unquote_plus
 
 from python_multipart.exceptions import FormParserError
 from python_multipart.multipart import MultipartParser, QuerystringParser, parse_options_header
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 log = logging.getLogger("aimart.access")
+host_log = logging.getLogger("aimart.host")
 
 
 async def _send_json(
@@ -68,6 +70,44 @@ def client_ip(scope: Scope, *, trust_forwarded_for: bool, trusted_hops: int = 1)
             return hops[-min(max(1, trusted_hops), len(hops))]
     client = scope.get("client")
     return str(client[0]) if client else "unknown"
+
+
+# RFC 3986 path characters that stand for themselves: sub-delims, ":" and "@", and the "/" between
+# segments (quote() already keeps letters, digits and "-._~").
+_PATH_SAFE = "/!$&'()*+,;=:@"
+
+
+class ScopeDefaultsMiddleware:
+    """Fill in what the ASGI spec lets a host leave out of a request's scope.
+
+    Modal's web endpoints pass no ``raw_path``, and x402's FastAPI middleware reads
+    ``request.scope["raw_path"]`` unguarded: on the first Modal deploy every request, /health
+    included, was a 500 (KeyError). uvicorn and httpx's test transport always send it, so no
+    test and no container smoke run had seen it. Outermost, so nothing reads the scope first.
+
+    A missing ``raw_path`` is rebuilt by escaping ``path``, the path Starlette routes on: for
+    the paid routes (plain ASCII) it is the same bytes, and the payment gate also matches the
+    decoded path, so a route that is dispatched is a route that was checked. A ``raw_path`` or
+    ``query_string`` the host did pass is never touched.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+        self._said: set[str] = set()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] in ("http", "websocket"):
+            filled = []
+            if scope.get("raw_path") is None:
+                scope["raw_path"] = quote(scope["path"], safe=_PATH_SAFE).encode("ascii")
+                filled.append("raw_path")
+            if scope.get("query_string") is None:
+                scope["query_string"] = b""
+                filled.append("query_string")
+            if filled and not self._said.issuperset(filled):
+                self._said.update(filled)  # once per process: a fact about the host, not a request
+                host_log.info("the host leaves request details out", extra={"filled": filled})
+        await self.app(scope, receive, send)
 
 
 class AccessLogMiddleware:

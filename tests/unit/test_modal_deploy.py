@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import yaml
 
+import aimart_testkit as kit
 from aimart_parquet.artifacts import build_store
 from aimart_parquet.config import PAYMENT_WINDOW_S, SETTLE_MARGIN_S, Settings
 from aimart_parquet.engine.models import ConvertOptions
@@ -112,6 +113,34 @@ def test_the_modal_version_is_pinned_once() -> None:
     assert "modal==" not in WORKFLOW.read_text(encoding="utf-8")  # the script installs it
 
 
+def test_the_deploy_runs_the_deployed_selftest() -> None:
+    """Not `modal run`, which would build a second, ephemeral app beside the deployed one."""
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert 'modal.Function.from_name("aimart-parquet", "selftest").remote()' in script
+    assert "modal run " not in "\n".join(
+        line for line in script.splitlines() if not line.lstrip().startswith("#")
+    )
+    app = APP.read_text(encoding="utf-8")
+    assert 'raise RuntimeError(f"selftest failed: {type(exc).__name__}: {exc}") from None' in app
+
+
+def test_the_selftest_runs_before_the_address_check() -> None:
+    """The first deploy cannot know its address: it must still prove the app works."""
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert script.index('"selftest").remote()') < script.index("get_web_url()")
+    assert "set AIMART_PUBLIC_BASE_URL (and PRODUCTION_URL) to" in script
+
+
+def test_a_failed_deploy_prints_the_apps_log_without_the_access_log() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    [logs] = [s for s in workflow["jobs"]["deploy"]["steps"] if "--logs" in s.get("run", "")]
+    assert logs["if"] == "failure()"
+    assert logs["run"] == "deploy/modal-deploy.sh --logs"
+    script = SCRIPT.read_text(encoding="utf-8")
+    # Other callers' request paths have no place in a public CI log.
+    assert """grep -v '"aimart.access"'""" in script
+
+
 def test_a_release_deploys_to_modal_unless_cloud_run_is_chosen() -> None:
     jobs = yaml.safe_load(RELEASE.read_text(encoding="utf-8"))["jobs"]
     assert jobs["deploy"]["uses"] == "./.github/workflows/deploy-modal.yml"
@@ -138,3 +167,25 @@ async def test_work_files_go_to_work_dir_and_outputs_to_the_store(
     assert list(work.iterdir()) == []  # each call's work directory is removed with the call
     inspected = await service.inspect(SourceRef(artifact_id=result.artifact.id))
     assert inspected.rows == 2
+
+
+async def test_the_app_starts_and_sells_a_conversion_with_modals_runtime_settings(
+    make_settings: Callable[..., Settings], tmp_path: Path
+) -> None:
+    """RUNTIME_ENV as the service reads it on Modal. The payment-window check at startup must
+    accept the tighter timeouts, and a paid conversion must be delivered and settled once."""
+    env = _constants()["RUNTIME_ENV"]
+    fields: dict[str, Any] = {k.removeprefix("AIMART_").lower(): v for k, v in env.items()}
+    fields.update(artifact_dir=tmp_path / "volume", work_dir=tmp_path / "local-disk")
+    settings = make_settings(**fields)
+    assert settings.convert_timeout_s == 60  # the strings of RUNTIME_ENV, as the env gives them
+    assert settings.trust_forwarded_for is False
+    facilitator = kit.FakeFacilitator()
+    body = {"content_base64": kit.b64(b"id,city\n1,Lagos\n2,Abuja\n"), "filename": "cities.csv"}
+    async with kit.running_app(settings, facilitator=facilitator) as app:
+        assert (await app.http.get("/health")).status_code == 200
+        assert (await app.http.post("/v1/convert", json=body)).status_code == 402
+        paid = await app.paying.post("/v1/convert", json=body)
+        assert paid.status_code == 200, paid.text
+        assert paid.json()["report"]["rows"] == 2
+        assert len(facilitator.settled) == 1
