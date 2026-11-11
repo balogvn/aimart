@@ -547,6 +547,13 @@ each test's docstring has the incident.
   finished afterwards; a caller that hung up was settled the same way. The timeout is the
   window (`deploy.yml`), and a paid REST response whose client is gone is a 499, unsettled.
   (`unit/test_final_verify_deploy_timeout.py`, `integration/test_final_verify_disconnect.py`)
+- **A host that passes no `raw_path`.** The ASGI spec makes it optional and Modal's web
+  endpoints leave it out; x402's FastAPI middleware reads `request.scope["raw_path"]`
+  unguarded, so on the first Modal deploy every request, /health included, was a 500
+  (KeyError). uvicorn and httpx's test transport always send it. `ScopeDefaultsMiddleware`
+  (outermost) rebuilds it from `path` and defaults a missing `query_string`
+  (`integration/test_host_scope_defaults.py`: the app behind a host that drops every optional
+  key, free and paid). Never read an optional scope key with `scope[...]`.
 - **A setting pasted with a line break.** The first Modal deploy's `AIMART_PAY_TO_EVM` ended
   with CR LF (pasted from a phone message). Python's `$` also matches before a final newline,
   so an address ending in a bare line feed passed `Settings` and would have been named as a

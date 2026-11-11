@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Deploy AImart Parquet to Modal from this checkout, then prove the deployment works.
 #
-#   AIMART_PUBLIC_BASE_URL=https://<workspace>--aimart-parquet.modal.run \
+#   AIMART_PUBLIC_BASE_URL=https://<workspace>--aimart-parquet.<region>.modal.run \
 #   AIMART_PAY_TO_EVM=0x... deploy/modal-deploy.sh
 #
 #   deploy/modal-deploy.sh --check    # check the inputs only: nothing is built, Modal is not called
+#   deploy/modal-deploy.sh --logs     # the deployed app's recent log lines, without the access log
+#
+# AIMART_PUBLIC_BASE_URL is the address Modal serves the app at. It is not known before the first
+# deploy (a workspace's addresses may carry a region, e.g. ...us-east.modal.run): that deploy
+# stops after the selftest and prints the address to set.
 #
 # Used by .github/workflows/deploy-modal.yml after every release, and by hand the same way. Needs
 # uv and a Modal token (MODAL_TOKEN_ID/MODAL_TOKEN_SECRET in the environment, or `modal token new`
@@ -12,9 +17,9 @@
 # deploy/modal_app.py CONFIG_KEYS, which are the GitHub variables deploy.yml uses.
 #
 # Steps: check the inputs, build dist/modal/ (the exact pins of uv.lock and this commit's wheel),
-# make the signing keys secret if it does not exist yet (deploy/modal_keys.py), deploy, check
-# Modal serves the app at AIMART_PUBLIC_BASE_URL, and run the selftest (a real conversion through
-# the isolated job child on Modal). The smoke test of the public URL is separate: scripts/smoke.py.
+# make the signing keys secret if it does not exist yet (deploy/modal_keys.py), deploy, run the
+# selftest (a real conversion through the isolated job child on Modal), and check Modal serves
+# the app at AIMART_PUBLIC_BASE_URL. The smoke test of the public URL is separate: scripts/smoke.py.
 set -euo pipefail
 
 # Pinned; tests/unit/test_modal_deploy.py keeps modal_keys.py in step. The client must know the
@@ -42,9 +47,9 @@ done
 
 url="${AIMART_PUBLIC_BASE_URL:-}"
 url_re='^https://[^[:space:]/]+/?$'
-[ -n "$url" ] || fail "set AIMART_PUBLIC_BASE_URL to https://<workspace>--aimart-parquet.modal.run"
+[ -n "$url" ] || fail "set AIMART_PUBLIC_BASE_URL to the address Modal serves the app at, like https://<workspace>--aimart-parquet.modal.run (the first deploy prints the exact one)"
 [[ "$url" =~ $url_re ]] \
-  || fail "AIMART_PUBLIC_BASE_URL must look like https://<workspace>--aimart-parquet.modal.run"
+  || fail "AIMART_PUBLIC_BASE_URL must be an https address with nothing after the host, like https://<workspace>--aimart-parquet.modal.run"
 
 evm="${AIMART_PAY_TO_EVM:-}"
 svm="${AIMART_PAY_TO_SVM:-}"
@@ -92,6 +97,16 @@ fi
 echo "modal-deploy: inputs look right: payee ${evm:-$svm}, URL ${url%/}, ${token_note}"
 if [ "${1:-}" = "--check" ]; then exit 0; fi
 
+with_modal=(uv run --no-project --python 3.13 --with "modal==${MODAL_VERSION}")
+
+if [ "${1:-}" = "--logs" ]; then
+  # What the app logged lately (an error's type and frames, a crash at start). Without the access
+  # log: other callers' request paths have no place in a public CI log.
+  "${with_modal[@]}" modal app logs aimart-parquet --since 20m --tail 500 \
+    | grep -v '"aimart.access"' | tail -n 150 || true
+  exit 0
+fi
+
 dist="dist/modal"
 rm -rf "$dist"
 mkdir -p "$dist"
@@ -102,9 +117,15 @@ uv export --frozen --no-dev --no-emit-project ${extras[@]+"${extras[@]}"} \
   --format requirements-txt --output-file "$dist/requirements.txt" > /dev/null
 uv build --wheel --out-dir "$dist" > /dev/null
 
-with_modal=(uv run --no-project --python 3.13 --with "modal==${MODAL_VERSION}")
 "${with_modal[@]}" python deploy/modal_keys.py
 "${with_modal[@]}" modal deploy deploy/modal_app.py
+
+# The deployed selftest, not `modal run`: it tests the app that was just deployed, and a failure
+# arrives here as one line ("selftest failed: ...").
+"${with_modal[@]}" python -c '
+import modal
+print("selftest ok:", modal.Function.from_name("aimart-parquet", "selftest").remote())
+'
 
 served="$("${with_modal[@]}" python -c '
 import modal
@@ -113,14 +134,8 @@ print(modal.Function.from_name("aimart-parquet", "web").get_web_url() or "")
 want="${url%/}"
 if [ "${served%/}" != "$want" ]; then
   echo "modal-deploy: Modal serves the app at '${served}', but AIMART_PUBLIC_BASE_URL is '${want}'." >&2
-  echo "modal-deploy: set AIMART_PUBLIC_BASE_URL to '${served}' and deploy again." >&2
+  echo "modal-deploy: set AIMART_PUBLIC_BASE_URL (and PRODUCTION_URL) to '${served}' and deploy again:" >&2
+  echo "modal-deploy: the service names itself by that address in every price quote and download link." >&2
   exit 1
 fi
 echo "serving at ${served}"
-
-# The deployed selftest, not `modal run`: it tests the app that was just deployed, and a failure
-# arrives here as one line ("selftest failed: ...").
-"${with_modal[@]}" python -c '
-import modal
-print("selftest ok:", modal.Function.from_name("aimart-parquet", "selftest").remote())
-'

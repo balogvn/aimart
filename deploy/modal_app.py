@@ -36,7 +36,7 @@ from typing import Any
 import modal
 
 APP_NAME = "aimart-parquet"
-LABEL = "aimart-parquet"  # the URL: https://<workspace>--aimart-parquet.modal.run
+LABEL = "aimart-parquet"  # the URL: https://<workspace>--aimart-parquet[.<region>].modal.run
 KEYS_SECRET = "aimart-parquet-keys"  # noqa: S105 - the secret's name, made by modal_keys.py
 VOLUME_NAME = "aimart-artifacts"
 ARTIFACT_DIR = "/artifacts"

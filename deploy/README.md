@@ -74,7 +74,9 @@ holds at most the 1 GiB budget of outputs, each for an hour.
 2. In Modal's settings, under usage and billing, set the **workspace budget** so nothing is
    billed beyond the free credits. Check on that page that the budget is in place.
 3. Note your **workspace name** (in the dashboard's URLs). The service will be at
-   `https://<workspace>--aimart-parquet.modal.run`.
+   `https://<workspace>--aimart-parquet.modal.run`, or with a region in it, such as
+   `https://<workspace>--aimart-parquet.us-east.modal.run`: the first deploy prints the exact
+   address.
 
 ### 0.2 GitHub configuration
 
@@ -87,7 +89,7 @@ holds at most the 1 GiB budget of outputs, each for an hour.
 
 | Variable | Required | Value |
 |---|---|---|
-| `AIMART_PUBLIC_BASE_URL` | yes | `https://<workspace>--aimart-parquet.modal.run` |
+| `AIMART_PUBLIC_BASE_URL` | yes | the address Modal serves the app at, e.g. `https://<workspace>--aimart-parquet.us-east.modal.run`; start with `https://<workspace>--aimart-parquet.modal.run` and correct it from the first deploy's message |
 | `PRODUCTION_URL` | yes, for the synthetic check | the same URL |
 | `AIMART_PAY_TO_EVM` | one of the two | Base address that receives USDC (receive-only) |
 | `AIMART_PAY_TO_SVM` | one of the two | Solana address that receives USDC (receive-only) |
@@ -109,9 +111,13 @@ shape before it builds anything: `deploy/modal-deploy.sh --check` runs only thos
 **Actions → Deploy to Modal → Run workflow** on `main`. After that, every release deploys by
 itself. The run builds the image from `uv.lock` and the commit's wheel, creates the signing keys
 secret `aimart-parquet-keys` the first time (never printed, never rotated by a re-run), deploys,
-checks that Modal serves the app at `AIMART_PUBLIC_BASE_URL` (if not, it prints the URL to set),
 runs the selftest (a real conversion through the isolated job child, and the memory watchdog
-stopping a job), then smoke tests the public URL as the Cloud Run deploy does.
+stopping a job), checks that Modal serves the app at `AIMART_PUBLIC_BASE_URL`, then smoke tests
+the public URL as the Cloud Run deploy does. The first run usually stops at the address check:
+it prints the address Modal serves the app at; set `AIMART_PUBLIC_BASE_URL` and `PRODUCTION_URL`
+to it and run the workflow again (the service names itself by that address in every price quote
+and download link). When a step fails, the run prints what the app logged, without its access
+log (`deploy/modal-deploy.sh --logs`).
 
 By hand: `modal token new` once, then
 `AIMART_PUBLIC_BASE_URL=https://<workspace>--aimart-parquet.modal.run AIMART_PAY_TO_EVM=0x... deploy/modal-deploy.sh`.

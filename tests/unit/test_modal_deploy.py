@@ -124,6 +124,23 @@ def test_the_deploy_runs_the_deployed_selftest() -> None:
     assert 'raise RuntimeError(f"selftest failed: {type(exc).__name__}: {exc}") from None' in app
 
 
+def test_the_selftest_runs_before_the_address_check() -> None:
+    """The first deploy cannot know its address: it must still prove the app works."""
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert script.index('"selftest").remote()') < script.index("get_web_url()")
+    assert "set AIMART_PUBLIC_BASE_URL (and PRODUCTION_URL) to" in script
+
+
+def test_a_failed_deploy_prints_the_apps_log_without_the_access_log() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    [logs] = [s for s in workflow["jobs"]["deploy"]["steps"] if "--logs" in s.get("run", "")]
+    assert logs["if"] == "failure()"
+    assert logs["run"] == "deploy/modal-deploy.sh --logs"
+    script = SCRIPT.read_text(encoding="utf-8")
+    # Other callers' request paths have no place in a public CI log.
+    assert """grep -v '"aimart.access"'""" in script
+
+
 def test_a_release_deploys_to_modal_unless_cloud_run_is_chosen() -> None:
     jobs = yaml.safe_load(RELEASE.read_text(encoding="utf-8"))["jobs"]
     assert jobs["deploy"]["uses"] == "./.github/workflows/deploy-modal.yml"
