@@ -21,6 +21,21 @@
 #   AIMART_ENABLE_QUANTUM    true: the two quantum operations must be served (default: false)
 set -euo pipefail
 
+# A value pasted into a settings page often ends with a line break or a space (the first Modal
+# deploy's wallet address ended with CR LF). Left in, it would be printed as a flag of its own.
+trim() {
+  local v="${1:-}"
+  v="${v#"${v%%[![:space:]]*}"}"
+  v="${v%"${v##*[![:space:]]}"}"
+  printf '%s' "$v"
+}
+AIMART_NETWORK_MODE="$(trim "${AIMART_NETWORK_MODE:-}")"
+AIMART_PAY_TO_EVM="$(trim "${AIMART_PAY_TO_EVM:-}")"
+AIMART_PAY_TO_SVM="$(trim "${AIMART_PAY_TO_SVM:-}")"
+AIMART_PUBLIC_BASE_URL="$(trim "${AIMART_PUBLIC_BASE_URL:-}")"
+SMOKE_SIGNING_KEY_SHA256="$(trim "${SMOKE_SIGNING_KEY_SHA256:-}")"
+AIMART_ENABLE_QUANTUM="$(trim "${AIMART_ENABLE_QUANTUM:-}")"
+
 mode="${AIMART_NETWORK_MODE:-testnet}"
 case "$mode" in
   testnet)
