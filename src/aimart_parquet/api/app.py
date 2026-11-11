@@ -53,6 +53,7 @@ from aimart_parquet.api.middleware import (
     FormPeek,
     FormPeekMiddleware,
     RateLimitMiddleware,
+    ScopeDefaultsMiddleware,
 )
 from aimart_parquet.api.schemas import (
     ConvertBody,
@@ -624,6 +625,7 @@ def create_app(
         trusted_hops=settings.trusted_proxy_hops,
     )
     app.add_middleware(AccessLogMiddleware)
+    app.add_middleware(ScopeDefaultsMiddleware)  # outermost: before anything reads the scope
     return app
 
 
