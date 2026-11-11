@@ -547,6 +547,15 @@ each test's docstring has the incident.
   finished afterwards; a caller that hung up was settled the same way. The timeout is the
   window (`deploy.yml`), and a paid REST response whose client is gone is a 499, unsettled.
   (`unit/test_final_verify_deploy_timeout.py`, `integration/test_final_verify_disconnect.py`)
+- **A setting pasted with a line break.** The first Modal deploy's `AIMART_PAY_TO_EVM` ended
+  with CR LF (pasted from a phone message). Python's `$` also matches before a final newline,
+  so an address ending in a bare line feed passed `Settings` and would have been named as a
+  payee nobody can pay; `smoke-flags.sh` printed the break as a flag of its own. `Settings`
+  now strips every value and matches addresses and prices with `fullmatch`; `smoke-flags.sh`
+  and `modal-deploy.sh` trim their inputs, and the deploy says what is wrong with a Modal
+  token pair (swapped, a whole command pasted, a proxy token) before it calls Modal, without
+  printing either value (`unit/test_deploy_input_whitespace.py`,
+  `unit/test_modal_deploy_inputs.py`). Use `fullmatch`, never `match` with `$`, for a validator.
 
 Known gaps: ISO date formats accept 1-digit years ('1/2/3' becomes 0001-02-03); JSON timestamps
 that all carry offsets become naive UTC with no note. A semicolon file whose only evidence of

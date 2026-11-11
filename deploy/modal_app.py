@@ -11,8 +11,9 @@ Shape, mirroring the Cloud Run service (deploy.yml):
 * 1 CPU core, 2 GiB, 4 concurrent requests, at most one container, scale to zero. Modal bills a
   container while it runs: about $0.06 an hour at this size, inside the Starter plan's $30 of
   monthly credits; the workspace budget (README) stops it instead of billing past them.
-* Stored outputs on the Volume ``aimart-artifacts`` (v2: hard links, background commits every few
-  seconds and a final one at shutdown), so a download link outlives the container's scale-down.
+* Stored outputs on the Volume ``aimart-artifacts`` (background commits every few seconds and a
+  final one at shutdown), so a download link outlives the container's scale-down. The Volume's
+  version is the workspace's default: nothing here needs hard links on it.
   Each call's temporary files stay on the container's local disk (``AIMART_WORK_DIR``): only the
   finished output is moved to the Volume.
 * Modal answers a web request still running after ``HTTP_LIMIT_S`` with a 303 redirect, which a
@@ -77,7 +78,9 @@ def _config() -> dict[str, str | None]:
     if not modal.is_local():
         return {}
     values: dict[str, str | None] = dict(RUNTIME_ENV)
-    values.update({k: os.environ[k] for k in CONFIG_KEYS if os.environ.get(k)})
+    # Stripped: a value pasted into a settings page often ends with a line break (the first
+    # deploy's wallet address did). modal-deploy.sh trims too; this also covers `modal deploy`.
+    values.update({k: v for k in CONFIG_KEYS if (v := os.environ.get(k, "").strip())})
     if not values.get("AIMART_PUBLIC_BASE_URL"):
         raise RuntimeError(
             "Set AIMART_PUBLIC_BASE_URL to https://<workspace>--aimart-parquet.modal.run"
@@ -105,7 +108,7 @@ image = (
     .uv_pip_install(f"/root/{WHEEL.name}", extra_options="--no-deps", uv_version=UV_VERSION)
 )
 app = modal.App(APP_NAME, image=image)
-volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True, version=2)
+volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 secrets = [modal.Secret.from_name(KEYS_SECRET), modal.Secret.from_dict(_config())]
 
 
@@ -142,26 +145,40 @@ async def selftest() -> dict[str, Any]:
     from aimart_parquet.errors import InputTooLarge  # noqa: PLC0415
     from aimart_parquet.service import Service, SourceRef  # noqa: PLC0415
 
-    csv = b"id,city,amount\n" + b"".join(b"%d,Lagos,%d.50\n" % (i, i) for i in range(1, 1001))
-    src = SourceRef(content_base64=base64.b64encode(csv).decode(), filename="selftest.csv")
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
+    def source(rows: int) -> SourceRef:
+        csv = b"id,city,amount\n" + b"".join(b"%d,Lagos,%d.50\n" % (i, i) for i in range(rows))
+        return SourceRef(content_base64=base64.b64encode(csv).decode(), filename="selftest.csv")
+
+    async def run() -> dict[str, Any]:
+        with tempfile.TemporaryDirectory() as tmp:
+            return await check(Path(tmp))
+
+    async def check(root: Path) -> dict[str, Any]:
         settings = Settings(artifact_dir=root / "artifacts", work_dir=root / "work")
         if not settings.isolate_jobs:
             raise RuntimeError("isolate_jobs is off: the selftest would not test isolation")
         service = Service(settings, build_store(settings), local_mode=False)
-        result = await service.convert(src, ConvertOptions())
+        result = await service.convert(source(1000), ConvertOptions())
         inspected = await service.inspect(SourceRef(artifact_id=result.artifact.id))
         if inspected.rows != 1000:
             raise RuntimeError(f"converted {inspected.rows} rows, expected 1000")
+        # The watchdog first looks 0.1 s into a job: 300,000 rows keep the job running past that.
         capped = settings.model_copy(update={"job_memory_limit_mb": 1})
         try:
             await Service(capped, build_store(capped), local_mode=False).convert(
-                src, ConvertOptions()
+                source(300_000), ConvertOptions()
             )
         except InputTooLarge as exc:
             watchdog = exc.message
+            if "memory budget" not in watchdog:  # refused, but by something else (DuckDB's limit)
+                raise RuntimeError(f"the watchdog did not stop the job: {watchdog}") from exc
         else:
             raise RuntimeError("a 1 MB job memory cap did not stop the job")
-    print(f"selftest ok: {inspected.rows} rows through the isolated child; watchdog: {watchdog}")
-    return {"rows": inspected.rows, "watchdog": watchdog}
+        return {"rows": inspected.rows, "watchdog": watchdog}
+
+    try:
+        return await run()
+    except Exception as exc:  # noqa: BLE001 - every failure must cross to the deployer
+        # Raised as a builtin: the deploying machine has no aimart_parquet to rebuild an
+        # AimartError from, and would report a deserialization error instead of this one.
+        raise RuntimeError(f"selftest failed: {type(exc).__name__}: {exc}") from None

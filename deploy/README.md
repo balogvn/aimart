@@ -79,8 +79,10 @@ holds at most the 1 GiB budget of outputs, each for an hour.
 ### 0.2 GitHub configuration
 
 1. **Settings → Environments → New environment** `production`: deployment branches **main only**.
-   In it, add two **environment secrets** from a Modal token (Modal's settings → API tokens →
-   new token): `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET`.
+   In it, add two **environment secrets** from a Modal token (Modal's settings → API Tokens →
+   New Token). Modal may show the token inside a `modal token set ...` command; only two pieces
+   of it are wanted: `MODAL_TOKEN_ID` (it starts with `ak-`) and `MODAL_TOKEN_SECRET` (it starts
+   with `as-`). A Proxy Auth Token (`wk-`/`ws-`) is a different thing and does not work here.
 2. **Settings → Secrets and variables → Actions → Variables**:
 
 | Variable | Required | Value |
@@ -95,7 +97,9 @@ holds at most the 1 GiB budget of outputs, each for an hour.
 | `SMOKE_SIGNING_KEY_SHA256` | no, recommended | pins the public signing key (section 1.7) |
 
 Every deploy passes these whole: a setting changed by hand in Modal is replaced by the next
-deploy. `DEPLOY_HOST` stays unset (Modal).
+deploy. `DEPLOY_HOST` stays unset (Modal). Spaces and line breaks around a pasted value are
+ignored (the first deploy's wallet address ended with one), and the deploy checks every value's
+shape before it builds anything: `deploy/modal-deploy.sh --check` runs only those checks.
 
 3. The branch protection ruleset, PyPI Trusted Publishing and the GHCR visibility step are the
    same as for Cloud Run: sections 1.4 (last paragraph), 1.5 and 1.6 step 3.
@@ -111,6 +115,10 @@ stopping a job), then smoke tests the public URL as the Cloud Run deploy does.
 
 By hand: `modal token new` once, then
 `AIMART_PUBLIC_BASE_URL=https://<workspace>--aimart-parquet.modal.run AIMART_PAY_TO_EVM=0x... deploy/modal-deploy.sh`.
+
+If the deploy stops with "This version of the modal client supports the following image builder
+versions", the workspace builds images with a newer builder than the pinned client knows: raise
+`MODAL_VERSION` in `deploy/modal-deploy.sh` (and the same version in `modal_keys.py`'s usage line).
 
 Then pin the signing key as in section 1.7.
 
