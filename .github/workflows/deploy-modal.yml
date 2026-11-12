@@ -25,6 +25,14 @@ on:
         type: string
         required: false
         default: ""
+    # The production environment's secrets. A called workflow sees them only when the caller
+    # passes them by name (release.yml does); the job's `environment` then supplies the values.
+    # The first release ran this job with neither and stopped at "no MODAL_TOKEN_ID".
+    secrets:
+      MODAL_TOKEN_ID:
+        required: false
+      MODAL_TOKEN_SECRET:
+        required: false
   workflow_dispatch:
     inputs:
       version:

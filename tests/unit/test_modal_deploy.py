@@ -141,6 +141,22 @@ def test_a_failed_deploy_prints_the_apps_log_without_the_access_log() -> None:
     assert """grep -v '"aimart.access"'""" in script
 
 
+def test_the_release_passes_the_modal_token_to_the_called_deploy() -> None:
+    """A called workflow sees an environment's secrets only if the caller names them: release
+    0.1.0 called the deploy with none, and it stopped at "no MODAL_TOKEN_ID" (checked on GitHub
+    with a throwaway caller: by name and `secrets: inherit` both reach the job, nothing does not).
+    """
+    names = {"MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"}
+    release = yaml.safe_load(RELEASE.read_text(encoding="utf-8"))["jobs"]["deploy"]
+    assert release["secrets"] == {name: "${{ secrets." + name + " }}" for name in names}
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    triggers = workflow[True] if True in workflow else workflow["on"]  # YAML reads `on` as True
+    assert set(triggers["workflow_call"]["secrets"]) == names
+    [deploy] = [s for s in workflow["jobs"]["deploy"]["steps"] if s.get("id") == "deploy"]
+    for name in names:
+        assert deploy["env"][name] == "${{ secrets." + name + " }}"
+
+
 def test_a_release_deploys_to_modal_unless_cloud_run_is_chosen() -> None:
     jobs = yaml.safe_load(RELEASE.read_text(encoding="utf-8"))["jobs"]
     assert jobs["deploy"]["uses"] == "./.github/workflows/deploy-modal.yml"

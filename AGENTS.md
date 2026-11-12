@@ -547,6 +547,11 @@ each test's docstring has the incident.
   finished afterwards; a caller that hung up was settled the same way. The timeout is the
   window (`deploy.yml`), and a paid REST response whose client is gone is a 499, unsettled.
   (`unit/test_final_verify_deploy_timeout.py`, `integration/test_final_verify_disconnect.py`)
+- **A called workflow without its environment's secrets.** `release.yml` calls
+  `deploy-modal.yml`, whose job runs in the `production` environment, but a called workflow
+  sees that environment's secrets only when the caller passes them (by name, or `inherit`):
+  release 0.1.0 deployed with an empty Modal token and stopped. Runs started by hand were
+  fine, which hid it (`unit/test_modal_deploy.py`).
 - **A host that passes no `raw_path`.** The ASGI spec makes it optional and Modal's web
   endpoints leave it out; x402's FastAPI middleware reads `request.scope["raw_path"]`
   unguarded, so on the first Modal deploy every request, /health included, was a 500

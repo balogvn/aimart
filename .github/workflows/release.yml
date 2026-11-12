@@ -324,6 +324,12 @@ jobs:
     uses: ./.github/workflows/deploy-modal.yml # zizmor: ignore[self-repository]
     with:
       version: ${{ needs.release-please.outputs.version }} # /health must then report it
+    # Named here so the called job, which runs in the production environment, receives that
+    # environment's values: without this the first release deployed with an empty token. A job
+    # that calls a workflow cannot itself name an environment.
+    secrets:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
 
   deploy-cloudrun:
     name: deploy (Cloud Run)
