@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/balogvn/aimart/compare/v0.1.0...v0.1.1) (2026-11-12)
+
+
+### Bug fixes
+
+* **release:** pass the Modal token to the called deploy workflow ([f91f35c](https://github.com/balogvn/aimart/commit/f91f35ccfc1c3fc37b053d8b7d2b1dcbf8726bd4))
+* **release:** pass the Modal token to the called deploy workflow ([c303037](https://github.com/balogvn/aimart/commit/c303037fe75b845da6c429788f0c7b28510e446e))
+
 ## 0.1.0 (2026-11-11)
 
 
