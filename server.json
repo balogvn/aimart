@@ -3,7 +3,7 @@
   "name": "io.github.balogvn/aimart-parquet",
   "title": "AImart Parquet",
   "description": "Messy CSV, JSON, Excel, SPSS/Stata/SAS and PDF tables to typed Parquet; inspect, query, join.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "websiteUrl": "https://github.com/balogvn/aimart",
   "repository": {
     "url": "https://github.com/balogvn/aimart",
@@ -14,7 +14,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "aimart-parquet",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
