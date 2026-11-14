@@ -79,6 +79,26 @@ def test_the_longest_paid_call_fits_modals_request_limit() -> None:
         assert call + SETTLE_MARGIN_S <= PAYMENT_WINDOW_S  # Payments._check_payment_window
 
 
+def test_an_idle_container_is_cheap_enough_to_be_awake_all_month() -> None:
+    """Modal bills the higher of a container's request and its use for every second it is up.
+
+    The first deploy reserved Cloud Run's shape, a whole core and 2 GiB: $0.063 an hour awake.
+    A public address is rarely idle, so the Starter plan's $1 of card-less credit lasted a day
+    and a half, and Modal disabled the workspace: every request answered 404.
+    """
+    core_second, gib_second = 0.0000131, 0.00000222  # modal.com/pricing, November 2026
+    constants = _constants()
+    cpu, reserved_mb = constants["CPU_REQUEST"], constants["MEMORY_REQUEST_MB"]
+    idle_hour = (cpu * core_second + reserved_mb / 1024 * gib_second) * 3600
+    assert idle_hour * 24 * 31 < 15  # a month awake: under half the plan's $30 of credits
+    assert (1.0 * core_second + 2 * gib_second) * 3600 * 24 * 31 > 30  # the first shape was not
+    assert constants["MEMORY_LIMIT_MB"] == 2048  # what the job caps are sized for
+    source = APP.read_text(encoding="utf-8")
+    assert source.count("cpu=CPU_REQUEST") == 2  # the web function and the selftest
+    assert source.count("memory=(MEMORY_REQUEST_MB, MEMORY_LIMIT_MB)") == 2
+    assert constants["SCALEDOWN_S"] <= 60
+
+
 def test_the_function_timeout_is_the_request_limit() -> None:
     source = APP.read_text(encoding="utf-8")
     assert "timeout=HTTP_LIMIT_S," in source

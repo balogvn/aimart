@@ -568,6 +568,13 @@ each test's docstring has the incident.
   token pair (swapped, a whole command pasted, a proxy token) before it calls Modal, without
   printing either value (`unit/test_deploy_input_whitespace.py`,
   `unit/test_modal_deploy_inputs.py`). Use `fullmatch`, never `match` with `$`, for a validator.
+- **A reservation billed around the clock.** On Modal a container is billed for every second
+  it is up at the higher of its request and its use. `deploy/modal_app.py` first reserved
+  Cloud Run's shape (`cpu=1.0`, `memory=2048`), $0.063 an hour awake; a public address is
+  rarely idle, the $1 of card-less credit lasted a day and a half, and Modal disabled the
+  workspace (every request: 404 "workspace is disabled"). It now requests a quarter core and
+  512 MiB with a 2 GiB limit (`unit/test_modal_deploy.py` prices a month awake). A host's
+  billing model is part of its shape: read it before copying another host's numbers.
 
 Known gaps: ISO date formats accept 1-digit years ('1/2/3' becomes 0001-02-03); JSON timestamps
 that all carry offsets become naive UTC with no note. A semicolon file whose only evidence of

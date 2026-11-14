@@ -8,9 +8,12 @@ Modal builds image definitions lazily, and inside a container the deployed defin
 
 Shape, mirroring the Cloud Run service (deploy.yml):
 
-* 1 CPU core, 2 GiB, 4 concurrent requests, at most one container, scale to zero. Modal bills a
-  container while it runs: about $0.06 an hour at this size, inside the Starter plan's $30 of
-  monthly credits; the workspace budget (README) stops it instead of billing past them.
+* A quarter of a CPU core and 512 MiB reserved, up to 2 GiB used, 4 concurrent requests, at
+  most one container, scale to zero. Modal bills the higher of what a container reserves and
+  what it uses for every second it is up, so the reservation is what an idle container costs:
+  about $0.016 an hour here. The first deploy reserved a whole core and 2 GiB (Cloud Run's
+  shape, where CPU is billed only during requests): $0.063 an hour awake, which spent the
+  Starter plan's card-less $1 of credit in a day and a half and got the workspace disabled.
 * Stored outputs on the Volume ``aimart-artifacts`` (background commits every few seconds and a
   final one at shutdown), so a download link outlives the container's scale-down. The Volume's
   version is the workspace's default: nothing here needs hard links on it.
@@ -42,7 +45,12 @@ VOLUME_NAME = "aimart-artifacts"
 ARTIFACT_DIR = "/artifacts"
 UV_VERSION = "0.13.0"  # as in ci.yml and the Dockerfile
 HTTP_LIMIT_S = 150  # Modal's limit for one web request before it redirects (303)
-SCALEDOWN_S = 120  # idle seconds before the container stops; each minute up costs ~$0.001
+SCALEDOWN_S = 60  # idle seconds before the container stops; an idle minute costs ~$0.0003
+# What the container reserves is billed whenever it is up; what it uses beyond that is billed
+# only while it is used (a job's seconds). The limit is the 2 GiB the job caps are sized for.
+CPU_REQUEST = 0.25
+MEMORY_REQUEST_MB = 512
+MEMORY_LIMIT_MB = 2048
 
 # Settings Modal needs on top of the application defaults; a deploy-time variable of the same
 # name wins. Timeouts: 15 s queue + 30 s fetch + 60 s job leaves 45 s of HTTP_LIMIT_S to verify,
@@ -113,8 +121,8 @@ secrets = [modal.Secret.from_name(KEYS_SECRET), modal.Secret.from_dict(_config()
 
 
 @app.function(
-    cpu=1.0,
-    memory=2048,  # MiB, as on Cloud Run
+    cpu=CPU_REQUEST,
+    memory=(MEMORY_REQUEST_MB, MEMORY_LIMIT_MB),
     timeout=HTTP_LIMIT_S,
     min_containers=0,  # scale to zero
     max_containers=1,  # the cost ceiling's first line, as on Cloud Run
@@ -130,7 +138,9 @@ def web() -> Any:
     return create_app()
 
 
-@app.function(cpu=1.0, memory=2048, timeout=300, secrets=secrets)
+@app.function(
+    cpu=CPU_REQUEST, memory=(MEMORY_REQUEST_MB, MEMORY_LIMIT_MB), timeout=300, secrets=secrets
+)
 async def selftest() -> dict[str, Any]:
     """Convert and read back a small CSV through the isolated job child, then check the memory
     watchdog stops a job, in this image on Modal's hardware. The deploy runs it before the smoke
