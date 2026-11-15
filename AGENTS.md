@@ -591,6 +591,14 @@ each test's docstring has the incident.
   own asset table (EIP-3009 for USDC), so prefer facilitators that list Base without
   `assetTransferMethod` (`integration/test_fix_facilitator_init.py`,
   `integration/test_fix_mainnet_defaults.py`; ADR 0003's amendment has the survey).
+- **A receipt without its amount.** The first paid calls on mainnet (2026-11-15) settled
+  through xpay, whose settle response has no `amount` (optional in x402 v2); the service
+  passed the receipt on as it came and `docs/examples/agent_pays.py` died on
+  `settlement['amount']` after the payer was charged. The fake facilitator had always stated
+  one. `_Answered.settle` now states the quoted amount on a successful 'exact' settlement
+  that names none, and the example reads receipts through `settled_amount`
+  (`integration/test_fix_receipt_amount.py`). A fake must be able to answer as tersely as the
+  real thing: every optional field of a facilitator's answer is one it may leave out.
 
 Known gaps: ISO date formats accept 1-digit years ('1/2/3' becomes 0001-02-03); JSON timestamps
 that all carry offsets become naive UTC with no note. A semicolon file whose only evidence of
@@ -623,8 +631,10 @@ be known before inflating. Before upgrading DuckDB past 1.5.6, run
 if it fails, the multi-member gzip data loss may be fixed, but re-check with many random member
 layouts before letting DuckDB read a gzip of more than one member again. Capacity numbers in
 `deploy/README.md` are macOS measurements; re-measure on Linux/Cloud Run before raising caps.
-No payment has been made on mainnet: that xpay and Primer verify and settle this service's
-EIP-3009 payloads without a key is their own statement until a first paid call. A facilitator
+xpay has verified and settled this service's EIP-3009 payloads on mainnet without a key
+(two paid conversions on 2026-11-15, each 0.02 USDC, transactions 0xf8415eae… and
+0xb0865212…); Primer, the fallback, and paid inspect, preview and query calls have not been
+exercised with real money yet. A facilitator
 that takes longer than `facilitator_timeout_s` (20 s) to answer `/settle` leaves the outcome
 unknown: the call is answered as failed and unsettled, yet the transfer may still complete
 (the bound keeps the call inside Modal's 150 s, where the alternative was a cut connection

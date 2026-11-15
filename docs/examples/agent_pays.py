@@ -62,6 +62,12 @@ def decode_header(value: str) -> dict[str, Any]:
     return decoded
 
 
+def settled_amount(settlement: dict[str, Any], quoted: str) -> str:
+    """What a receipt says was paid. x402 v2 lets a facilitator leave ``amount`` out of its
+    settlement, and a service may pass that on untouched; 'exact' settles the quoted amount."""
+    return str(settlement.get("amount") or quoted)
+
+
 def make_payer(private_key: str, *, network: str, max_usd: Decimal) -> x402Client:
     """An x402 client that can sign on exactly one network and never above ``max_usd``."""
     payer = x402Client()
@@ -106,7 +112,8 @@ async def rest_flow(
         report = result["report"]
         print(
             f"converted: {report['rows']} rows, {len(report['columns'])} columns;"
-            f" paid {settlement['amount']} in tx {settlement['transaction']}"
+            f" paid {settled_amount(settlement, quote['accepts'][0]['amount'])}"
+            f" in tx {settlement['transaction']}"
         )
         print(
             f"tokens to read: raw ~{report['estimated_tokens_raw']},"
@@ -174,7 +181,8 @@ async def mcp_flow(
         if paid.is_error:
             sys.exit(f"paid call failed (not settled): {paid.structured_content}")
         settlement = (paid.meta or {}).get("x402/payment-response", {})
-        print(f"mcp query: {paid.structured_content}; paid {settlement.get('amount')}")
+        quoted = required["accepts"][0]["amount"]
+        print(f"mcp query: {paid.structured_content}; paid {settled_amount(settlement, quoted)}")
         return paid.structured_content or {}
 
 
