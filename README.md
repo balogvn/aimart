@@ -219,7 +219,7 @@ charge up to about $0.002 per settlement. Below that floor a call is either unse
 loss-making. See [docs/economics.md](docs/economics.md).
 
 Networks: testnet by default (Base Sepolia `eip155:84532`, facilitator
-`https://x402.org/facilitator`). Mainnet (Base `eip155:8453` via Heurist, Solana via Dexter)
+`https://x402.org/facilitator`). Mainnet (Base `eip155:8453` via xpay, Solana via Dexter)
 must be switched on explicitly by the operator. See [docs/payments.md](docs/payments.md).
 
 ## Supported formats

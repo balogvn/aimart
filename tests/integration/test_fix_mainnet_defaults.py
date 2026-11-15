@@ -11,6 +11,8 @@ GET /supported listed on 2026-11-15.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
@@ -108,6 +110,27 @@ def test_mainnet_has_an_independent_fallback_and_no_dead_entry() -> None:
     # Two different operators before Dexter: by registrable domain, not by subdomain.
     domains = [".".join(urlsplit(url).hostname.split(".")[-2:]) for url in urls]  # type: ignore[union-attr]
     assert len(set(domains)) == len(domains)
+
+
+def test_the_docs_name_the_defaults_the_code_uses() -> None:
+    # "Text that promised more than the code did" (AGENTS.md): the pages an operator follows
+    # to switch to mainnet named Heurist while it was down.
+    root = Path(__file__).resolve().parents[2]
+    urls = DEFAULT_FACILITATORS[NetworkMode.MAINNET]
+    payments = (root / "docs" / "payments.md").read_text()
+    row = next(line for line in payments.splitlines() if line.startswith("| mainnet |"))
+    assert re.findall(r"`(https://[^`]+)`", row) == list(urls)
+    adr = (root / "docs" / "adr" / "0003-facilitators-and-price-floors.md").read_text()
+    decision = adr[adr.index("## Amendment, 2026-11-15") :]
+    decision = decision[decision.index("### Decision") :]
+    assert re.findall(r"`(https://[^`]+)`", decision.split("\n- **Testnet")[0]) == list(urls)
+    # The one-line probe an operator runs first asks exactly these, and only /supported.
+    deploy = (root / "deploy" / "README.md").read_text()
+    probe = next(line for line in deploy.splitlines() if line.strip().startswith("for u in "))
+    assert probe.split(" in ", 1)[1].split(";")[0].split() == list(urls)
+    assert '"$u/supported"' in probe
+    assert "/verify" not in probe
+    assert "/settle" not in probe
 
 
 # ------------------------------------------------------------------------------ DEF 3

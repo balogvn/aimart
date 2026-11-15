@@ -364,21 +364,90 @@ invalidates links already handed out, which expire within an hour anyway.
 
 ### Switching to mainnet
 
-Real money. Do it deliberately, and on a quiet day.
+Real money. Do it deliberately, and on a quiet day. These steps are for the Modal host; on
+Cloud Run the variables are the same and the workflow is `Deploy` instead of `Deploy to Modal`.
 
-1. Decide the payees: `AIMART_PAY_TO_EVM` (Base mainnet) and/or `AIMART_PAY_TO_SVM` (Solana
-   mainnet). These are **receive-only** addresses you control; the server never holds a key.
-   Send yourself a tiny amount on each chain first to prove you can see and move funds there.
-2. Set `AIMART_NETWORK_MODE=mainnet`. The default facilitators become Heurist (Base, EIP-3009)
-   then Dexter (Solana); override with `AIMART_FACILITATOR_URLS` only if you have a reason.
-3. Deploy. The smoke test expectations follow automatically (`smoke-flags.sh` maps mainnet to
-   `eip155:8453` and Solana mainnet), and canonical mainnet USDC is checked.
-4. Read the logs for price-floor warnings ("price below facilitator minimum"): a price under a
-   facilitator's minimum is unsettleable, and settlement fees of $0.001-0.002 can exceed the
-   margin on the cheapest operations (AGENTS.md, money invariant 4).
-5. Pay for one cheap call yourself (e.g. `inspect`) and confirm the USDC arrives at the payee.
+The payee, `AIMART_PAY_TO_EVM` (Base) and/or `AIMART_PAY_TO_SVM` (Solana), is a
+**receive-only** address you control; the server never holds a key. If it is new, send
+yourself a tiny amount on that chain first, to prove you can see and move funds there.
 
-Mainnet is reversible: set `AIMART_NETWORK_MODE=testnet` and deploy.
+1. **Probe the facilitators.** In mainnet mode the service uses xpay (Base), Primer (Base, if
+   xpay does not answer) and Dexter (Solana), unless `AIMART_FACILITATOR_URLS` names others.
+   This asks each only for its public list of what it supports, `GET /supported`:
+
+   ```bash
+   for u in https://facilitator.xpay.sh https://x402.primer.systems https://x402.dexter.cash; do curl -s -m 15 -o /dev/null -w "%{http_code} $u\n" "$u/supported"; done
+   ```
+
+   Each line should start with `200`. (Without a terminal: open
+   `https://facilitator.xpay.sh/supported` in a browser; it should show text that contains
+   `eip155:8453`.) One line that is not 200 does not block the switch: the service skips a
+   facilitator that does not answer and uses the next one. If xpay **and** Primer both fail,
+   wait: Base would be left to Dexter, which was not tested for it
+   ([ADR 0003](../docs/adr/0003-facilitators-and-price-floors.md), the amendment).
+2. **Set the variable.** GitHub → the repository → Settings → Secrets and variables → Actions
+   → Variables: set `AIMART_NETWORK_MODE` to `mainnet` (create it if it is not there). Leave
+   `AIMART_FACILITATOR_URLS` unset.
+3. **Deploy.** Actions → Deploy to Modal → Run workflow, on `main`.
+4. **Read the run's smoke test.** Open the run, then its smoke test step. The expectations
+   follow the variable by themselves (`smoke-flags.sh` maps mainnet to `eip155:8453` and
+   canonical mainnet USDC), and the last line must read `N passed, 0 failed`. A failure here
+   means the service is not quoting what you configured: go to "To undo" and look at the
+   run's log before trying again. In the app's log on modal.com, `facilitator skipped` names
+   a facilitator that did not answer (the next one is serving), and `price below facilitator
+   minimum` names a price that could not be settled.
+5. **Make one paid call** (below) and see the USDC arrive at the payee.
+
+**To undo:** set `AIMART_NETWORK_MODE` to `testnet` and run Deploy to Modal again. Nothing
+else needs changing.
+
+#### Make one paid test call
+
+The smoke test proves what the service *asks* for. Only a payment proves that the facilitator
+accepts it and that the money arrives. What a payer needs on Base: a wallet with a few cents
+of USDC on Base. No ETH, and no approval: the wallet signs one authorization for the exact
+price to your payee, and the facilitator submits it and pays the gas. Use a wallet made for
+this, holding only those few cents, never one that holds your savings.
+
+Checking the payment, either way: open `https://basescan.org/address/<your payee address>`,
+then "Token Transfers": a USDC transfer of the price (0.02 for a conversion) from the paying
+wallet appears within about a minute.
+
+**With this repository's example** (`docs/examples/agent_pays.py`). Verified: its code was
+read, and the test suite runs it against a fake facilitator on testnet. Not verified: a run
+against mainnet (nobody has paid yet). It needs [uv](https://docs.astral.sh/uv/), a small CSV
+file, and the paying wallet's private key in the terminal's environment (it never leaves
+that process, and the service never sees it):
+
+```bash
+export AIMART_URL=https://<workspace>--aimart-parquet.modal.run   # your service's address
+export PAYER_PRIVATE_KEY=...                                       # the test wallet's key; type it yourself
+export AIMART_MAINNET_CONFIRM=I_UNDERSTAND_THIS_SPENDS_REAL_USDC
+uv run docs/examples/agent_pays.py small.csv --network mainnet --max-usd 0.02
+```
+
+It makes three payments, $0.027 in all: a conversion ($0.02), an inspect ($0.002) and a query
+over MCP ($0.005), and prints each quote before paying it and each settlement's transaction.
+How it guards real money: it refuses to run on mainnet without that exact confirmation
+sentence; it can sign for Base only; and it refuses any single quote above `--max-usd` (a cap
+on each payment, not on their sum). A payment the facilitator rejects ends it with the
+reason, and a failed call is not charged.
+
+**Without handling a key** (not verified against this service; described from the tool's
+documentation). Coinbase's Agentic Wallet command line keeps the wallet behind an email
+sign-in. It needs [Node.js](https://nodejs.org/):
+
+```bash
+npx awal auth login you@example.com      # then: npx awal auth verify <the code from the email>
+npx awal show                            # fund it: a dollar of USDC on Base is plenty
+npx awal x402 details https://<workspace>--aimart-parquet.modal.run/v1/convert   # the price; nothing is paid
+npx awal x402 pay https://<workspace>--aimart-parquet.modal.run/v1/convert -X POST -d '{"content_base64": "YSxiCjEsMgo=", "filename": "t.csv"}' --max-amount 20000
+```
+
+`--max-amount` is in millionths of a USDC: 20000 is $0.02, the price of that one conversion
+(of a two-line CSV). If `details` does not show $0.02 of USDC on Base to your payee, do not
+pay: say what it showed. Whether this tool reads x402 version 2 quotes, which this service
+sends in the `PAYMENT-REQUIRED` header, was not checked.
 
 ### Logs
 
@@ -562,5 +631,5 @@ more memory, and set `AIMART_GCS_BUCKET` so stored artifacts leave the RAM disk.
 | Smoke fails on `payTo` / network | The service advertises a different payee or chain than the variables say. Treat as an incident: an unexpected `payTo` is revenue going elsewhere. |
 | Smoke fails on provenance / key fingerprint | `AIMART_SIGNING_KEY_MLDSA` is missing (ephemeral key) or was rotated without updating `SMOKE_SIGNING_KEY_SHA256`. |
 | MCP requests rejected with a host error | `AIMART_PUBLIC_BASE_URL` does not match the host being called; the MCP transport allows only that host (and localhost). |
-| Paid calls return 503 "facilitator is unreachable" | Facilitator outage; nothing is charged. Check its status, or override `AIMART_FACILITATOR_URLS`. |
+| Paid calls return 503 "facilitator is unreachable" | No configured facilitator answered `GET /supported` with x402 v2 'exact' on a network you accept; nothing is charged, and the next request asks again. The app's log names each one (`facilitator skipped`). Run the probe in "Switching to mainnet", or name others in `AIMART_FACILITATOR_URLS`. One facilitator down alone does not cause this. |
 | Service paused | The spend cap was reached (1.2 A). Raise it or wait for the next month. |

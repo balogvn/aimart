@@ -3,27 +3,31 @@
 A micro-payment business lives or dies by one comparison: **the settlement fee against the
 margin, not against the price**. A flat fee equal to the margin makes every call net zero.
 That bug shipped in the owner's previous x402 project. This page records the numbers behind
-the defaults. Fee schedules change, so they are given as last checked in October 2026.
+the defaults. Fee schedules change, so they are given as last checked on 2026-11-15, from
+each operator's own pages (sources and the probes behind them:
+[ADR 0003](adr/0003-facilitators-and-price-floors.md), the amendment).
 
 ## Facilitator fees and minimums
 
 | facilitator | networks | settlement fee to us | minimum payment | notes |
 |---|---|---|---|---|
 | x402.org | Base Sepolia (testnet) | free | n/a | the testnet default |
-| **Heurist** | Base | free | n/a | EIP-3009 `transferWithAuthorization`: the payer needs no approval step. **Mainnet default for Base.** |
-| Mogami | Base | free | n/a | EIP-3009, Base only. A drop-in alternative to Heurist. |
-| **Dexter** | Solana, Base | free | about **$0.00125** on Solana, about **$0.00145** on Base | Base settlement uses Permit2, so the payer must approve first. **Mainnet default for Solana.** |
-| PayAI | Base, Solana | 1,000 **lifetime** free credits, then gas × 1.3, about **$0.0015–0.0022** per settlement | | |
+| **xpay** | Base | free ("no fees for verify or settle"); it pays the gas | none published | EIP-3009 `transferWithAuthorization`: the payer needs no approval step and no ETH. 100 verify and 50 settle requests a minute. **Mainnet default for Base.** |
+| **Primer** | Base and other EVM chains | none stated (it publishes no fee, limit or terms) | none published | EIP-3009 for USDC. **Mainnet fallback for Base.** |
+| **Dexter** | Solana, Base | free ("no facilitator fee") | **$0.00078** on Solana (780 atomic); none published on Base | It lists Base as Permit2, which this service does not quote. **Mainnet default for Solana.** |
+| Heurist | Base | free | n/a | The Base default until 2026-11-15; its `/supported` answered 502 from 11-12 on. Dropped. |
+| Mogami | Base | free | n/a | Lists x402 v1 only; this service speaks v2. |
+| PayAI | Base, Solana | 1,000 free credits per `payTo` ($1), then **$0.00166** per Base settlement (1.66 credits), $0.00099 on Solana | | Out of credits, `/settle` answers 403: every paid call fails after its work until credits are bought. |
 | CDP (Coinbase) | Base, Solana | 1,000 free per **month**, then **$0.001** per transaction | | needs a CDP API key; the only route into the CDP Bazaar |
 
-The defaults (`payments/__init__.py`, `DEFAULT_FACILITATORS`) are therefore Heurist then
-Dexter on mainnet: both are free and keyless.
+The defaults (`payments/__init__.py`, `DEFAULT_FACILITATORS`) are therefore xpay, Primer,
+then Dexter on mainnet: none needs a key, and none takes a fee from a settlement.
 
 ## Why the floor is $0.002
 
-| price | fee (PayAI, after credits) | fee (CDP, after 1,000/month) | free facilitator | verdict |
+| price | fee (PayAI, after credits; at its October 2026 rate) | fee (CDP, after 1,000/month) | free facilitator | verdict |
 |---:|---:|---:|---:|---|
-| $0.001 | −$0.0005 to −$0.0012 net | $0.000 net | rejected (below Dexter's minimum) | unsettleable or loss-making |
+| $0.001 | −$0.0005 to −$0.0012 net | $0.000 net | +$0.001 net (Dexter's Solana minimum is $0.00078 since November 2026; at about $0.00125 it was rejected) | loss-making or net zero with a fee, and unsettleable again if a minimum rises |
 | **$0.002** | −$0.0002 to +$0.0005 net | +$0.001 net | +$0.002 net | **the floor**: clears every minimum, and is profitable on free and CDP routes |
 | $0.005 | +$0.0028 to +$0.0035 | +$0.004 | +$0.005 | comfortable |
 | $0.01 | +$0.0078 to +$0.0085 | +$0.009 | +$0.01 | comfortable |

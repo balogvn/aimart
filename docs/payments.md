@@ -113,26 +113,55 @@ The format follows the x402 v2 MCP transport spec. It is implemented in
 ## Facilitators
 
 `AIMART_FACILITATOR_URLS` is a comma-separated list in priority order. Each
-`(network, scheme)` is served by the first facilitator whose `/supported` lists it. The
-defaults (`payments/__init__.py`, `DEFAULT_FACILITATORS`):
+`(network, scheme)` is served by the first facilitator that answered `GET /supported` and
+lists it. The defaults (`payments/__init__.py`, `DEFAULT_FACILITATORS`):
 
 | mode | facilitators | networks |
 |---|---|---|
 | testnet (default) | `https://x402.org/facilitator` | Base Sepolia `eip155:84532` (and Solana devnet if `AIMART_PAY_TO_SVM` is set and supported) |
-| mainnet | `https://facilitator.heurist.xyz`, then `https://x402.dexter.cash` | Base `eip155:8453` (Heurist, EIP-3009) and Solana `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` (Dexter) |
+| mainnet | `https://facilitator.xpay.sh`, then `https://x402.primer.systems`, then `https://x402.dexter.cash` | Base `eip155:8453` (xpay, EIP-3009; Primer if xpay is skipped) and Solana `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` (Dexter) |
 
-Heurist comes first on mainnet because it settles Base with standard EIP-3009 transfers, so
-the payer needs no Permit2 approval. Dexter is free, but on Base it uses Permit2. The fees and
-minimums are in [economics.md](economics.md), and the choice is recorded in
+xpay comes first on mainnet because it settles Base with standard EIP-3009 transfers, charges
+no fee and needs no key; Primer settles Base the same way and is there for when xpay does not
+answer. Neither lists Solana, so Dexter, last, serves it. Dexter is free too, but it lists
+Base as Permit2, so it serves Base only when both others were skipped. Heurist was the first
+default until 2026-11-15: its `/supported` answered 502 for days. The fees and minimums are
+in [economics.md](economics.md), and the choice and the survey behind it are recorded in
 [ADR 0003](adr/0003-facilitators-and-price-floors.md).
+
+**What a payer on Base needs.** USDC on Base for the price, and nothing else: no ETH and no
+approval. The client signs one EIP-3009 `TransferWithAuthorization` (EIP-712, domain
+`USD Coin` version `2` on chain 8453, the USDC contract) for the quoted amount to the quoted
+`payTo`, valid 300 seconds, and sends it with the retry. The facilitator submits it and pays
+the gas. The 402 never names `assetTransferMethod`, so no client is sent down the Permit2
+path.
 
 **Lazy initialization.** Facilitator capabilities are fetched on the first paid request, not
 at boot. A scale-to-zero host cold-starts on that request, and a facilitator blip at that
-moment should cost one failed (unpaid) request, not a crash loop. If initialization fails, the
-server returns `503 payments_unavailable`. Watch out for the SDK middleware's
+moment should cost one failed (unpaid) request, not a crash loop. Watch out for the SDK middleware's
 `sync_facilitator_on_start=False`: with that flag the SDK **never** initializes the resource
 server on its own. `Payments.http_middleware()` therefore initializes it before handing paid
 requests to the SDK.
+
+**One dead facilitator does not stop the rest.** Every configured facilitator is asked for
+`/supported` at once and given 10 seconds. One that fails (an HTTP error, a timeout, a
+connection error, a body that is not the expected JSON) is skipped with one warning,
+`facilitator skipped: GET /supported failed`, that names its URL and the error's type, and the
+others serve in the configured order. What follows from that:
+
+| after asking | unpaid request | paid request |
+|---|---|---|
+| every accepted network has a facilitator | 402 quoting each | verified, run, settled |
+| some accepted network has none (x402 v2 'exact') | 402 quoting only the networks that have one | the same, on those networks |
+| no accepted network has one | `503 payments_unavailable` (REST), the same typed error as an MCP result; never a 402 | the same 503: nothing is verified, nothing is charged |
+
+A network is never quoted unless a facilitator can verify and settle it. After a 503 the next
+request asks again. While a facilitator is skipped or a network is left out, one request
+every 300 seconds asks them all again (never a request that carries a payment: its
+authorization is already running out), so a facilitator that comes back serves again without
+a restart, and a dead host is not called on every request. Verify and settle have no
+failover: once a payment is being verified, its facilitator's failure is that call's typed,
+unpaid failure, as in the tables above.
 
 ## Price floors
 
@@ -150,7 +179,7 @@ fee-versus-margin arithmetic in [economics.md](economics.md). Do not set
 | `AIMART_NETWORK_MODE` | `testnet` | `mainnet` |
 | Base | Sepolia `eip155:84532`, USDC `0x036CbD53842c5426634e7929541eC2318f3dCF7e` | `eip155:8453`, USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
 | Solana | devnet `solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1` | `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` |
-| facilitators | x402.org | Heurist, Dexter |
+| facilitators | x402.org | xpay, Primer, Dexter |
 | money | test USDC from a faucet | **real** |
 
 To switch, an operator sets `AIMART_NETWORK_MODE=mainnet` plus mainnet `AIMART_PAY_TO_EVM`
