@@ -63,12 +63,19 @@ NETWORKS: dict[NetworkMode, dict[str, str]] = {
     NetworkMode.MAINNET: {"evm": BASE_MAINNET, "svm": SOLANA_MAINNET_CAIP2},
 }
 
-# Free, keyless facilitators. Mainnet order matters: the first facilitator supporting a
-# (network, scheme) serves it. Heurist settles Base with standard EIP-3009 transfers (no
-# Permit2 approval needed by the payer); Dexter settles Solana. See docs/adr/0003.
+# Free, keyless facilitators. Mainnet order matters: the first facilitator that answered GET
+# /supported and lists a (network, scheme) serves it. xpay, then Primer, settle USDC on Base
+# with standard EIP-3009 transfers (the payer signs one authorization: no approval, no ETH);
+# neither lists Solana, so Dexter, last, settles it. Dexter also lists Base, as Permit2, and
+# would serve it only with both others down. Heurist (first until 2026-11-15) answered
+# /supported with a 502 at every probe from 11-12 to 11-15. See docs/adr/0003, the amendment.
 DEFAULT_FACILITATORS: dict[NetworkMode, tuple[str, ...]] = {
     NetworkMode.TESTNET: ("https://x402.org/facilitator",),
-    NetworkMode.MAINNET: ("https://facilitator.heurist.xyz", "https://x402.dexter.cash"),
+    NetworkMode.MAINNET: (
+        "https://facilitator.xpay.sh",
+        "https://x402.primer.systems",
+        "https://x402.dexter.cash",
+    ),
 }
 
 # One facilitator's GET /supported. The SDK's HTTP client waits 90 s (one timeout for
