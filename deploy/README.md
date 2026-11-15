@@ -53,9 +53,10 @@ in-flight call.
 
 ## 0. Deploy on Modal (the current host), step by step
 
-What runs: one container of 1 CPU core and 2 GiB (`deploy/modal_app.py`), up to 4 requests at
-once, at most one container, stopped 2 minutes after the last request and started again by the
-next one (a cold start of several seconds). Stored outputs live on the Modal Volume
+What runs: one container that reserves a quarter of a CPU core and 512 MiB and may use up to
+2 GiB (`deploy/modal_app.py`), up to 4 requests at once, at most one container, stopped one
+minute after the last request and started again by the next one (a cold start of several
+seconds). Stored outputs live on the Modal Volume
 `aimart-artifacts`, so download links last their full hour across restarts (1 GiB budget by
 default); each call's temporary files stay on the container's local disk. Modal gives a web
 request at most 150 s, then answers with a redirect a paying client must not see, so the paid
@@ -63,16 +64,26 @@ timeouts are tighter than on Cloud Run: 60 s per conversion, 30 s for all of a c
 downloads, 15 s waiting for a job slot (`RUNTIME_ENV` in `modal_app.py`;
 `tests/unit/test_modal_deploy.py` checks they fit).
 
-Cost: a running container uses about $0.06 an hour (1 core at $0.0000131/s, 2 GiB at
-$0.00000222/GiB-s), from the $30 of monthly credits, and nothing while stopped. The Volume
-holds at most the 1 GiB budget of outputs, each for an hour.
+Cost: Modal bills the higher of what a container reserves and what it uses, for every second
+it is up (a core at $0.0000131/s, memory at $0.00000222 per GiB-second), and nothing while it
+is stopped. Idle, this container costs about $0.016 an hour: about $11 if it never stopped for
+a month, inside the $30 of monthly credits; a job adds the core and memory it uses for its few
+seconds. The Volume holds at most the 1 GiB budget of outputs, each for an hour.
+
+**The $30 needs a payment method on file.** Without one a Starter workspace gets $1 a month,
+about 60 hours awake at this size, and once it is spent Modal disables the workspace: every
+request answers 404 `modal-http: workspace ... is disabled` until a payment method is added or
+the next month's credit arrives. A public address is rarely idle (registries and crawlers call
+it), so plan for the container being awake much of the time. The first deploy reserved a whole
+core and 2 GiB, $0.063 an hour awake, and spent the $1 in a day and a half.
 
 ### 0.1 Modal account and budget
 
 1. Sign up at modal.com (GitHub login works). The Starter plan is $0 a month plus usage, with
    $30 of compute credits each month.
-2. In Modal's settings, under usage and billing, set the **workspace budget** so nothing is
-   billed beyond the free credits. Check on that page that the budget is in place.
+2. In Modal's settings, under usage and billing, add a payment method (it unlocks the full
+   $30 of monthly credits; see "Cost" above) and set the **workspace budget** to $30 or less,
+   so nothing is billed beyond the free credits. Check on that page that the budget is in place.
 3. Note your **workspace name** (in the dashboard's URLs). The service will be at
    `https://<workspace>--aimart-parquet.modal.run`, or with a region in it, such as
    `https://<workspace>--aimart-parquet.us-east.modal.run`: the first deploy prints the exact
@@ -541,6 +552,7 @@ more memory, and set `AIMART_GCS_BUCKET` so stored artifacts leave the RAM disk.
 
 | Symptom | Cause and fix |
 |---|---|
+| Every request answers 404 `modal-http: workspace ... is disabled` (Modal) | The month's credit is spent: $1 without a payment method, $30 with one (section 0, "Cost"). Add a payment method and a workspace budget in Modal's settings, then run **Deploy to Modal** again; or wait for the next month's credit. |
 | Deploy fails at "Check inputs": *deploy is not configured* | A required variable is missing; the message lists which. |
 | `unauthorized_client ... rejected by the attribute condition` | The token's repository or owner id differs from `setup-gcp.sh`'s `GITHUB_REPO`/`GITHUB_OWNER_ID`; re-run the script with the right values. |
 | `Permission 'iam.serviceAccounts.getAccessToken' denied` | The `workloadIdentityUser` binding is missing or names another repository; re-run the script. |

@@ -55,8 +55,13 @@ goes there unless `DEPLOY_HOST=cloudrun`. Differences that matter:
   checked by `tests/unit/test_modal_deploy.py`. Cloud Run's 300 s window is unchanged.
 - Outputs live on a Modal Volume, so download links outlive a scale-down; each call's temporary
   files stay on local disk (`AIMART_WORK_DIR`). On Cloud Run without a bucket they lived in RAM.
-- Modal bills a container while it runs (about $0.06 an hour at 1 core and 2 GiB), not per
-  request: idle time after a call (2 minutes) costs credits too.
+- Modal bills a container for every second it is up, at the higher of what it reserves and
+  what it uses, not per request: idle time after a call costs credits too. The first deploy
+  reserved Cloud Run's shape (1 core, 2 GiB: $0.063 an hour awake) and spent the card-less $1
+  of credit in a day and a half; Modal then disabled the workspace (2026-11-13). The container
+  now reserves a quarter core and 512 MiB (about $0.016 an hour awake, $11 for a month without
+  a stop), may use up to 2 GiB, and stops after one idle minute. The $30 of monthly credits
+  need a payment method on file; "fits without a card" above holds for a day or two only.
 - The Starter plan has no rollbacks: a failed deploy is fixed forward or redeployed from the
   previous release's tag.
 
