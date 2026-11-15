@@ -167,7 +167,21 @@ class _Answered:
     async def settle(
         self, payload: PaymentPayload, requirements: PaymentRequirements
     ) -> SettleResponse:
-        return await self.client.settle(payload, requirements)
+        settled = await self.client.settle(payload, requirements)
+        # x402 v2 makes the amount optional and xpay leaves it out: the first receipts on
+        # mainnet named a transaction and no amount, and the example client crashed on them.
+        # 'exact' settles exactly the quoted amount, so the receipt (PAYMENT-RESPONSE on REST,
+        # _meta on MCP) says so. An amount the facilitator states is passed on. The money has
+        # moved by now: nothing here may raise (getattr: a v1 requirement has no ``amount``).
+        quoted = getattr(requirements, "amount", None)
+        if (
+            settled.success
+            and settled.amount is None
+            and quoted
+            and getattr(requirements, "scheme", None) == "exact"
+        ):
+            settled = settled.model_copy(update={"amount": str(quoted)})
+        return settled
 
     def offers(self, network: str) -> bool | None:
         """Whether it lists x402 v2 'exact' on ``network``; None when it lists no 'exact' there."""

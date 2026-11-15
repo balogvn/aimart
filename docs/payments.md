@@ -83,7 +83,9 @@ This order is what guarantees that no caller pays for an error and no work is gi
 3. **Success** → the normal response plus the header **`PAYMENT-RESPONSE`** (base64
    settlement):
    `{"success": true, "transaction": "0x…", "network": "eip155:84532", "payer": "0x…", "amount": "2000"}`
-   (it settles exactly the quoted `amount`).
+   (it settles exactly the quoted `amount`). `success`, `transaction`, `network` and `amount`
+   are always there: a facilitator may leave `amount` out of its settlement (xpay does), and
+   the service then states the quoted one. `payer` is there when the facilitator reports it.
 4. **Rejected payment** → `402` again with body `{}`. The reason is in the new
    `PAYMENT-REQUIRED` header's `error` field. Clients and logs must read the header, because
    the body says nothing.
