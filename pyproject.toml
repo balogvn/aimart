@@ -1,6 +1,6 @@
 [project]
 name = "aimart-parquet"
-version = "0.1.0"
+version = "0.1.1"
 description = "Pay-per-call MCP server and API that turns messy CSV, JSON, Excel, SPSS, Stata and SAS files into clean, schema-validated, token-efficient Parquet. AI agents pay in USDC via x402."
 readme = "README.md"
 license = "Apache-2.0"

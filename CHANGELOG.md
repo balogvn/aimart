@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.1.1](https://github.com/balogvn/aimart/compare/v0.1.0...v0.1.1) (2026-11-15)
+
+
+### Bug fixes
+
+* **deploy:** make the Modal service about four times cheaper to keep awake ([4019a49](https://github.com/balogvn/aimart/commit/4019a49916a613eef4f2ad68f16c84aaacc94ec8))
+* **deploy:** reserve a quarter core and 512 MiB on Modal, not Cloud Run's shape ([4310ba3](https://github.com/balogvn/aimart/commit/4310ba3a20f2631685614a2e7b32628bed8ce290))
+* **deps:** opentelemetry-api 1.45.2 for CVE-2026-126360 ([8557021](https://github.com/balogvn/aimart/commit/8557021d257c5be8a63a136a81c3a572ca87995b))
+* **payments:** a network moves only on an answer; Permit2 kinds are not given Base ([2bd211b](https://github.com/balogvn/aimart/commit/2bd211be24cd8612a7f11afe4a50729d770fe599))
+* **payments:** a receipt always states the amount that was settled ([db5c947](https://github.com/balogvn/aimart/commit/db5c947f49b5a605c1d0a1f2dd6e8a06bf6e1b3c))
+* **payments:** a receipt always states the amount that was settled ([b9f06aa](https://github.com/balogvn/aimart/commit/b9f06aa70a83ae26451bfb552747a802a786b542))
+* **payments:** mainnet defaults are xpay, Primer, then Dexter ([6c58573](https://github.com/balogvn/aimart/commit/6c58573c1b7cbeab0a3f46d219f2ea797836b7c5))
+* **payments:** mainnet readiness: working facilitators, and one dead facilitator no longer blocks payments ([7364b5f](https://github.com/balogvn/aimart/commit/7364b5f09fbb794beae8a21442c6c1b3e79978ba))
+* **payments:** one facilitator failing GET /supported no longer refuses every paid call ([d6ec20a](https://github.com/balogvn/aimart/commit/d6ec20af7f35e2b7fee8c3be3330eb5ad7b59d8d))
+* **release:** pass the Modal token to the called deploy workflow ([f91f35c](https://github.com/balogvn/aimart/commit/f91f35ccfc1c3fc37b053d8b7d2b1dcbf8726bd4))
+* **release:** pass the Modal token to the called deploy workflow ([c303037](https://github.com/balogvn/aimart/commit/c303037fe75b845da6c429788f0c7b28510e446e))
+
+
+### Documentation
+
+* **adr:** amend 0003 with the 2026-11 facilitator survey and the tolerant initialisation ([f4e3ea6](https://github.com/balogvn/aimart/commit/f4e3ea662742465044580aa57696f938b76d0c08))
+* mainnet facilitators, what a payer needs, and switching to mainnet on Modal ([2b55197](https://github.com/balogvn/aimart/commit/2b55197cbad35ca5225d46ff806f32774b3dd7f4))
+
 ## 0.1.0 (2026-11-11)
 
 
