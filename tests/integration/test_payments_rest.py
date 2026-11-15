@@ -496,8 +496,11 @@ def test_facilitator_urls_defaults_and_overrides(make_settings: Callable[..., Se
     assert facilitator_urls(make_settings(facilitator_urls=None)) == [
         "https://x402.org/facilitator"
     ]
+    # Until 2026-11-15 this asserted Heurist then Dexter: Heurist's /supported answered 502 at
+    # every probe from 11-12, and Dexter lists Base as Permit2 (integration/test_fix_mainnet_defaults.py).
     assert facilitator_urls(make_settings(facilitator_urls=None, network_mode="mainnet")) == [
-        "https://facilitator.heurist.xyz",
+        "https://facilitator.xpay.sh",
+        "https://x402.primer.systems",
         "https://x402.dexter.cash",
     ]
     assert facilitator_urls(make_settings(facilitator_urls=" https://a.example , ,https://b ")) == [

@@ -106,6 +106,16 @@ class Settings(BaseSettings):
     convert_timeout_s: float = 120.0
     query_timeout_s: float = 15.0
     fetch_timeout_s: float = 60.0
+    facilitator_timeout_s: float = Field(
+        default=20.0,
+        description=(
+            "How long one call to a facilitator (verify, settle) may take. The SDK's default is "
+            "90 s each: on a host that cuts a request at 150 s (Modal) a slow verify, the job "
+            "and a slow settle could outlast the request while the transfer still went through, "
+            "a caller charged for an answer it never received. Verify and settle on Base "
+            "normally take a few seconds."
+        ),
+    )
     max_concurrent_jobs: int = 2
     isolate_jobs: bool = Field(
         default=True,

@@ -575,6 +575,22 @@ each test's docstring has the incident.
   workspace (every request: 404 "workspace is disabled"). It now requests a quarter core and
   512 MiB with a 2 GiB limit (`unit/test_modal_deploy.py` prices a month awake). A host's
   billing model is part of its shape: read it before copying another host's numbers.
+- **One dead facilitator refused every paid call.** On 2026-11-12 the first mainnet default
+  answered `GET /supported` with a 502 (a Cloudflare page); the SDK's `initialize()` stops at
+  the first facilitator that raises, so `Payments.ensure_initialized()` failed as a whole
+  though the second answered: every paid call a 503, the deploy's smoke test red. And a
+  network no facilitator offered was a bare 500 on every paid route. `Payments._initialize`
+  now asks each facilitator itself (10 s each, at once), skips one that fails with a warning
+  naming its URL and the error's type (never the message: the SDK puts the response body in
+  it), and hands the SDK only those that answered (`_Answered`). A 402 quotes only networks
+  some facilitator lists as x402 v2 'exact' (`Payments.served`, not `accepted`); none at all
+  is the typed 503, asked again on the next request; a skipped one is asked again every
+  `RETRY_SKIPPED_S`, never by a request that carries a payment. Never call the SDK's
+  `initialize()` on the real clients, and never build a quote from `accepted` once
+  initialized. A facilitator's kind does not shape the Base quote: the SDK builds it from its
+  own asset table (EIP-3009 for USDC), so prefer facilitators that list Base without
+  `assetTransferMethod` (`integration/test_fix_facilitator_init.py`,
+  `integration/test_fix_mainnet_defaults.py`; ADR 0003's amendment has the survey).
 
 Known gaps: ISO date formats accept 1-digit years ('1/2/3' becomes 0001-02-03); JSON timestamps
 that all carry offsets become naive UTC with no note. A semicolon file whose only evidence of
@@ -607,6 +623,12 @@ be known before inflating. Before upgrading DuckDB past 1.5.6, run
 if it fails, the multi-member gzip data loss may be fixed, but re-check with many random member
 layouts before letting DuckDB read a gzip of more than one member again. Capacity numbers in
 `deploy/README.md` are macOS measurements; re-measure on Linux/Cloud Run before raising caps.
+No payment has been made on mainnet: that xpay and Primer verify and settle this service's
+EIP-3009 payloads without a key is their own statement until a first paid call. A facilitator
+that takes longer than `facilitator_timeout_s` (20 s) to answer `/settle` leaves the outcome
+unknown: the call is answered as failed and unsettled, yet the transfer may still complete
+(the bound keeps the call inside Modal's 150 s, where the alternative was a cut connection
+with the same doubt); read `duration_ms` in the access log at the first paid calls.
 (The 422 for a time past 9999 in preview and query and the 413 for
 `read_csv` running out of memory are tested in `integration/test_final_isolate_gaps.py`;
 DuckDB's `memory_limit` no longer sits above the job cap, `unit/test_fix_csv_memory.py`.)
