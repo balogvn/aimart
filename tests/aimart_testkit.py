@@ -21,7 +21,7 @@ import httpx
 from x402 import SettleResponse, SupportedKind, SupportedResponse, VerifyResponse
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterable
+    from collections.abc import AsyncIterator, Iterable, Sequence
     from pathlib import Path
 
     import mcp
@@ -60,7 +60,11 @@ class FakeFacilitator:
     """
 
     networks: tuple[str, ...] = (BASE_SEPOLIA,)
+    url: str = (
+        "https://facilitator.test"  # what the service's logs call it, as the HTTP client does
+    )
     kind_extra: dict[str, dict[str, Any]] = field(default_factory=dict)
+    x402_version: int = 2  # of every kind it lists; 1 is a facilitator the service cannot use
     valid: bool = True
     settle_ok: bool = True
     verify_error: Exception | None = None
@@ -80,7 +84,9 @@ class FakeFacilitator:
                 extra.setdefault(network, {"feePayer": FEE_PAYER})
         return SupportedResponse(
             kinds=[
-                SupportedKind(x402_version=2, scheme="exact", network=n, extra=extra.get(n))
+                SupportedKind(
+                    x402_version=self.x402_version, scheme="exact", network=n, extra=extra.get(n)
+                )
                 for n in self.networks
             ]
         )
@@ -167,8 +173,12 @@ async def running_app(
     facilitator: FakeFacilitator | None = None,
     paid: bool = True,
     client: x402Client | None = None,
+    facilitators: Sequence[Any] | None = None,
 ) -> AsyncIterator[AppHarness]:
-    """Build the real ASGI app, run its lifespan, and hand back unpaid + paying clients."""
+    """Build the real ASGI app, run its lifespan, and hand back unpaid + paying clients.
+
+    ``facilitators`` is the whole configured list, in order, when a test needs more than one.
+    """
     from x402.http.clients.httpx import x402AsyncTransport
 
     from aimart_parquet.api.app import create_app
@@ -176,8 +186,10 @@ async def running_app(
 
     payments: Payments | None = None
     if paid:
-        facilitator = facilitator or FakeFacilitator()
-        payments = Payments(settings, [facilitator])
+        if facilitators is None:
+            facilitator = facilitator or FakeFacilitator()
+            facilitators = [facilitator]
+        payments = Payments(settings, list(facilitators))
         app = create_app(settings, payments=payments)
     else:
         app = create_app(settings, payments=False)

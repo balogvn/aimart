@@ -116,11 +116,12 @@ class X402McpGate(Extension):
             if refused is not None:
                 return refused
         try:
-            reqs, resource = await self.payments.mcp_requirements(op)
-        except Exception:  # any facilitator failure: nothing can be quoted
+            reqs, resource = await self.payments.mcp_requirements(op, paying=raw is not None)
+        except Exception as exc:  # any facilitator failure: nothing can be quoted
             # It escaped the SDK's tool handling as a JSON-RPC -32603, with no code or hint,
             # where REST answers the same outage with a typed 503 that says "not charged".
-            log.exception("facilitator initialization failed", extra={"tool": params.name})
+            if not isinstance(exc, PaymentsUnavailable):  # that one is already logged
+                log.exception("facilitator initialization failed", extra={"tool": params.name})
             return _result(payments_unavailable().to_dict())
         if raw is None:
             return await self._payment_required(reqs, resource, "Payment required")
