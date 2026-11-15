@@ -124,7 +124,9 @@ lists it. The defaults (`payments/__init__.py`, `DEFAULT_FACILITATORS`):
 xpay comes first on mainnet because it settles Base with standard EIP-3009 transfers, charges
 no fee and needs no key; Primer settles Base the same way and is there for when xpay does not
 answer. Neither lists Solana, so Dexter, last, serves it. Dexter is free too, but it lists
-Base as Permit2, so it serves Base only when both others were skipped. Heurist was the first
+Base as Permit2, which is not what a 402 from this service asks a payer to sign, so it is
+never given Base: with xpay and Primer both unavailable, Base is refused (the unpaid 503
+below), not quoted. Heurist was the first
 default until 2026-11-15: its `/supported` answered 502 for days. The fees and minimums are
 in [economics.md](economics.md), and the choice and the survey behind it are recorded in
 [ADR 0003](adr/0003-facilitators-and-price-floors.md).
@@ -134,7 +136,9 @@ approval. The client signs one EIP-3009 `TransferWithAuthorization` (EIP-712, do
 `USD Coin` version `2` on chain 8453, the USDC contract) for the quoted amount to the quoted
 `payTo`, valid 300 seconds, and sends it with the retry. The facilitator submits it and pays
 the gas. The 402 never names `assetTransferMethod`, so no client is sent down the Permit2
-path.
+path, and a facilitator whose 'exact' kind on a network names another method than the quote
+does (Dexter on Base: `permit2`) counts as not offering that network
+(`facilitator's kind ignored` in the log, at INFO).
 
 **Lazy initialization.** Facilitator capabilities are fetched on the first paid request, not
 at boot. A scale-to-zero host cold-starts on that request, and a facilitator blip at that
@@ -155,20 +159,32 @@ others serve in the configured order. What follows from that:
 | some accepted network has none (x402 v2 'exact') | 402 quoting only the networks that have one | the same, on those networks |
 | no accepted network has one | `503 payments_unavailable` (REST), the same typed error as an MCP result; never a 402 | the same 503: nothing is verified, nothing is charged |
 
-A network is never quoted unless a facilitator can verify and settle it. After a 503 the next
-request asks again. While a facilitator is skipped or a network is left out, one request
-every 300 seconds asks them all again (never a request that carries a payment: its
+A network is never quoted unless a facilitator lists it the way it is quoted. After a 503
+the next request asks again. While a facilitator is skipped or a network is left out, one
+request every 300 seconds asks them all again (never a request that carries a payment: its
 authorization is already running out), so a facilitator that comes back serves again without
-a restart, and a dead host is not called on every request. Verify and settle have no
-failover: once a payment is being verified, its facilitator's failure is that call's typed,
-unpaid failure, as in the tables above.
+a restart, and a dead host is not called on every request.
+
+In those rounds a network moves only on an answer. A facilitator that answered before and
+fails `/supported` now keeps its place with its last answer (its verify and settle can work
+while `/supported` does not), so one 502 does not hand its network to the next in the list.
+After three failed rounds in a row (`KEPT_ROUNDS`, 15 minutes) it is dropped, with the
+warning `facilitator dropped`, until it answers again: its networks go to the next
+facilitator that lists them, or out of the quote, or, with nothing left, to the 503. A
+facilitator that answers and no longer lists a network loses it at once.
+
+Verify and settle have no failover: once a payment is being verified, its facilitator's
+failure is that call's typed, unpaid failure, as in the tables above. When every facilitator
+answered at the start nobody is asked again, so one that dies afterwards is quoted until the
+process restarts (on Modal, after 60 idle seconds) and its paid calls fail unpaid.
 
 ## Price floors
 
 Facilitators publish minimums (`minPaymentAmountAtomic` in their `/supported` kinds). At
 initialization, `Payments._check_price_floors` compares every active operation's price with
 the minimum and **logs an error** for any price below it, because such payments will be
-rejected. Our own floor is **$0.002**, set by `config.py` defaults and the
+rejected. A minimum that is not a whole number of atomic units is ignored with the warning
+`facilitator's price floor ignored`. Our own floor is **$0.002**, set by `config.py` defaults and the
 fee-versus-margin arithmetic in [economics.md](economics.md). Do not set
 `AIMART_PRICE_*` below it.
 

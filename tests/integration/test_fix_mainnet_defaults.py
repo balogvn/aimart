@@ -19,8 +19,9 @@ from urllib.parse import urlsplit
 import pytest
 
 import aimart_testkit as kit
+from aimart_parquet import payments as payments_module
 from aimart_parquet.config import NetworkMode
-from aimart_parquet.payments import DEFAULT_FACILITATORS, facilitator_urls
+from aimart_parquet.payments import DEFAULT_FACILITATORS, Payments, facilitator_urls
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -216,18 +217,40 @@ async def test_with_xpay_down_primer_serves_base_with_the_same_quote(mainnet: Se
     assert dexter.verified == []
 
 
-async def test_dexter_alone_on_base_is_still_quoted_as_eip3009(mainnet: Settings) -> None:
-    """A fact to know, not a behaviour to keep: the SDK builds a Base quote from its own table
-    of assets, never from the facilitator's kind. With both EIP-3009 facilitators down at
-    initialization Dexter serves Base, whose kind says Permit2, and the 402 still asks for an
-    EIP-3009 authorization. Whether Dexter verifies one was not tested (that needs /verify
-    with a signed payment); if it does not, the paid retry is a 402, unpaid.
+async def test_dexter_alone_does_not_serve_base(mainnet: Settings) -> None:
+    """The SDK builds a Base quote from its own table of assets, never from the facilitator's
+    kind: with both EIP-3009 facilitators down at initialization Dexter used to be handed
+    Base, whose kind there says Permit2, under a 402 that asks for an EIP-3009 authorization.
+    Whether Dexter verifies and settles one was never tested (that needs /verify with a
+    signed payment), so it is not asked to: the answer is the typed, unpaid 503.
     """
     xpay, primer, dexter = fakes = chosen()
     xpay.supported_error = primer.supported_error = RuntimeError("down")
     async with kit.running_app(mainnet, facilitators=fakes) as h:
         rest = await h.http.post("/v1/convert", json={})
-    requirement = base_requirement(kit.payment_required(rest)["accepts"])
-    assert {k: requirement["extra"][k] for k in EIP3009_DOMAIN} == EIP3009_DOMAIN
-    assert "assetTransferMethod" not in requirement["extra"]
+    assert rest.status_code == 503
+    assert rest.json()["error"]["code"] == "payments_unavailable"
+    assert "payment-required" not in rest.headers
     assert dexter.supported_calls == 1
+    assert dexter.verified == []
+
+
+def test_facilitator_calls_are_bounded_by_the_setting(
+    make_settings: Callable[..., Settings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify and settle each get facilitator_timeout_s, not the SDK's 90 s: on Modal a request
+    is cut at 150 s, and a settle that outlasts it can still move the payer's money."""
+    seen: list[Any] = []
+
+    class Recorder:
+        def __init__(self, config: Any) -> None:
+            seen.append(config)
+
+    monkeypatch.setattr(payments_module, "HTTPFacilitatorClient", Recorder)
+    settings = make_settings(
+        network_mode="mainnet", facilitator_urls=None, facilitator_timeout_s=7.5
+    )
+    Payments.from_settings(settings)
+    assert [config.url for config in seen] == list(DEFAULT_FACILITATORS[NetworkMode.MAINNET])
+    assert {config.timeout for config in seen} == {7.5}
+    assert make_settings().facilitator_timeout_s == 20.0

@@ -14,7 +14,7 @@ each operator's own pages (sources and the probes behind them:
 | x402.org | Base Sepolia (testnet) | free | n/a | the testnet default |
 | **xpay** | Base | free ("no fees for verify or settle"); it pays the gas | none published | EIP-3009 `transferWithAuthorization`: the payer needs no approval step and no ETH. 100 verify and 50 settle requests a minute. **Mainnet default for Base.** |
 | **Primer** | Base and other EVM chains | none stated (it publishes no fee, limit or terms) | none published | EIP-3009 for USDC. **Mainnet fallback for Base.** |
-| **Dexter** | Solana, Base | free ("no facilitator fee") | **$0.00078** on Solana (780 atomic); none published on Base | It lists Base as Permit2, which this service does not quote. **Mainnet default for Solana.** |
+| **Dexter** | Solana, Base | free ("no facilitator fee") | **$0.00078** on Solana (780 atomic); none published on Base | It lists Base as Permit2, which this service does not quote, so it is never given Base. **Mainnet default for Solana.** |
 | Heurist | Base | free | n/a | The Base default until 2026-11-15; its `/supported` answered 502 from 11-12 on. Dropped. |
 | Mogami | Base | free | n/a | Lists x402 v1 only; this service speaks v2. |
 | PayAI | Base, Solana | 1,000 free credits per `payTo` ($1), then **$0.00166** per Base settlement (1.66 credits), $0.00099 on Solana | | Out of credits, `/settle` answers 403: every paid call fails after its work until credits are bought. |

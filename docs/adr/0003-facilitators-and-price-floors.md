@@ -72,7 +72,7 @@ followed from that one response:
 - While a facilitator is skipped or a network is left out, one request every 300 s asks every
   facilitator again, so a preferred one that comes back serves again without a restart and a
   dead host is not called on every request. A request that carries a payment never starts
-  that round, and a round that finds less than is being served changes nothing.
+  that round. (What such a round may change was corrected the same day: see "After review".)
 - Verify and settle are unchanged: there is no failover once a payment is being verified.
 
 ### The survey
@@ -130,7 +130,36 @@ client takes the EIP-3009 path.
   dishonest facilitator only claimed.
 - Not verified: that xpay's and Primer's `/verify` and `/settle` accept this service's
   payloads without a key (no payment was made), and whether Dexter verifies an EIP-3009
-  payload on Base. If Dexter does not, a start with both others down quotes Base and then
-  refuses each paid retry with a 402, unpaid. Make one paid call after switching
+  payload on Base. Because of the second, Dexter is never given Base (see "After review").
+  Make one paid call after switching
   ([deploy/README.md](../../deploy/README.md), "Switching to mainnet").
 - Re-run the probe in that section before each mainnet release, as before.
+
+### After review (2026-11-15)
+
+A review of the above reproduced three faults, fixed the same day
+(`tests/integration/test_fix_facilitator_routing.py`):
+
+- **A retry round could move a network off the facilitator serving it.** The round compared
+  only which networks were served, not by whom: one failed `GET /supported` from xpay in a
+  round where Dexter answered handed Base to Dexter for the next 300 s or more. Now a
+  facilitator that answered before and fails now keeps its place with its last answer, so a
+  network moves only on an answer. After three failed rounds in a row (`KEPT_ROUNDS`, 15
+  minutes) it is dropped until it answers again; it used to be quoted until a restart. With
+  nobody left the service goes back to the typed, unpaid 503.
+- **Base could be quoted with only Dexter behind it.** The 402 asks for an EIP-3009
+  authorization and Dexter's only v2 'exact' kind on Base says `assetTransferMethod:
+  permit2`: a quote nobody was shown to settle, which could be refused (unpaid) or verified
+  and then not settled after the work ran. A facilitator's 'exact' kind that names another
+  transfer method than the quote on that network is now ignored, so Dexter serves Solana
+  only, and Base with xpay and Primer both unavailable is the unpaid 503. This costs
+  availability on purpose: if someone shows that Dexter settles EIP-3009 payloads on Base,
+  the rule can be relaxed for it.
+- **A price floor that is not a whole number stopped every paid call.** `int("0.78")` raised
+  after the new SDK server was in place and before it counted as initialized. Such a floor
+  is now ignored with a warning naming the facilitator, and floors are checked before
+  anything is swapped.
+
+Still true, and accepted: when every facilitator answered at the start nobody is asked
+again, so one that dies afterwards is quoted until the process restarts; its paid calls
+fail unpaid. On Modal a container lives 60 idle seconds, so this is short there.

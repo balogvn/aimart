@@ -292,12 +292,13 @@ async def test_a_retry_that_finds_less_keeps_what_was_working(settings: Settings
     payments = Payments(settings, [preferred, fallback])
     clock = payments._clock = Clock()
     await payments.ensure_initialized()
-    server = payments.server
     fallback.supported_error = RuntimeError("blip")  # its /supported fails; verify may not
     clock.now += payments_module.RETRY_SKIPPED_S + 1
     await payments.ensure_initialized()  # before the fix this path did not exist
     assert payments.is_initialized()
-    assert payments.server is server
+    # Rebuilt from the answer it gave before (test_fix_facilitator_routing has the rest).
+    serving = payments.server._facilitator_clients_map[kit.BASE_SEPOLIA]["exact"]
+    assert serving.client is fallback
     assert payments.served == [(kit.BASE_SEPOLIA, kit.PAY_TO_EVM)]
     assert fallback.supported_calls == 2
     await payments.ensure_initialized()  # and the failed retry starts a new cool-down

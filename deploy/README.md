@@ -383,8 +383,10 @@ yourself a tiny amount on that chain first, to prove you can see and move funds 
    `https://facilitator.xpay.sh/supported` in a browser; it should show text that contains
    `eip155:8453`.) One line that is not 200 does not block the switch: the service skips a
    facilitator that does not answer and uses the next one. If xpay **and** Primer both fail,
-   wait: Base would be left to Dexter, which was not tested for it
-   ([ADR 0003](../docs/adr/0003-facilitators-and-price-floors.md), the amendment).
+   wait: nobody would settle Base (Dexter lists it as Permit2, which this service does not
+   quote, so it is never given Base), every paid call would answer 503 (nobody is charged)
+   and the smoke test would fail
+   ([ADR 0003](../docs/adr/0003-facilitators-and-price-floors.md), the amendments).
 2. **Set the variable.** GitHub → the repository → Settings → Secrets and variables → Actions
    → Variables: set `AIMART_NETWORK_MODE` to `mainnet` (create it if it is not there). Leave
    `AIMART_FACILITATOR_URLS` unset.
@@ -394,8 +396,9 @@ yourself a tiny amount on that chain first, to prove you can see and move funds 
    canonical mainnet USDC), and the last line must read `N passed, 0 failed`. A failure here
    means the service is not quoting what you configured: go to "To undo" and look at the
    run's log before trying again. In the app's log on modal.com, `facilitator skipped` names
-   a facilitator that did not answer (the next one is serving), and `price below facilitator
-   minimum` names a price that could not be settled.
+   a facilitator that did not answer (the next one is serving), `facilitator dropped` one
+   that has not answered for 15 minutes, and `price below facilitator minimum` a price that
+   could not be settled.
 5. **Make one paid call** (below) and see the USDC arrive at the payee.
 
 **To undo:** set `AIMART_NETWORK_MODE` to `testnet` and run Deploy to Modal again. Nothing

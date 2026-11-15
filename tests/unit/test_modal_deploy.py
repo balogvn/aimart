@@ -36,8 +36,8 @@ APP = ROOT / "deploy" / "modal_app.py"
 SCRIPT = ROOT / "deploy" / "modal-deploy.sh"
 WORKFLOW = ROOT / ".github" / "workflows" / "deploy-modal.yml"
 RELEASE = ROOT / ".github" / "workflows" / "release.yml"
-# Verify before the job and settle after it are two facilitator round trips, plus the response.
-VERIFY_SETTLE_S = 30
+# Sending the response once verify, the job and settle are done.
+RESPONSE_S = 5
 
 pytestmark = pytest.mark.anyio
 
@@ -75,7 +75,10 @@ def test_the_longest_paid_call_fits_modals_request_limit() -> None:
     )
     for job in jobs:
         call = settings.queue_wait_for(job) + settings.fetch_timeout_s + job
-        assert call + VERIFY_SETTLE_S <= limit, (job, call)
+        # Verify before the job and settle after it: each bounded by facilitator_timeout_s
+        # (the SDK's default, 90 s each, did not fit, and a settle that outlasts the request
+        # can still move the money).
+        assert call + 2 * settings.facilitator_timeout_s + RESPONSE_S <= limit, (job, call)
         assert call + SETTLE_MARGIN_S <= PAYMENT_WINDOW_S  # Payments._check_payment_window
 
 

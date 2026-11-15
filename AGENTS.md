@@ -623,6 +623,12 @@ be known before inflating. Before upgrading DuckDB past 1.5.6, run
 if it fails, the multi-member gzip data loss may be fixed, but re-check with many random member
 layouts before letting DuckDB read a gzip of more than one member again. Capacity numbers in
 `deploy/README.md` are macOS measurements; re-measure on Linux/Cloud Run before raising caps.
+No payment has been made on mainnet: that xpay and Primer verify and settle this service's
+EIP-3009 payloads without a key is their own statement until a first paid call. A facilitator
+that takes longer than `facilitator_timeout_s` (20 s) to answer `/settle` leaves the outcome
+unknown: the call is answered as failed and unsettled, yet the transfer may still complete
+(the bound keeps the call inside Modal's 150 s, where the alternative was a cut connection
+with the same doubt); read `duration_ms` in the access log at the first paid calls.
 (The 422 for a time past 9999 in preview and query and the 413 for
 `read_csv` running out of memory are tested in `integration/test_final_isolate_gaps.py`;
 DuckDB's `memory_limit` no longer sits above the job cap, `unit/test_fix_csv_memory.py`.)

@@ -66,9 +66,11 @@ NETWORKS: dict[NetworkMode, dict[str, str]] = {
 # Free, keyless facilitators. Mainnet order matters: the first facilitator that answered GET
 # /supported and lists a (network, scheme) serves it. xpay, then Primer, settle USDC on Base
 # with standard EIP-3009 transfers (the payer signs one authorization: no approval, no ETH);
-# neither lists Solana, so Dexter, last, settles it. Dexter also lists Base, as Permit2, and
-# would serve it only with both others down. Heurist (first until 2026-11-15) answered
-# /supported with a 502 at every probe from 11-12 to 11-15. See docs/adr/0003, the amendment.
+# neither lists Solana, so Dexter, last, settles it. Dexter also lists Base, but as Permit2,
+# which is not what a 402 here asks a payer to sign: that kind is ignored (``_Answered``), so
+# with both others down Base is refused (503, unpaid), not handed to Dexter. Heurist (first
+# until 2026-11-15) answered /supported with a 502 at every probe from 11-12 to 11-15. See
+# docs/adr/0003, the amendments.
 DEFAULT_FACILITATORS: dict[NetworkMode, tuple[str, ...]] = {
     NetworkMode.TESTNET: ("https://x402.org/facilitator",),
     NetworkMode.MAINNET: (
@@ -86,6 +88,11 @@ SUPPORTED_TIMEOUT_S = 10.0
 # How long a facilitator that failed /supported, or an accepted network nobody offered, is
 # left alone before one request asks every facilitator again (see ``ensure_initialized``).
 RETRY_SKIPPED_S = 300.0
+# How many of those rounds in a row a facilitator that answered before may fail /supported and
+# keep its place, with its last answer: its verify and settle can work while /supported does
+# not, and one 502 must not move a network to the next in the list. After them (15 minutes)
+# it is dropped until it answers again, so a host that died is not quoted until a restart.
+KEPT_ROUNDS = 3
 
 # Where a paying client puts its signed payload (v2, then v1): what the SDK middleware reads.
 PAYMENT_HEADERS = ("payment-signature", "x-payment")
@@ -124,9 +131,30 @@ class _Answered:
     answered, each repeating its answer. Verify and settle go to the client untouched.
     """
 
-    def __init__(self, client: FacilitatorClient, supported: SupportedResponse) -> None:
+    def __init__(
+        self, client: FacilitatorClient, supported: SupportedResponse, methods: dict[str, str]
+    ) -> None:
+        """``methods``: per accepted network, the assetTransferMethod a 402 on it names.
+
+        An 'exact' kind that names another one is left out, so this facilitator counts as not
+        offering that network: Dexter lists Base as Permit2 while the SDK quotes USDC on Base
+        as EIP-3009, and it was never shown to verify or settle what such a quote makes a
+        payer sign. A kind that names no method means the scheme's default, as in a quote.
+        """
         self.client = client
-        self.supported = supported
+        self.url = str(getattr(client, "url", type(client).__name__))
+        kinds = []
+        for kind in supported.kinds:
+            stated = (kind.extra or {}).get("assetTransferMethod")
+            quoted = methods.get(kind.network)
+            if kind.scheme == "exact" and quoted and stated and stated != quoted:
+                log.info(
+                    "facilitator's kind ignored: it settles with another transfer method",
+                    extra={"facilitator": self.url, "network": kind.network, "method": stated},
+                )
+                continue
+            kinds.append(kind)
+        self.supported = supported.model_copy(update={"kinds": kinds})
 
     def get_supported(self) -> SupportedResponse:
         return self.supported
@@ -150,6 +178,33 @@ class _Answered:
         }
         return (2 in versions) if versions else None
 
+    def price_floor(self, network: str) -> int | None:
+        """The least it settles on ``network``, in atomic units; None when it names none."""
+        for kind in self.supported.kinds:
+            if (kind.x402_version, kind.network, kind.scheme) != (2, network, "exact"):
+                continue
+            floor = (kind.extra or {}).get("minPaymentAmountAtomic")
+            if floor is None or floor == "":
+                return None
+            try:
+                return int(str(floor))
+            except ValueError:
+                # "0.78", 1e3, true: int() raised here, after the new SDK server was swapped
+                # in and before it counted as initialized, so every paid call was a 503.
+                # Not the value: logs hold no third party's content.
+                log.warning(
+                    "facilitator's price floor ignored: not a whole number of atomic units",
+                    extra={"facilitator": self.url, "network": network},
+                )
+                return None
+        return None
+
+
+def _quoted_method(scheme: Any, network: str) -> str:
+    """The assetTransferMethod a quote on ``network`` names: the SDK's asset table decides."""
+    extra = scheme.parse_price("$1", network).extra or {}
+    return str(extra.get("assetTransferMethod") or scheme.default_asset_transfer_method)
+
 
 class Payments:
     def __init__(self, settings: Settings, facilitators: list[FacilitatorClient]) -> None:
@@ -157,10 +212,19 @@ class Payments:
         self._facilitators = facilitators
         nets = NETWORKS[settings.network_mode]
         self.accepted: list[tuple[str, str]] = []
+        self._schemes: dict[str, Any] = {}  # per accepted network, what builds its quotes
         if settings.pay_to_evm:
             self.accepted.append((nets["evm"], settings.pay_to_evm))
+            # The SDK's own Protocol annotations disagree with its scheme classes (payment_flows).
+            self._schemes[nets["evm"]] = ExactEvmServerScheme()  # type: ignore[no-untyped-call]
         if settings.pay_to_svm:
             self.accepted.append((nets["svm"], settings.pay_to_svm))
+            self._schemes[nets["svm"]] = ExactSvmServerScheme()
+        self._methods = {n: _quoted_method(scheme, n) for n, scheme in self._schemes.items()}
+        # Each facilitator's last answer to GET /supported, by its place in the list, and how
+        # many rounds in a row it has failed since.
+        self._answers: dict[int, SupportedResponse] = {}
+        self._misses: dict[int, int] = {}
         # Replaced by each initialization that serves something: until the first, it exists
         # so the routes can be checked when the app is built.
         self.server = self._new_server(facilitators)
@@ -216,18 +280,17 @@ class Payments:
     @classmethod
     def from_settings(cls, settings: Settings) -> Payments:
         clients: list[FacilitatorClient] = [
-            HTTPFacilitatorClient(FacilitatorConfig(url=url)) for url in facilitator_urls(settings)
+            HTTPFacilitatorClient(
+                FacilitatorConfig(url=url, timeout=settings.facilitator_timeout_s)
+            )
+            for url in facilitator_urls(settings)
         ]
         return cls(settings, clients)
 
     def _new_server(self, facilitators: list[Any]) -> x402ResourceServer:
         server = x402ResourceServer(facilitators)
-        nets = NETWORKS[self.settings.network_mode]
-        if self.settings.pay_to_evm:
-            # The SDK's own Protocol annotations disagree with its scheme classes (payment_flows).
-            server.register(nets["evm"], ExactEvmServerScheme())  # type: ignore[no-untyped-call,arg-type]
-        if self.settings.pay_to_svm:
-            server.register(nets["svm"], ExactSvmServerScheme())  # type: ignore[arg-type]
+        for network, scheme in self._schemes.items():
+            server.register(network, scheme)
         return server
 
     # ------------------------------------------------------------------ lifecycle
@@ -243,6 +306,10 @@ class Payments:
         that comes back serves again without a restart and a dead host is not called on every
         request. A request that carries a payment (``paying``) never starts that round: its
         authorization is already running out, and a quote always comes before it.
+
+        In such a round a facilitator that answered before and fails now keeps its place with
+        its last answer (``KEPT_ROUNDS`` rounds in a row, then it is dropped until it answers):
+        a network moves only on an answer, never on one failed GET.
 
         Raises ``PaymentsUnavailable`` (typed, unpaid) while no accepted network can be served;
         the next request then asks again.
@@ -269,24 +336,41 @@ class Payments:
         return not paying and self._retry_at is not None and self._clock() >= self._retry_at
 
     async def _initialize(self) -> None:
-        answers: dict[int, SupportedResponse] = {}
+        if self._initialized:
+            # Whatever happens below, this round is not repeated by the next request.
+            self._retry_at = self._clock() + RETRY_SKIPPED_S
+        fresh: dict[int, SupportedResponse] = {}
 
         async def ask(index: int, client: FacilitatorClient) -> None:
             answer = await self._supported(client)
             if answer is not None:
-                answers[index] = answer
+                fresh[index] = answer
 
         async with anyio.create_task_group() as tg:
             for index, client in enumerate(self._facilitators):
                 tg.start_soon(ask, index, client)
-        answered = [_Answered(self._facilitators[i], answers[i]) for i in sorted(answers)]
-        served = [(n, pay_to) for n, pay_to in self.accepted if self._settles(answered, n)]
-        # A facilitator's /supported can fail while its verify and settle still work, so a
-        # round that finds less than is being served changes nothing.
-        if not served or not set(self.served) <= set(served):
-            self._retry_at = self._clock() + RETRY_SKIPPED_S
-            if self._initialized:
-                return
+        for index, client in enumerate(self._facilitators):
+            if index in fresh:
+                self._answers[index], self._misses[index] = fresh[index], 0
+            elif index in self._answers:
+                # One failed GET moved Base from the facilitator serving it to the next that
+                # answered, for 300 s or more: its last answer stands, for a while.
+                self._misses[index] += 1
+                if self._misses[index] > KEPT_ROUNDS:
+                    del self._answers[index]
+                    log.warning(
+                        "facilitator dropped: GET /supported has failed for too long",
+                        extra={"facilitator": getattr(client, "url", type(client).__name__)},
+                    )
+        answered = [
+            _Answered(self._facilitators[i], self._answers[i], self._methods)
+            for i in sorted(self._answers)
+        ]
+        routes = {n: self._serving(answered, n) for n, _ in self.accepted}
+        served = [(n, pay_to) for n, pay_to in self.accepted if routes[n] is not None]
+        if not served:
+            # Also when it was serving until now: a quote nobody can settle can only fail.
+            self._initialized = False
             log.error(
                 "no facilitator offers x402 v2 'exact' on an accepted network: paid calls are "
                 "refused (503, unpaid) until one does",
@@ -295,16 +379,16 @@ class Payments:
             raise payments_unavailable()
         server = self._new_server(answered)
         server.initialize()  # no network: each _Answered repeats the answer it already gave
+        self._check_price_floors(routes)
         self.server, self.served = server, served
         self._mcp_requirements.clear()
-        self._check_price_floors()
         self._initialized = True
         for network in sorted({n for n, _ in self.accepted} - {n for n, _ in served}):
             log.warning(
                 "network left out of quotes: no facilitator offers x402 v2 'exact' on it",
                 extra={"network": network},
             )
-        missing = len(answered) < len(self._facilitators) or len(served) < len(self.accepted)
+        missing = len(fresh) < len(self._facilitators) or len(served) < len(self.accepted)
         self._retry_at = self._clock() + RETRY_SKIPPED_S if missing else None
 
     async def _supported(self, client: FacilitatorClient) -> SupportedResponse | None:
@@ -327,8 +411,8 @@ class Payments:
             return None
 
     @staticmethod
-    def _settles(answered: list[_Answered], network: str) -> bool:
-        """Whether the SDK, given ``answered``, can verify and settle v2 'exact' on ``network``.
+    def _serving(answered: list[_Answered], network: str) -> _Answered | None:
+        """Who the SDK, given ``answered``, has verify and settle v2 'exact' on ``network``.
 
         The SDK gives a (network, scheme) to the first facilitator that lists it, in any x402
         version, so that one decides: a later facilitator's v2 offer is never used.
@@ -336,25 +420,24 @@ class Payments:
         for facilitator in answered:
             offers = facilitator.offers(network)
             if offers is not None:
-                return offers
-        return False
+                return facilitator if offers else None
+        return None
 
-    def _check_price_floors(self) -> None:
-        for network, _ in self.served:
-            kind = self.server.get_supported_kind(2, network, "exact")
-            floor = (kind.extra or {}).get("minPaymentAmountAtomic") if kind else None
-            if not floor:
+    def _check_price_floors(self, routes: dict[str, _Answered | None]) -> None:
+        for network, facilitator in routes.items():
+            floor = facilitator.price_floor(network) if facilitator else None
+            if floor is None:
                 continue
             for op in active_operations(self.settings):
                 atomic = usd_to_atomic(op.price(self.settings))
-                if atomic < int(floor):
+                if atomic < floor:
                     log.error(
                         "price below facilitator minimum: these payments will be rejected",
                         extra={
                             "operation": op.key,
                             "network": network,
                             "price_atomic": atomic,
-                            "floor_atomic": int(floor),
+                            "floor_atomic": floor,
                         },
                     )
 
