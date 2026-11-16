@@ -13,7 +13,8 @@ What it does, in the order an agent should do it:
 
 1. REST: POST /v1/convert unpaid, decode the base64 PAYMENT-REQUIRED header and print the quote.
 2. REST: the same call through an x402 transport, which signs the quote and retries; read the
-   settlement from the PAYMENT-RESPONSE header.
+   settlement from the PAYMENT-RESPONSE header. A 402 after paying has its reason in
+   PAYMENT-REQUIRED (rejected before the work) or PAYMENT-RESPONSE (settlement failed after it).
 3. MCP: tools/list (free), call query_parquet unpaid (isError + PaymentRequired in
    structuredContent), sign it, retry with params._meta["x402/payment"].
 4. Provenance (free): verify the artifact's ML-DSA-65 signature offline with the published key,
@@ -62,6 +63,56 @@ def decode_header(value: str) -> dict[str, Any]:
     return decoded
 
 
+def read_header(response: httpx.Response, name: str) -> dict[str, Any]:
+    """A payment header as a dict: {} when it is absent or is not base64 of a JSON object.
+    Never index these headers: which one a 402 carries depends on where the payment stopped."""
+    try:
+        decoded = decode_header(response.headers.get(name) or "")
+    except ValueError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def explain(reason: object, receipt: dict[str, Any]) -> str:
+    """One line for a paid attempt that was refused.
+
+    Without a receipt the payment was rejected before the work (verification): nothing was
+    settled. With one (``success`` false), the work ran, the settlement did not go through as
+    far as the service could tell, and the result was withheld. The facilitator may have
+    moved the money all the same (a timeout, an answer the service could not read), so look
+    before paying again: at the transaction the receipt names, when it names one.
+    """
+    why = " ".join(str(reason or "no reason given").split())[:300]
+    if not receipt:
+        return f"payment rejected before any work was done: {why}"
+    line = f"payment not settled, so the result was withheld: {why}"
+    transaction = receipt.get("transaction")
+    if transaction:
+        return (
+            f"{line}; the facilitator named transaction {transaction}:"
+            " look it up on chain before paying again, the transfer may have been made"
+        )
+    return f"{line}; check your wallet's transfers to payTo before paying again"
+
+
+def refusal(response: httpx.Response) -> str:
+    """Why a paid request came back 402. The body is {}: the reason is in PAYMENT-REQUIRED
+    (``error``) when the payment was rejected, and in PAYMENT-RESPONSE (``errorReason``) when
+    the settlement failed after the work. A 402 carries one of them, not both."""
+    required = read_header(response, "PAYMENT-REQUIRED")
+    receipt = read_header(response, "PAYMENT-RESPONSE")
+    return explain(required.get("error") or receipt.get("errorReason"), receipt)
+
+
+def paid_or_exit(response: httpx.Response, what: str) -> None:
+    """Stop with one line unless the paid call succeeded. Only a 200 was charged for."""
+    if response.status_code == 402:
+        sys.exit(f"{what}: {refusal(response)}")
+    if response.status_code != 200:
+        text = " ".join(response.text.split())[:200]
+        sys.exit(f"{what}: failed with HTTP {response.status_code}, not charged: {text}")
+
+
 def settled_amount(settlement: dict[str, Any], quoted: str) -> str:
     """What a receipt says was paid. x402 v2 lets a facilitator leave ``amount`` out of its
     settlement, and a service may pass that on untouched; 'exact' settles the quoted amount."""
@@ -103,18 +154,17 @@ async def rest_flow(
     paying = x402AsyncTransport(payer, inner)
     async with httpx.AsyncClient(base_url=base_url, transport=paying, timeout=180) as paid:
         r = await paid.post("/v1/convert", json=body)
-        if r.status_code == 402:  # rejected payment: the reason is in the header, not the body
-            reason = decode_header(r.headers["PAYMENT-REQUIRED"]).get("error")
-            sys.exit(f"payment rejected: {reason}")
-        r.raise_for_status()
-        settlement = decode_header(r.headers["PAYMENT-RESPONSE"])
+        paid_or_exit(r, "convert")  # a 402 here has its reason in a header, not the body
+        settlement = read_header(r, "PAYMENT-RESPONSE")
         result: dict[str, Any] = r.json()
         report = result["report"]
         print(
             f"converted: {report['rows']} rows, {len(report['columns'])} columns;"
             f" paid {settled_amount(settlement, quote['accepts'][0]['amount'])}"
-            f" in tx {settlement['transaction']}"
+            f" in tx {settlement.get('transaction') or 'not named'}"
         )
+        # Said now, before anything else can fail: this is what the payment bought.
+        print(f"artifact: {result['artifact']['id']} at {result['artifact']['download_url']}")
         print(
             f"tokens to read: raw ~{report['estimated_tokens_raw']},"
             f" schema report ~{report['estimated_tokens_schema']}"
@@ -122,7 +172,7 @@ async def rest_flow(
 
         # Pass the artifact_id onward instead of re-sending the file.
         r = await paid.post("/v1/inspect", json={"artifact_id": result["artifact"]["id"]})
-        r.raise_for_status()
+        paid_or_exit(r, "inspect")
         print("inspect:", [(c["name"], c["type"]) for c in r.json()["columns"]])
 
         # Download (free, signed link) and verify provenance offline.
@@ -160,6 +210,10 @@ async def mcp_flow(
     *,
     transport: Any = None,
 ) -> dict[str, Any]:
+    # sys.exit inside this block would surface as a BaseExceptionGroup from the client's task
+    # group, not as its one line: a failure is carried out of the block and reported after it.
+    failure: str | None = None
+    result: dict[str, Any] = {}
     async with mcp.Client(transport or streamable_http_client(mcp_url)) as session:
         tools = await session.list_tools()  # free: initialize and tools/list never charge
         print("mcp tools:", [t.name for t in tools.tools])
@@ -168,22 +222,29 @@ async def mcp_flow(
         first = await session.call_tool("query_parquet", args)
         required = first.structured_content or {}
         if not (first.is_error and "accepts" in required):
-            sys.exit(f"expected a PaymentRequired result, got: {required}")
-        print("mcp quote:", [(a["amount"], a["network"]) for a in required["accepts"]])
-
-        payload = await payer.create_payment_payload(parse_payment_required(required))
-        # _meta is an open map at runtime; the cast only tells the type checker so.
-        meta = cast(
-            "RequestParamsMeta",
-            {"x402/payment": payload.model_dump(by_alias=True, exclude_none=True)},
-        )
-        paid = await session.call_tool("query_parquet", args, meta=meta)
-        if paid.is_error:
-            sys.exit(f"paid call failed (not settled): {paid.structured_content}")
-        settlement = (paid.meta or {}).get("x402/payment-response", {})
-        quoted = required["accepts"][0]["amount"]
-        print(f"mcp query: {paid.structured_content}; paid {settled_amount(settlement, quoted)}")
-        return paid.structured_content or {}
+            failure = f"expected a PaymentRequired result, got: {str(required)[:300]}"
+        else:
+            print("mcp quote:", [(a["amount"], a["network"]) for a in required["accepts"]])
+            payload = await payer.create_payment_payload(parse_payment_required(required))
+            # _meta is an open map at runtime; the cast only tells the type checker so.
+            meta = cast(
+                "RequestParamsMeta",
+                {"x402/payment": payload.model_dump(by_alias=True, exclude_none=True)},
+            )
+            paid = await session.call_tool("query_parquet", args, meta=meta)
+            result = paid.structured_content or {}
+            if paid.is_error:
+                # A failed settlement's receipt is in structuredContent (a successful one's
+                # is in _meta); a payment rejected before the work has none.
+                receipt = result.get("x402/payment-response")
+                failure = explain(result.get("error"), receipt if isinstance(receipt, dict) else {})
+            else:
+                settlement = (paid.meta or {}).get("x402/payment-response", {})
+                quoted = required["accepts"][0]["amount"]
+                print(f"mcp query: {result}; paid {settled_amount(settlement, quoted)}")
+    if failure:
+        sys.exit(f"mcp query_parquet: {failure}")
+    return result
 
 
 def main() -> int:
