@@ -423,6 +423,7 @@ def create_app(
     app.state.settings = settings
     app.state.service = service
     app.state.payments = pay
+    app.openapi = _openapi_with_guidance(app, settings)  # type: ignore[method-assign]
 
     # ------------------------------------------------------------------ errors
     @app.exception_handler(AimartError)
@@ -453,7 +454,9 @@ def create_app(
     async def health() -> dict[str, str]:
         return {"status": "ok", "version": __version__}
 
-    @app.get("/pricing", summary="Per-call prices (free)")
+    # Free, so `security: []`: without it x402scan probed /pricing for a 402 and listed it as a
+    # failed endpoint when the service was registered there (2026-11-16).
+    @app.get("/pricing", summary="Per-call prices (free)", openapi_extra=free)
     async def pricing() -> dict[str, Any]:
         return discovery.pricing(settings, networks)
 
@@ -627,6 +630,26 @@ def create_app(
     app.add_middleware(AccessLogMiddleware)
     app.add_middleware(ScopeDefaultsMiddleware)  # outermost: before anything reads the scope
     return app
+
+
+def _openapi_with_guidance(app: FastAPI, settings: Settings) -> Callable[[], dict[str, Any]]:
+    """The OpenAPI document with the hints x402 indexes read for agents.
+
+    x402scan, x402gle and other tools built on the agentcash discovery profile read
+    `info.x-guidance` (what the API is for, in a line) and `x-agentcash-guidance.llmsTxtUrl`
+    (where the longer guide is) from /openapi.json.
+    """
+    build = app.openapi
+
+    def openapi() -> dict[str, Any]:
+        if app.openapi_schema is None:
+            schema = build()
+            schema["info"]["x-guidance"] = discovery.GUIDANCE
+            schema["x-agentcash-guidance"] = {"llmsTxtUrl": f"{settings.public_base_url}/llms.txt"}
+            app.openapi_schema = schema
+        return app.openapi_schema
+
+    return openapi
 
 
 async def _sweeper(store: ArtifactStore) -> None:

@@ -78,7 +78,7 @@ URL=https://balogvn--aimart-parquet.us-east.modal.run   # the hosted service
 
 curl -s -D - -o /dev/null -X POST "$URL/v1/convert" \
   -H 'content-type: application/json' \
-  -d '{"url": "https://example.com/sales.csv"}' \
+  -d '{"url": "https://raw.githubusercontent.com/balogvn/aimart/main/docs/examples/sales.csv"}' \
   | awk 'tolower($1) == "payment-required:" {print $2}' | tr -d '\r' | base64 --decode | jq .
 ```
 
@@ -128,8 +128,9 @@ payer.register_policy(max_amount(20_000))  # never pay more than $0.02 per call
 async def main() -> None:
     transport = x402AsyncTransport(payer, httpx.AsyncHTTPTransport())
     async with httpx.AsyncClient(base_url=URL, transport=transport, timeout=180) as http:
-        # Put your file's public URL here: a URL that cannot be fetched is refused, unpaid.
-        r = await http.post("/v1/convert", json={"url": "https://example.com/sales.csv"})
+        # A 6-row sample from this repository; put your own file's public URL here.
+        sample = "https://raw.githubusercontent.com/balogvn/aimart/main/docs/examples/sales.csv"
+        r = await http.post("/v1/convert", json={"url": sample})
         artifact_id = r.json()["artifact"]["id"]
         r = await http.post(
             "/v1/query",

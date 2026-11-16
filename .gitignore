@@ -26,6 +26,8 @@ mutants/
 
 # Outputs
 *.parquet
+# The sample the bazaar examples fetch from GitHub (payments/bazaar.py):
+!docs/examples/sales.parquet
 !tests/fixtures/**/*.parquet
 /tmp/
 

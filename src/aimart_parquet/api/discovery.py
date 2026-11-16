@@ -25,6 +25,13 @@ DESCRIPTION = (
     "Built for AI agents: no signup, pay per call in USDC via x402."
 )
 
+# One line for indexes that show an API's purpose (OpenAPI info.x-guidance); /llms.txt has more.
+GUIDANCE = (
+    "Turn a messy data file into Parquet with POST /v1/convert (a public url, or base64 "
+    "content), then inspect, preview or query it with SQL by the returned artifact_id. Each "
+    "call is paid in USDC with x402, and a call that fails is not charged. Guide: /llms.txt."
+)
+
 
 def _tools(settings: Settings) -> list[str]:
     """MCP tool names, from the same table that prices them."""

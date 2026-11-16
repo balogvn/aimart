@@ -7,6 +7,7 @@ computes the expectation with the code under test cannot see that code being wro
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -18,7 +19,7 @@ from pydantic import ValidationError
 import aimart_testkit as kit
 from aimart_parquet.engine.models import ConvertOptions
 from aimart_parquet.payments import DEFAULT_FACILITATORS, Payments, facilitator_urls
-from aimart_parquet.payments.bazaar import EXAMPLES
+from aimart_parquet.payments.bazaar import EXAMPLES, example_output
 from aimart_parquet.payments.pricing import BY_KEY, OPERATIONS, active_operations, usd_to_atomic
 from aimart_parquet.service import SourceRef
 
@@ -144,7 +145,10 @@ async def test_bazaar_extension_is_present_and_self_consistent(
     assert info_input["bodyType"] == ("form-data" if op.key == "convert_upload" else "json")
     assert info_input["body"] == example["input"]
     jsonschema.validate(info_input["body"], example["input_schema"])
-    assert bazaar["info"]["output"]["example"] == example["output"]
+    assert bazaar["info"]["output"]["example"] == example_output(
+        op.key, paid_app.settings.public_base_url
+    )
+    assert "example.run.app" not in json.dumps(bazaar)  # its links stand on the service itself
 
 
 async def test_bazaar_tag_is_placed_in_accepts_extra(

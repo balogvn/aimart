@@ -36,7 +36,7 @@ from x402.schemas.config import ResourceConfig
 from aimart_parquet.artifacts import discard_withheld, outputs_of
 from aimart_parquet.config import PAYMENT_WINDOW_S, SETTLE_MARGIN_S, NetworkMode, Settings
 from aimart_parquet.errors import AimartError
-from aimart_parquet.payments.bazaar import EXAMPLES
+from aimart_parquet.payments.bazaar import EXAMPLES, example_output
 from aimart_parquet.payments.mcp_gate import (
     PaymentsUnavailable,
     X402McpGate,
@@ -503,7 +503,9 @@ class Payments:
                     input=example["input"],
                     input_schema=example["input_schema"],
                     body_type="form-data" if op.key == "convert_upload" else "json",
-                    output=OutputConfig(example=example["output"]),
+                    output=OutputConfig(
+                        example=example_output(op.key, self.settings.public_base_url)
+                    ),
                 ),
             )
         return routes

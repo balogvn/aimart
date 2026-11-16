@@ -23,6 +23,7 @@ from x402.http.clients.httpx import PaymentError
 
 import aimart_testkit as kit
 from aimart_parquet.config import Settings
+from aimart_parquet.payments.bazaar import SAMPLES
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -108,6 +109,10 @@ def test_readme_names_the_hosted_service_and_no_placeholder() -> None:
     assert f'URL = "{HOSTED}"' in text
     assert 'payer.register("eip155:8453"' in text
     assert "eip155:84532" in text  # still named, as the software's default (testnet)
+    # The samples it converts are the ones the catalog examples fetch: they exist (the replay
+    # test in test_bazaar_examples_are_real.py converts them), example.com/sales.csv never did.
+    assert "example.com/sales.csv" not in text
+    assert f"{SAMPLES}/sales.csv" in text
 
 
 async def test_payments_page_samples_quote_and_settle_the_same_amount(
