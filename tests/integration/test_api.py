@@ -24,6 +24,7 @@ from aimart_parquet import __version__
 from aimart_parquet.api import app as app_module
 from aimart_parquet.api.app import _transport_security, create_app
 from aimart_parquet.api.middleware import BodyLimitMiddleware, RateLimitMiddleware, client_ip
+from aimart_parquet.artifacts import build_store
 from aimart_parquet.config import Settings
 from aimart_parquet.payments.pricing import BY_KEY, active_operations
 
@@ -720,6 +721,26 @@ async def test_background_sweeper_removes_expired_artifacts_and_survives_errors(
             while (settings.artifact_dir / art.id).exists():  # noqa: ASYNC110
                 await anyio.sleep(0.01)
     assert len(calls) >= 2  # kept running after the first sweep raised
+
+
+async def test_expired_outputs_are_deleted_when_the_service_starts(
+    make_settings: Callable[..., Settings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hosted service stops 60 s after its last request and keeps outputs on storage that
+    outlives the instance (Modal's Volume). The sweeper used to sleep a minute before its first
+    pass, so an instance woken by one request could stop without deleting what had expired while
+    it was down. Only the sweep at start can remove the file here: the interval is an hour."""
+    monkeypatch.setattr(app_module, "SWEEP_INTERVAL_S", 3600)
+    settings = make_settings(artifact_ttl_s=-1)
+    # What an instance that has since stopped left behind: an output, expired by now.
+    earlier = build_store(settings)
+    left = earlier.put(kit.write(settings.artifact_dir / "in.bin", b"x"), "x.parquet")
+    assert (settings.artifact_dir / left.id).exists()
+    async with kit.running_app(settings, paid=False):
+        with anyio.fail_after(5):
+            # The effect under test is a background task's: there is no event to wait on.
+            while (settings.artifact_dir / left.id).exists():  # noqa: ASYNC110
+                await anyio.sleep(0.01)
 
 
 async def test_converted_parquet_is_typed(free_app: kit.AppHarness, tmp_path: Path) -> None:

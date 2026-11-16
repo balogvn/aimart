@@ -91,14 +91,16 @@ def retention_policy(settings: Settings) -> dict[str, Any]:
 
     Every buyer persona we asked raised data handling before price. These are facts about the
     code paths (per-request work directories, artifact TTL, log fields), not aspirations. The
-    TTL makes an artifact unreachable; deletion is a later sweep, run from the request path at
-    most once a minute (and over the bucket listing at most every 6 h), with the bucket's 1-day
-    lifecycle rule as the last resort. "Deleted at 60 minutes" was promised once and was false.
+    TTL makes an artifact unreachable; deletion is a later sweep, run when the service starts
+    and from the request path at most once a minute (and over the bucket listing at most every
+    6 h), with the bucket's 1-day lifecycle rule as the last resort. "Deleted at 60 minutes" was
+    promised once and was false.
     """
     minutes = settings.artifact_ttl_s // 60
     outputs = (
         f"converted files become unreachable {minutes} minutes after creation and are normally "
-        "deleted within minutes after that (cleanup runs while the service has traffic)"
+        "deleted within minutes after that (cleanup runs when the service starts and while it "
+        "has traffic)"
     )
     if settings.gcs_bucket:
         outputs += (

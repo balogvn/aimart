@@ -630,11 +630,18 @@ def create_app(
 
 
 async def _sweeper(store: ArtifactStore) -> None:
+    """Delete expired artifacts when the service starts, then once a minute.
+
+    The first sweep does not wait: a host that stops an idle instance (Modal, 60 s after the last
+    request) may never let a sweep that sleeps a minute first run, and where outputs are on
+    storage that outlives the instance (Modal's Volume) an expired file would then stay stored,
+    unreachable but not deleted, until a busier day.
+    """
     while True:
-        await anyio.sleep(SWEEP_INTERVAL_S)
         try:
             removed = await anyio.to_thread.run_sync(store.sweep)
             if removed:
                 log.info("artifacts swept", extra={"removed": removed})
         except Exception:  # the sweeper must outlive any single bad directory
             log.exception("artifact sweep failed")
+        await anyio.sleep(SWEEP_INTERVAL_S)
