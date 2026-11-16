@@ -246,7 +246,9 @@ def test_facilitator_calls_are_bounded_by_the_setting(
         def __init__(self, config: Any) -> None:
             seen.append(config)
 
-    monkeypatch.setattr(payments_module, "HTTPFacilitatorClient", Recorder)
+    # Was HTTPFacilitatorClient: from_settings now builds the service's own subclass of it
+    # (payments/settle.py), with the same config.
+    monkeypatch.setattr(payments_module, "LenientSettleClient", Recorder)
     settings = make_settings(
         network_mode="mainnet", facilitator_urls=None, facilitator_timeout_s=7.5
     )

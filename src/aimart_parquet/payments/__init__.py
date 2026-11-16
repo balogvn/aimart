@@ -24,7 +24,7 @@ import anyio.to_thread
 from fastapi.responses import JSONResponse
 from x402 import x402ResourceServer
 from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
-from x402.http import FacilitatorConfig, HTTPFacilitatorClient
+from x402.http import FacilitatorConfig
 from x402.http.middleware.fastapi import payment_middleware
 from x402.http.types import PaymentOption, RouteConfig
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
@@ -43,6 +43,7 @@ from aimart_parquet.payments.mcp_gate import (
     payments_unavailable,
 )
 from aimart_parquet.payments.pricing import Operation, active_operations, usd_to_atomic
+from aimart_parquet.payments.settle import LenientSettleClient
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -293,10 +294,10 @@ class Payments:
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Payments:
+        # Not the SDK's client as it is: that one reads a settle answer it cannot parse, or
+        # a 201, as "not settled" after the money has moved (payments/settle.py).
         clients: list[FacilitatorClient] = [
-            HTTPFacilitatorClient(
-                FacilitatorConfig(url=url, timeout=settings.facilitator_timeout_s)
-            )
+            LenientSettleClient(FacilitatorConfig(url=url, timeout=settings.facilitator_timeout_s))
             for url in facilitator_urls(settings)
         ]
         return cls(settings, clients)
