@@ -123,6 +123,12 @@ class ClientDisconnected(AimartError):
     http_status = 499
 
 
+def _same_units(stated: str, quoted: str) -> bool:
+    """Whether a facilitator's amount is the quoted number of atomic units ("020000" is)."""
+    whole = stated.isascii() and stated.isdigit() and quoted.isascii() and quoted.isdigit()
+    return int(stated) == int(quoted) if whole else stated == quoted
+
+
 class _Answered:
     """A facilitator, with the answer its GET /supported gave this initialization.
 
@@ -171,17 +177,29 @@ class _Answered:
         settled = await self.client.settle(payload, requirements)
         # x402 v2 makes the amount optional and xpay leaves it out: the first receipts on
         # mainnet named a transaction and no amount, and the example client crashed on them.
-        # 'exact' settles exactly the quoted amount, so the receipt (PAYMENT-RESPONSE on REST,
-        # _meta on MCP) says so. An amount the facilitator states is passed on. The money has
-        # moved by now: nothing here may raise (getattr: a v1 requirement has no ``amount``).
+        # Under 'exact' the payer signed a transfer of exactly the quoted amount, so that is
+        # what a settlement that succeeded moved, and what the receipt (PAYMENT-RESPONSE on
+        # REST, _meta on MCP) states: also when the facilitator states "19999", "2e4" or ""
+        # (a stated amount was once passed on as it came, a receipt misstating what was
+        # paid). The money has moved by now: nothing here may raise (getattr: a v1
+        # requirement has no ``amount``, and then the receipt stays as it came).
         quoted = getattr(requirements, "amount", None)
-        if (
-            settled.success
-            and settled.amount is None
-            and quoted
-            and getattr(requirements, "scheme", None) == "exact"
-        ):
-            settled = settled.model_copy(update={"amount": str(quoted)})
+        if settled.success and quoted and getattr(requirements, "scheme", None) == "exact":
+            quoted = str(quoted)
+            stated = "" if settled.amount is None else str(settled.amount).strip()
+            if stated and not _same_units(stated, quoted):
+                # For the owner: a facilitator that disagrees about the amount is one to ask.
+                log.warning(
+                    "facilitator's receipt states another amount than was quoted: "
+                    "the receipt names the quoted amount",
+                    extra={
+                        "facilitator": self.url,
+                        "stated_amount": stated[:80],
+                        "quoted_amount": quoted,
+                    },
+                )
+            if settled.amount != quoted:
+                settled = settled.model_copy(update={"amount": quoted})
         return settled
 
     def offers(self, network: str) -> bool | None:
