@@ -36,7 +36,7 @@ from aimart_parquet.payments.pricing import active_operations
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from x402.schemas import PaymentRequirements, ResourceInfo
+    from x402.schemas import PaymentRequirements, ResourceInfo, SettleResponse
 
     from aimart_parquet.artifacts import ArtifactStore
     from aimart_parquet.payments import Payments
@@ -177,7 +177,7 @@ class X402McpGate(Extension):
             if not settled.success:
                 self._withhold(produced, "settle_failed")
                 return self._settle_failed(
-                    reqs, resource, matched.network, settled.error_reason or "unknown"
+                    reqs, resource, matched.network, settled.error_reason or "unknown", settled
                 )
             if self._store is not None and produced:
                 self._store.commit(produced)
@@ -198,19 +198,33 @@ class X402McpGate(Extension):
 
     @staticmethod
     def _settle_failed(
-        reqs: list[PaymentRequirements], resource: ResourceInfo, network: str, reason: str
+        reqs: list[PaymentRequirements],
+        resource: ResourceInfo,
+        network: str,
+        reason: str,
+        answer: SettleResponse | None = None,
     ) -> CallToolResult:
+        """``answer``: the facilitator's refusal, when it gave one (none when settle raised).
+
+        Its transaction id and message go into the receipt, as REST's PAYMENT-RESPONSE has
+        them: an answer that names a transaction without saying "settled" is withheld
+        (payments/settle.py), and that id is the one thing the payer can look up on chain
+        before paying again. The receipt said ``"transaction": ""`` whatever was named.
+        """
+        receipt = {
+            "success": False,
+            "errorReason": reason,
+            "transaction": answer.transaction if answer else "",
+            "network": network,
+        }
+        if answer and answer.error_message:
+            receipt["errorMessage"] = answer.error_message
         return _result(
             {
                 "x402Version": 2,
                 "error": f"Payment settlement failed: {reason}",
                 "accepts": [r.model_dump(by_alias=True, exclude_none=True) for r in reqs],
                 "resource": resource.model_dump(by_alias=True, exclude_none=True),
-                PAYMENT_RESPONSE_META_KEY: {
-                    "success": False,
-                    "errorReason": reason,
-                    "transaction": "",
-                    "network": network,
-                },
+                PAYMENT_RESPONSE_META_KEY: receipt,
             }
         )

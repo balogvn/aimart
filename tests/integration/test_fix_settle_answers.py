@@ -281,6 +281,20 @@ async def test_an_unreadable_answer_names_its_transaction_to_the_owner_and_the_p
     assert "before paying again" in receipt["errorMessage"]
     (line,) = settle_lines(caplog)
     assert (line.levelno, line.transaction, line.settled) == (logging.ERROR, TX, False)  # type: ignore[attr-defined]
+    # The MCP receipt of a failed settlement always said "transaction": "": the payer of a
+    # tool call was not told the one thing it could look up.
+    refused_mcp = await mcp_call(
+        settings, kit.wire_facilitator({"transaction": TX, "error": "reverted"})
+    )
+    assert refused_mcp.is_error
+    receipt_mcp = refused_mcp.structured_content["x402/payment-response"]
+    assert receipt_mcp == {
+        "success": False,
+        "errorReason": "reverted",
+        "errorMessage": receipt["errorMessage"],
+        "transaction": TX,
+        "network": N,
+    }
 
 
 # ------------------------------------------------------------------------------ rule d
