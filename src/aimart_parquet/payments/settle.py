@@ -17,6 +17,8 @@ The rules, in ``read_settle_answer``:
 * No boolean ``success``: a settlement only if a transaction id is named and no error is.
 * Anything else in a 2xx (not JSON, not an object, nothing that says "settled") is answered as
   a refusal and logged at ERROR, so the owner can reconcile it against the chain.
+* A refusal that names a transaction stays a refusal (the transfer may be pending and still
+  land: AGENTS.md, Known gaps) and is logged at WARNING however it was worded.
 
 A non-2xx, a timeout and a connection error are raised, as the SDK raises them. After a 2xx
 nothing here raises: every outcome is a ``SettleResponse``.
@@ -199,12 +201,17 @@ class LenientSettleClient(HTTPFacilitatorClient):
         except Exception:  # noqa: BLE001 - a body that is not JSON, or a fault in the reading
             settled, reading = _not_confirmed(network), "unreadable"
         # One line per answer the SDK would have refused: the owner reconciles from these.
-        # Never the body (a third party's content) and never the payload.
-        if reading != "schema":
+        # Never the body (a third party's content) and never the payload. A refusal that
+        # names a transaction gets its line in any wording, the SDK's included: a transfer
+        # was submitted and may still land (pending), and this line is all that records it.
+        refused_with_a_transaction = not settled.success and bool(settled.transaction)
+        if reading != "schema" or refused_with_a_transaction:
             log.log(
                 logging.ERROR if reading == "unreadable" else logging.WARNING,
                 "facilitator's settle answer could not be read: treated as not settled"
                 if reading == "unreadable"
+                else "facilitator refused to settle and named a transaction: check it on chain"
+                if refused_with_a_transaction
                 else "facilitator's settle answer read leniently",
                 extra={
                     "facilitator": self.url,

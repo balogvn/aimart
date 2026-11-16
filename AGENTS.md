@@ -143,7 +143,9 @@ Module docstrings explain the why; read the one you are about to change.
   Bazaar extension, lazy facilitator init, price-floor check; `http_middleware(prevalidate=,
   store=)` commits or deletes a paid call's outputs from its final status, and makes a paid
   response whose client has disconnected a 499 `client_disconnected` before the SDK settles
-  it), `mcp_gate.py` (x402
+  it), `settle.py` (`LenientSettleClient`, the facilitator client `from_settings` builds:
+  the service's own reading of a `/settle` answer, and the only place that touches the SDK's
+  private helpers), `mcp_gate.py` (x402
   for MCP tool calls, same commit or delete), `bazaar.py` (catalog examples).
 - `mcp/server.py`: `build_mcp(...)`, the tools and their descriptions (the whole interface an
   agent sees). Remote: `convert_to_parquet` takes `url`/`content_base64`/`artifact_id`, every
@@ -599,6 +601,26 @@ each test's docstring has the incident.
   that names none, and the example reads receipts through `settled_amount`
   (`integration/test_fix_receipt_amount.py`). A fake must be able to answer as tersely as the
   real thing: every optional field of a facilitator's answer is one it may leave out.
+- **A settlement the SDK could not read.** The SDK's `HTTPFacilitatorClient` reads every
+  `/settle` answer but an HTTP 200 its strict `SettleResponse` accepts as an error, and an
+  error there is "not settled": a facilitator that had moved the money and then answered with
+  the amount as a JSON number, without `network`, with the hash under `txHash`, or with a 201
+  left the payer charged, with a 402 or `isError` and the output deleted (found in review on
+  2026-11-16, not on mainnet: xpay's answers are schema-valid). `payments/settle.py` now reads
+  the answer for every facilitator: any 2xx saying `"success": true` is a settlement, read
+  leniently; `"success": false` is a refusal; an answer that says neither is a settlement only
+  if it names a transaction id and no error, so that no facilitator can have work delivered
+  by answering vaguely; a non-2xx is not settled; nothing raises after a 2xx. Each answer read
+  outside the SDK's schema is one `aimart.payments.settle` line (URL, status, transaction;
+  never the body), WARNING when read leniently and ERROR when unreadable: reconcile those
+  against the chain. A successful 'exact' receipt names the quoted amount whatever the
+  facilitator states (a WARNING when it states another), a failed settlement's receipt names
+  the transaction the facilitator named (REST header and MCP `structuredContent`), and the
+  access log's `payment_settled` is true only for a settlement that succeeded
+  (`integration/test_fix_settle_answers.py`, `unit/test_fix_settle_reading.py`, whose last
+  test fails when an SDK upgrade renames a private helper `LenientSettleClient` stands on;
+  `integration/test_fix_settle_docs.py`). A `FakeFacilitator` returns SDK models and so can
+  only answer in the SDK's schema: test a facilitator's wording with `kit.wire_facilitator`.
 
 Known gaps: ISO date formats accept 1-digit years ('1/2/3' becomes 0001-02-03); JSON timestamps
 that all carry offsets become naive UTC with no note. A semicolon file whose only evidence of
@@ -634,7 +656,17 @@ layouts before letting DuckDB read a gzip of more than one member again. Capacit
 xpay has verified and settled this service's EIP-3009 payloads on mainnet without a key
 (two paid conversions on 2026-11-15, each 0.02 USDC, transactions 0xf8415eae… and
 0xb0865212…); Primer, the fallback, and paid inspect, preview and query calls have not been
-exercised with real money yet. A facilitator
+exercised with real money yet. Primer's real answer to `/settle` has never been seen: the
+lenient reading (`payments/settle.py`) is built from the x402 v2 schema and from the variants
+a review imagined, not from a capture, so capture one Primer settlement (status and body) and
+add it to `integration/test_fix_settle_answers.py` before relying on Primer. A facilitator
+that answers `"success": false` with a pending reason and a transaction id (a transfer
+submitted but not yet confirmed) is read as a refusal: the SDK asks it once more when the
+reason is exactly `settlement_pending`, and if it is still pending, or the reason is worded
+otherwise, the caller gets a 402 or `isError` and no result. The receipt and an
+`aimart.payments.settle` WARNING line name the transaction, yet the transfer may still land
+and nothing here follows it up: reconcile that line against the chain and refund by hand. A
+facilitator
 that takes longer than `facilitator_timeout_s` (20 s) to answer `/settle` leaves the outcome
 unknown: the call is answered as failed and unsettled, yet the transfer may still complete
 (the bound keeps the call inside Modal's 150 s, where the alternative was a cut connection

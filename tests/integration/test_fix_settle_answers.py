@@ -367,6 +367,51 @@ async def test_a_refusal_in_the_sdk_schema_is_read_as_before(settings: Settings)
     assert kept(settings) == 0
 
 
+async def test_a_refusal_that_names_a_transaction_leaves_a_line_even_in_the_sdk_schema(
+    settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Not solved, only made visible (AGENTS.md, Known gaps): "success": false with a pending
+    reason and a transaction id is a refusal, and the transfer may still land. Schema-valid, so
+    it was read without a line: the owner had nothing to reconcile from.
+
+    The SDK asks once more when the reason is exactly ``settlement_pending`` and a transaction
+    is named (``x402.server_base.settle_with_pending_retry_async``): two POSTs, two lines, and
+    then the refusal stands.
+    """
+    body = {"success": False, "errorReason": "settlement_pending", "transaction": TX, "network": N}
+    rest, mcp = kit.wire_facilitator(body), kit.wire_facilitator(body)
+    with caplog.at_level(logging.INFO):
+        refused = await rest_call(settings, rest)
+        refused_mcp = await mcp_call(settings, mcp)
+    assert refused.status_code == 402
+    assert kit.payment_response(refused) == body
+    assert refused_mcp.is_error
+    assert refused_mcp.structured_content["x402/payment-response"] == body
+    assert kept(settings) == 0
+    assert (rest.settle_calls, mcp.settle_calls) == (2, 2)
+    lines = settle_lines(caplog)
+    assert len(lines) == 4  # one per answer
+    for line in lines:
+        assert line.levelno == logging.WARNING
+        assert (line.facilitator, line.status, line.transaction, line.settled) == (  # type: ignore[attr-defined]
+            URL,
+            200,
+            TX,
+            False,
+        )
+    # Any other reason is asked once, and logged once, as long as a transaction is named ...
+    caplog.clear()
+    reverted = kit.wire_facilitator({**body, "errorReason": "transaction_reverted"})
+    with caplog.at_level(logging.INFO):
+        await rest_call(settings, reverted)
+    assert (reverted.settle_calls, len(settle_lines(caplog))) == (1, 1)
+    # ... and a plain refusal, with no transaction to look up, still logs nothing here.
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        await rest_call(settings, kit.wire_facilitator({**body, "transaction": ""}))
+    assert settle_lines(caplog) == []
+
+
 async def test_verify_is_the_sdks_own(settings: Settings) -> None:
     """Only the settle answer is read leniently. An answer to /verify the SDK cannot parse is
     refused before any work is done or anything is settled: there is nothing to lose there."""

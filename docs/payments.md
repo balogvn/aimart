@@ -112,7 +112,9 @@ worded (the amount as a number, no `network`, the hash under `txHash` or `transa
 a transaction and no error; everything else, and every status that is not 2xx, is not
 settled. Each answer read outside the SDK's schema is one log line (`aimart.payments.settle`:
 the facilitator's URL, the HTTP status, the transaction), which is what the owner reconciles
-against the chain.
+against the chain. A refusal that names a transaction (a transfer submitted and perhaps still
+pending) is logged the same way, however it is worded: it stays a refusal, and the transfer
+may still land.
 
 Prices are also published, for free, in OpenAPI: every paid operation in `/openapi.json`
 carries `x-payment-info`, for example
