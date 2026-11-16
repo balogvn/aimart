@@ -2,7 +2,9 @@
 
 How an AI agent, or the developer wiring one up, uses AImart Parquet from start to finish.
 All URLs use the placeholder `https://YOUR-SERVICE.run.app`. Replace it with the deployment
-you are calling.
+you are calling. The hosted service is `https://balogvn--aimart-parquet.us-east.modal.run`. It
+is on Base mainnet, so paid calls to it spend real USDC, and the testnet steps below are for a
+deployment in testnet mode (your own: `make serve` starts one).
 
 ## 0. Decide: local or hosted
 
