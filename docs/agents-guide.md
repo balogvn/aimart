@@ -312,8 +312,12 @@ shown." for a value with no JSON form, such as a time past year 9999 (cast it in
 table or `url` that is not Parquet (convert it first and pass its `artifact_id`); and "Table 't'
 has columns of a type SQL queries cannot read: ..." (cast them as the hint says).
 
-On REST, a paid retry that still returns **402** means the payment was rejected. The body is
-`{}`, and the reason is in the `PAYMENT-REQUIRED` header's `error` field.
+On REST, a paid retry that still returns **402** has body `{}` and its reason in a header.
+With `PAYMENT-REQUIRED`, the payment was rejected before the work (read its `error` field):
+nothing was charged. With `PAYMENT-RESPONSE` and no `PAYMENT-REQUIRED`, the work was done but
+the settlement failed (read `errorReason`), and the result is withheld; if its `transaction`
+is not `""`, look that transaction up on chain before paying again. Over MCP the same failure
+is an `isError` result with the receipt at `structuredContent["x402/payment-response"]`.
 
 ## 7. Runnable example (REST and MCP, real URL)
 
