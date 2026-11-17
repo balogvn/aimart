@@ -11,10 +11,16 @@ schema-valid, Primer's have never been seen).
 The rules, in ``read_settle_answer``:
 
 * An HTTP 200 the SDK's model accepts is read by that model, exactly as before.
-* Any other 2xx whose JSON is an object with ``"success": true`` is a settlement, and the rest
-  is read leniently: what cannot be read is left out, never fatal.
-* ``"success": false`` is a refusal, read as leniently.
-* No boolean ``success``: a settlement only if a transaction id is named and no error is.
+* Any other 2xx whose JSON is an object with ``"success": true`` is a settlement, unless
+  something beside it says otherwise (an error or reason key, a ``status`` or ``state`` that
+  is not a settled word, ``ok``/``settled``/``isValid`` not true); the rest is read leniently:
+  what cannot be read is left out, never fatal.
+* ``"success": false`` (or what the SDK reads as false) is a refusal, read as leniently.
+* ``success`` absent, or a word the SDK reads as true ("true", 1): a settlement only if a
+  transaction id that looks like one on the quoted network is named (0x and 64 hex digits,
+  not all zeros, on eip155; a base58 signature on solana) and nothing says otherwise, a
+  ``message`` included. ``success`` present as anything else (null, "failed", -1, an object)
+  is unreadable: no facilitator settles by being vague.
 * Anything else in a 2xx (not JSON, not an object, nothing that says "settled") is answered as
   a refusal and logged at ERROR, so the owner can reconcile it against the chain.
 * A refusal that names a transaction stays a refusal (the transfer may be pending and still
@@ -28,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import TypeAdapter, ValidationError
@@ -50,6 +57,19 @@ Reading = Literal["schema", "lenient", "unreadable"]
 TRANSACTION_KEYS = ("transaction", "txHash", "transactionHash")
 REASON_KEYS = ("errorReason", "error_reason", "error")
 MESSAGE_KEYS = ("errorMessage", "error_message")
+# Free text that, without a boolean success, may be a refusal ("transfer reverted").
+WORDING_KEYS = ("message", "msg", "detail", "details", "description")
+# Keys (lowercased, without _ or -) whose value, when set, means something went wrong.
+FAULT_WORDS = ("error", "reason", "fault", "failure", "revert")
+# ``status`` / ``state`` values that do not contradict a settlement.
+SETTLED_STATES = frozenset(
+    {"settled", "success", "succeeded", "successful", "confirmed", "completed", "complete"}
+)
+STATE_KEYS = frozenset({"status", "state", "settlementstatus", "txstatus"})
+# Flags that must be true, when present, for an answer to be a settlement.
+FLAG_KEYS = frozenset({"ok", "settled", "isvalid", "valid", "confirmed", "issettled"})
+EVM_TX = re.compile(r"0x[0-9a-fA-F]{64}")
+SOLANA_TX = re.compile(r"[1-9A-HJ-NP-Za-km-z]{64,88}")
 
 UNREADABLE = "facilitator_answer_unreadable"
 UNREADABLE_MESSAGE = (
@@ -94,20 +114,79 @@ def _amount(value: Any) -> str | None:
     return str(value)
 
 
-def _stated_success(value: Any) -> bool | None:
-    """True or False when the answer says so with a boolean; None when it does not say.
+Stated = Literal["settled", "refused", "unsaid", "unreadable"]
 
-    "false", "no" and 0 count as False: the SDK's model reads them so, and a transaction id
+
+def _stated_success(data: dict[str, Any]) -> Stated:
+    """What ``success`` says: only a JSON true is "settled".
+
+    "false", "no" and 0 are "refused": the SDK's model reads them so, and a transaction id
     beside one of them (a transfer that was broadcast and failed) must not turn a refusal
-    into a settlement. "true", "yes" and 1 are not a boolean true: outside the SDK's own
-    schema they only count with a transaction id, like an answer with no ``success`` at all.
+    into a settlement. "true", "yes" and 1 are "unsaid", like no ``success`` at all: outside
+    the SDK's schema they count only with a transaction id. Anything else (null, "failed",
+    -1, an object) is "unreadable": a facilitator that says something no reader can take for
+    a boolean has not said it settled, and a transaction id beside it may be a reverted one.
     """
+    if "success" not in data:
+        return "unsaid"
+    value = data["success"]
     if isinstance(value, bool):
-        return value
+        return "settled" if value else "refused"
     try:
-        return False if _BOOL.validate_python(value) is False else None
+        return "unsaid" if _BOOL.validate_python(value) else "refused"
     except ValidationError:
-        return None
+        return "unreadable"
+
+
+def _key(key: str) -> str:
+    return key.lower().replace("_", "").replace("-", "")
+
+
+def _fault(data: dict[str, Any]) -> str | None:
+    """The first error the answer names: the SDK's keys first, then any error or reason key.
+
+    ``errorCode``, ``errors``, ``invalidReason``, ``reason``, ``failureReason``... all count;
+    a key that is null, false, zero or empty does not. The error message keys are left to
+    ``MESSAGE_KEYS``, as before.
+    """
+    named = _first(data, REASON_KEYS)
+    if named:
+        return named
+    skip = {_key(k) for k in MESSAGE_KEYS}
+    for key, value in data.items():
+        norm = _key(str(key))
+        if norm not in skip and any(word in norm for word in FAULT_WORDS):
+            text = _text(value)
+            if text:
+                return text
+    return None
+
+
+def _contradicted(data: dict[str, Any]) -> bool:
+    """Whether a ``status``/``state`` or an ``ok``/``settled``/``isValid`` flag says no.
+
+    A state must be one of ``SETTLED_STATES`` and a flag exactly true; null is not stated.
+    """
+    for key, value in data.items():
+        norm = _key(str(key))
+        if value is None:
+            continue
+        if norm in STATE_KEYS and not (
+            isinstance(value, str) and value.strip().lower() in SETTLED_STATES
+        ):
+            return True
+        if norm in FLAG_KEYS and value is not True:
+            return True
+    return False
+
+
+def _looks_like_a_transaction(transaction: str, network: str) -> bool:
+    """A real transaction id on the quoted network, not "pending", "0x" or a zero hash."""
+    if network.startswith("eip155:"):
+        return bool(EVM_TX.fullmatch(transaction)) and bool(transaction[2:].strip("0"))
+    if network.startswith("solana:"):
+        return bool(SOLANA_TX.fullmatch(transaction)) and bool(transaction.strip("1"))
+    return False
 
 
 def _not_confirmed(
@@ -135,21 +214,34 @@ def read_settle_answer(status: int, data: Any, network: str) -> tuple[SettleResp
             pass  # where the SDK stops ("invalid data"): the money may have moved all the same
     if not isinstance(data, dict):
         return _not_confirmed(network), "unreadable"
-    success = _stated_success(data.get("success"))
+    stated = _stated_success(data)
     transaction = _transaction(data)
-    reason = _first(data, REASON_KEYS)
+    reason = _fault(data)
     message = _first(data, MESSAGE_KEYS)
-    if success is None:
+    success = stated != "refused"
+    if stated == "unreadable":
+        return _not_confirmed(network, transaction, reason), "unreadable"
+    if stated == "settled" and (reason or message or _contradicted(data)):
+        # "Settled" beside an error, a failed status or ok: false contradicts itself: no
+        # delivery on it, and no receipt that says both.
+        return _not_confirmed(network, transaction, reason), "unreadable"
+    if stated == "unsaid":
         # Nothing here says "settled" or "refused". A facilitator must not be able to have
         # work delivered by answering vaguely ({} or {"status": "ok"} with a 200), and the
         # payer must not be charged for nothing because a facilitator spells success another
         # way. The transaction id decides: a facilitator names one once it has submitted the
         # transfer, and that is something the owner and the payer can check on chain. So:
-        # settled only with a transaction id and no error beside it; in every other case not
-        # settled, which withholds the result and logs the answer's status for reconciling.
-        if not transaction or reason or message:
+        # settled only with a real transaction id on the quoted network and nothing beside it
+        # that says otherwise, not even a message ("transfer reverted"); in every other case
+        # not settled, which withholds the result and logs the answer for reconciling.
+        wording = message or _first(data, WORDING_KEYS)
+        if (
+            reason
+            or wording
+            or _contradicted(data)
+            or not _looks_like_a_transaction(transaction, network)
+        ):
             return _not_confirmed(network, transaction, reason), "unreadable"
-        success = True
     extensions, extra = data.get("extensions"), data.get("extra")
     return (
         SettleResponse(
@@ -200,6 +292,19 @@ class LenientSettleClient(HTTPFacilitatorClient):
             settled, reading = read_settle_answer(status, response.json(), network)
         except Exception:  # noqa: BLE001 - a body that is not JSON, or a fault in the reading
             settled, reading = _not_confirmed(network), "unreadable"
+        if settled.success and (settled.error_reason or settled.error_message):
+            # Only the SDK's schema gets here ("success": true beside an errorReason): read as
+            # the SDK reads it, a settlement, but flagged, and the receipt does not say both.
+            log.warning(
+                "facilitator settled and named an error: the error is left out of the receipt",
+                extra={
+                    "facilitator": self.url,
+                    "status": status,
+                    "transaction": settled.transaction[:TEXT_LIMIT],
+                    "reason": (settled.error_reason or "")[:TEXT_LIMIT],
+                },
+            )
+            settled = settled.model_copy(update={"error_reason": None, "error_message": None})
         # One line per answer the SDK would have refused: the owner reconciles from these.
         # Never the body (a third party's content) and never the payload. A refusal that
         # names a transaction gets its line in any wording, the SDK's included: a transfer

@@ -165,6 +165,22 @@ def client_over(
             {"success": True, "transaction": TX, "network": N},
         ),
         (202, {"success": "yes", "txHash": TX}, {"success": True, "transaction": TX, "network": N}),
+        # ...and nothing beside it that says otherwise: settled words and true flags are fine.
+        (
+            200,
+            {"transaction": TX, "status": " Confirmed ", "ok": True, "settled": True, "x": None},
+            {"success": True, "transaction": TX, "network": N},
+        ),
+        (
+            200,
+            {"txHash": "0x" + "AB" * 32, "state": "completed", "message": None},
+            {"success": True, "transaction": "0x" + "AB" * 32, "network": N},
+        ),
+        (
+            201,
+            {"success": True, "transaction": TX, "status": "settled", "isValid": True},
+            {"success": True, "transaction": TX, "network": N},
+        ),
     ],
 )
 def test_an_answer_the_sdk_rejects_is_read_leniently(
@@ -188,6 +204,47 @@ def test_an_answer_the_sdk_rejects_is_read_leniently(
         ({"transaction": TX, "errorReason": {"code": 3}}, TX, '{"code":3}'),
         ({"txHash": TX, "error_message": "out of gas"}, TX, UNREADABLE),
         ({"error": "x" * 5000}, "", "x" * 200),  # a caller gets an excerpt, not a page
+        # Refusals in other words (review 2026-11-16, V1): each delivered unpaid work.
+        ({"status": "failed", "transaction": TX}, TX, UNREADABLE),
+        (
+            {"status": "reverted", "txHash": TX, "reason": "execution reverted"},
+            TX,
+            "execution reverted",
+        ),
+        ({"state": "pending", "transaction": TX}, TX, UNREADABLE),
+        ({"status": 1, "transaction": TX}, TX, UNREADABLE),
+        ({"success": None, "transaction": TX, "message": "transfer reverted"}, TX, UNREADABLE),
+        ({"success": "failed", "transaction": TX, "network": N}, TX, UNREADABLE),
+        ({"success": " false", "transaction": TX}, TX, UNREADABLE),
+        ({"success": -1, "transaction": TX}, TX, UNREADABLE),
+        ({"success": {"value": False}, "transaction": TX}, TX, UNREADABLE),
+        ({"success": [True], "transaction": TX}, TX, UNREADABLE),
+        ({"ok": False, "transaction": TX, "message": "insufficient funds"}, TX, UNREADABLE),
+        ({"settled": False, "transaction": TX}, TX, UNREADABLE),
+        ({"is_settled": "yes", "transaction": TX}, TX, UNREADABLE),
+        (
+            {"isValid": False, "invalidReason": "insufficient_funds", "transaction": TX},
+            TX,
+            "insufficient_funds",
+        ),
+        ({"errors": ["reverted"], "transaction": TX}, TX, '["reverted"]'),
+        ({"errorCode": "REVERTED", "transaction": TX}, TX, "REVERTED"),
+        ({"failureReason": "nonce used", "txHash": TX}, TX, "nonce used"),
+        ({"transaction": TX, "message": "insufficient funds"}, TX, UNREADABLE),
+        ({"transaction": TX, "detail": "queued"}, TX, UNREADABLE),
+        # Not a transaction id on the quoted network: nothing anyone can look up.
+        ({"transaction": "pending"}, "pending", UNREADABLE),
+        ({"transaction": "null"}, "null", UNREADABLE),
+        ({"txHash": "0x"}, "0x", UNREADABLE),
+        ({"transaction": "0x" + "0" * 64}, "0x" + "0" * 64, UNREADABLE),
+        ({"transaction": TX[:-2]}, TX[:-2], UNREADABLE),
+        ({"transaction": TX + "ef"}, TX + "ef", UNREADABLE),
+        ({"transaction": "5" * 88}, "5" * 88, UNREADABLE),  # a Solana id, quoted on Base
+        # "success": true beside something that says otherwise (review, low): withheld.
+        ({"success": True, "error": "insufficient_funds"}, "", "insufficient_funds"),
+        ({"success": True, "transaction": TX, "errorMessage": "late"}, TX, UNREADABLE),
+        ({"success": True, "transaction": TX, "status": "failed"}, TX, UNREADABLE),
+        ({"success": True, "transaction": TX, "ok": False}, TX, UNREADABLE),
         ([], "", UNREADABLE),
         ([{"success": True, "transaction": TX}], "", UNREADABLE),
         ("success", "", UNREADABLE),

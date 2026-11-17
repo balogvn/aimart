@@ -125,8 +125,10 @@ class ClientDisconnected(AimartError):
 
 def _same_units(stated: str, quoted: str) -> bool:
     """Whether a facilitator's amount is the quoted number of atomic units ("020000" is)."""
+    # No int(): Python refuses a digit string over 4300 characters, and this runs after the
+    # money has moved, where nothing may raise.
     whole = stated.isascii() and stated.isdigit() and quoted.isascii() and quoted.isdigit()
-    return int(stated) == int(quoted) if whole else stated == quoted
+    return stated.lstrip("0") == quoted.lstrip("0") if whole else stated == quoted
 
 
 class _Answered:
