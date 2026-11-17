@@ -69,6 +69,11 @@ public `url` (best for large files), `content_base64` plus `filename` (under abo
 options). Over MCP only `convert_to_parquet` takes `content_base64`; on REST, convert, inspect,
 preview and query take all three.
 
+**Pay from an agent wallet.** If your agent already holds a Coinbase CDP or Circle
+developer-controlled wallet, [docs/recipes](docs/recipes/README.md) has a ready-made script for
+each (Python and TypeScript) that converts and queries a sample for $0.025. Coding agents can
+learn the service with `npx skills add balogvn/aimart`.
+
 ### REST: 402 → decode → pay → retry
 
 An unpaid call returns HTTP **402** with an empty body. The quote is in the base64

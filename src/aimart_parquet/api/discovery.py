@@ -32,6 +32,9 @@ GUIDANCE = (
     "call is paid in USDC with x402, and a call that fails is not charged. Guide: /llms.txt."
 )
 
+# Ready-made code for agents that already hold a Coinbase or Circle wallet (docs/recipes).
+RECIPES_URL = "https://github.com/balogvn/aimart/tree/main/docs/recipes"
+
 
 def _tools(settings: Settings) -> list[str]:
     """MCP tool names, from the same table that prices them."""
@@ -164,6 +167,8 @@ def llms_txt(settings: Settings) -> str:
         f"- [OpenAPI]({base}/openapi.json): REST endpoints under /v1",
         f"- [Pricing]({base}/pricing): per-call prices in USDC",
         f"- [x402 discovery]({base}/.well-known/x402): payable resources",
+        f"- [Wallet recipes]({RECIPES_URL}): pay from a Coinbase or Circle wallet in minutes; "
+        "coding agents: `npx skills add balogvn/aimart`",
         "",
         "## Operations",
         "",
