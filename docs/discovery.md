@@ -94,6 +94,12 @@ This is the root listing: Glama copies it, and PulseMCP will.
   `server.json`, and refuses to publish a placeholder remote.
 - release-please bumps `version` in `server.json` (the top-level field and the PyPI package's)
   on every release. The registry rejects a republish of an existing version.
+- **The 0.1.2 entry is wrong until the next release.** The 0.1.2 release commit carried
+  `server.json` from before #32, so the registry's 0.1.2 entry still lists testnet and Solana
+  networks, which the hosted remote does not take. `server.json` on main is fixed; the next
+  release publishes the right networks, and a version cannot be republished. Since then the
+  release guard (`scripts/check_release_diff.py`, run by `release.yml` before anything is
+  published) stops a release that changes anything but version numbers.
 
 ### 2. Glama
 

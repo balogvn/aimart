@@ -1,7 +1,8 @@
 # Release: release-please keeps a release PR open; merging it tags vX.Y.Z and creates the GitHub
 # release, and only then do the publishing jobs run, in this order:
 #
-#   release-please -> build (sdist + wheel) -> pypi (Trusted Publishing, PEP 740 attestations)
+#   release-please (its last step is the release guard, scripts/check_release_diff.py)
+#                  -> build (sdist + wheel) -> pypi (Trusted Publishing, PEP 740 attestations)
 #                  -> image (amd64 + arm64 -> GHCR, SLSA provenance + SPDX SBOM attestations)
 #   pypi + image   -> mcp-registry (server.json stamped with the version, OIDC login)
 #   image          -> deploy (deploy.yml with the image DIGEST, never a tag)
@@ -59,6 +60,24 @@ jobs:
           # A repository secret: release-please runs on every push to main, and an environment
           # would add a deployment record (or an approval) to each one.
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }} # zizmor: ignore[secrets-outside-env]
+      # Release guard: the release merge may change version numbers (and add to CHANGELOG.md),
+      # nothing else. On 2026-11-17 PRs #31 and #32 were merged 16 seconds apart, and
+      # release-please wrote the 0.1.2 release commit from server.json as it was before #32 plus
+      # the version bump; nobody reads a release PR line by line, so merging it silently
+      # reverted #32 and the MCP Registry got the old x402 networks. The same race can revert a
+      # dependency or security bump in uv.lock or pyproject.toml. Every publishing and deploying
+      # job needs this job, so a failure here stops all of them. By now the tag and the GitHub
+      # release already exist, so the fix is a commit to main and a new release, not a re-run.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.rp.outputs.release_created == 'true'
+        with:
+          ref: ${{ steps.rp.outputs.sha }} # the merge (or squash) of the release PR
+          fetch-depth: 2 # that commit and its parents: the range HEAD^1..HEAD
+          persist-credentials: false
+      - name: The release changed version numbers only
+        if: steps.rp.outputs.release_created == 'true'
+        # Stdlib only, on the runner's python3 (3.12 on ubuntu-latest): nothing is installed.
+        run: python3 scripts/check_release_diff.py HEAD^1..HEAD
 
   build:
     name: build (sdist + wheel)
