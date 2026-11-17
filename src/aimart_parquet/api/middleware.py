@@ -8,6 +8,7 @@ upload route must spool to disk, not buffer 50 MB in memory.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import math
@@ -110,6 +111,19 @@ class ScopeDefaultsMiddleware:
         await self.app(scope, receive, send)
 
 
+def _says_settled(receipt: bytes) -> bool:
+    """Whether a PAYMENT-RESPONSE header is the receipt of a settlement that succeeded.
+
+    The header alone is not: the 402 after a failed settlement carries one too (``success``
+    false and the reason), and the access log counted those calls as settled.
+    """
+    try:
+        said = json.loads(base64.b64decode(receipt))
+    except ValueError:  # not base64, not UTF-8, not JSON: each is a ValueError
+        return False
+    return isinstance(said, dict) and said.get("success") is True
+
+
 class AccessLogMiddleware:
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -129,7 +143,8 @@ class AccessLogMiddleware:
                 status = int(message["status"])
                 headers = list(message.get("headers", []))
                 settled = any(
-                    k.lower() in {b"payment-response", b"x-payment-response"} for k, _ in headers
+                    k.lower() in {b"payment-response", b"x-payment-response"} and _says_settled(v)
+                    for k, v in headers
                 )
                 headers.append((b"x-request-id", request_id.encode()))
                 message["headers"] = headers

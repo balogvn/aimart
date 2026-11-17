@@ -24,7 +24,7 @@ import anyio.to_thread
 from fastapi.responses import JSONResponse
 from x402 import x402ResourceServer
 from x402.extensions.bazaar import OutputConfig, declare_discovery_extension
-from x402.http import FacilitatorConfig, HTTPFacilitatorClient
+from x402.http import FacilitatorConfig
 from x402.http.middleware.fastapi import payment_middleware
 from x402.http.types import PaymentOption, RouteConfig
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
@@ -43,6 +43,7 @@ from aimart_parquet.payments.mcp_gate import (
     payments_unavailable,
 )
 from aimart_parquet.payments.pricing import Operation, active_operations, usd_to_atomic
+from aimart_parquet.payments.settle import LenientSettleClient
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -122,6 +123,14 @@ class ClientDisconnected(AimartError):
     http_status = 499
 
 
+def _same_units(stated: str, quoted: str) -> bool:
+    """Whether a facilitator's amount is the quoted number of atomic units ("020000" is)."""
+    # No int(): Python refuses a digit string over 4300 characters, and this runs after the
+    # money has moved, where nothing may raise.
+    whole = stated.isascii() and stated.isdigit() and quoted.isascii() and quoted.isdigit()
+    return stated.lstrip("0") == quoted.lstrip("0") if whole else stated == quoted
+
+
 class _Answered:
     """A facilitator, with the answer its GET /supported gave this initialization.
 
@@ -170,17 +179,29 @@ class _Answered:
         settled = await self.client.settle(payload, requirements)
         # x402 v2 makes the amount optional and xpay leaves it out: the first receipts on
         # mainnet named a transaction and no amount, and the example client crashed on them.
-        # 'exact' settles exactly the quoted amount, so the receipt (PAYMENT-RESPONSE on REST,
-        # _meta on MCP) says so. An amount the facilitator states is passed on. The money has
-        # moved by now: nothing here may raise (getattr: a v1 requirement has no ``amount``).
+        # Under 'exact' the payer signed a transfer of exactly the quoted amount, so that is
+        # what a settlement that succeeded moved, and what the receipt (PAYMENT-RESPONSE on
+        # REST, _meta on MCP) states: also when the facilitator states "19999", "2e4" or ""
+        # (a stated amount was once passed on as it came, a receipt misstating what was
+        # paid). The money has moved by now: nothing here may raise (getattr: a v1
+        # requirement has no ``amount``, and then the receipt stays as it came).
         quoted = getattr(requirements, "amount", None)
-        if (
-            settled.success
-            and settled.amount is None
-            and quoted
-            and getattr(requirements, "scheme", None) == "exact"
-        ):
-            settled = settled.model_copy(update={"amount": str(quoted)})
+        if settled.success and quoted and getattr(requirements, "scheme", None) == "exact":
+            quoted = str(quoted)
+            stated = "" if settled.amount is None else str(settled.amount).strip()
+            if stated and not _same_units(stated, quoted):
+                # For the owner: a facilitator that disagrees about the amount is one to ask.
+                log.warning(
+                    "facilitator's receipt states another amount than was quoted: "
+                    "the receipt names the quoted amount",
+                    extra={
+                        "facilitator": self.url,
+                        "stated_amount": stated[:80],
+                        "quoted_amount": quoted,
+                    },
+                )
+            if settled.amount != quoted:
+                settled = settled.model_copy(update={"amount": quoted})
         return settled
 
     def offers(self, network: str) -> bool | None:
@@ -293,10 +314,10 @@ class Payments:
 
     @classmethod
     def from_settings(cls, settings: Settings) -> Payments:
+        # Not the SDK's client as it is: that one reads a settle answer it cannot parse, or
+        # a 201, as "not settled" after the money has moved (payments/settle.py).
         clients: list[FacilitatorClient] = [
-            HTTPFacilitatorClient(
-                FacilitatorConfig(url=url, timeout=settings.facilitator_timeout_s)
-            )
+            LenientSettleClient(FacilitatorConfig(url=url, timeout=settings.facilitator_timeout_s))
             for url in facilitator_urls(settings)
         ]
         return cls(settings, clients)

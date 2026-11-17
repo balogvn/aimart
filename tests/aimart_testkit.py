@@ -119,6 +119,60 @@ class FakeFacilitator:
         )
 
 
+def wire_facilitator(
+    settle: Any,
+    *,
+    status: int = 200,
+    verify: Any = None,
+    headers: dict[str, str] | None = None,
+    networks: tuple[str, ...] = (BASE_SEPOLIA,),
+) -> Any:
+    """The service's own facilitator client (what ``Payments.from_settings`` builds) with only
+    the socket replaced: /verify and /settle answer raw JSON, or raw bytes, so an answer is
+    parsed exactly as a real facilitator's is. ``FakeFacilitator`` returns SDK models and so
+    can only ever answer in the SDK's schema; the money was once lost outside it.
+
+    ``settle`` is the body /settle answers with ``status`` (a dict or list is sent as JSON, str
+    or bytes as they are; an Exception is raised by the socket). ``.requests`` holds every
+    request it received and ``.settle_calls`` counts the POSTs to /settle.
+    """
+    from x402.http import FacilitatorConfig
+
+    from aimart_parquet.payments.settle import LenientSettleClient
+
+    class WireFacilitator(LenientSettleClient):
+        def __init__(self) -> None:
+            self.requests: list[httpx.Request] = []
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                self.requests.append(request)
+                if request.url.path.endswith("/verify"):
+                    return httpx.Response(200, json=verify or {"isValid": True, "payer": PAYER})
+                if isinstance(settle, Exception):
+                    raise settle
+                if isinstance(settle, (bytes, str)):
+                    return httpx.Response(status, content=settle, headers=headers)
+                return httpx.Response(status, json=settle, headers=headers)
+
+            super().__init__(
+                FacilitatorConfig(
+                    url="https://wire.facilitator.test",
+                    http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+                )
+            )
+
+        def get_supported(self) -> SupportedResponse:
+            return SupportedResponse(
+                kinds=[SupportedKind(x402_version=2, scheme="exact", network=n) for n in networks]
+            )
+
+        @property
+        def settle_calls(self) -> int:
+            return sum(1 for r in self.requests if r.url.path.endswith("/settle"))
+
+    return WireFacilitator()
+
+
 # ---------------------------------------------------------------------------------- wire
 def decode_b64_json(value: str) -> dict[str, Any]:
     """Decode a base64 JSON header exactly as a client would — no SDK helpers in between."""

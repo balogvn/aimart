@@ -84,11 +84,40 @@ This order is what guarantees that no caller pays for an error and no work is gi
    settlement):
    `{"success": true, "transaction": "0x…", "network": "eip155:84532", "payer": "0x…", "amount": "2000"}`
    (it settles exactly the quoted `amount`). `success`, `transaction`, `network` and `amount`
-   are always there: a facilitator may leave `amount` out of its settlement (xpay does), and
-   the service then states the quoted one. `payer` is there when the facilitator reports it.
-4. **Rejected payment** → `402` again with body `{}`. The reason is in the new
-   `PAYMENT-REQUIRED` header's `error` field. Clients and logs must read the header, because
-   the body says nothing.
+   are always there. `amount` is the quoted amount, the one the payer signed: a facilitator may
+   leave it out of its settlement (xpay does) or state another, and the receipt names the
+   quoted one all the same. `transaction` is `""` when the facilitator names none. `payer` is
+   there when the facilitator reports it.
+4. **Rejected payment** (before the work: a bad signature, a wrong amount, a refused verify)
+   → `402` again with body `{}`. The reason is in the new `PAYMENT-REQUIRED` header's `error`
+   field, and there is no `PAYMENT-RESPONSE`. Nothing was charged.
+5. **Failed settlement** (after the work: the facilitator refused to settle, did not answer,
+   or answered without saying that it settled) → `402` with body `{}` and the header
+   **`PAYMENT-RESPONSE`**, and no `PAYMENT-REQUIRED`:
+   `{"success": false, "errorReason": "insufficient_funds", "transaction": "", "network": "eip155:84532"}`.
+   The result is withheld and the converted file deleted. `errorReason` says why, and
+   `errorMessage` says more when there is more to say. `transaction` is `""` unless the
+   facilitator named one: if it did, a transfer was submitted and may still have been made, so
+   look that transaction up on chain before paying again.
+
+A client that has paid must therefore read whichever header a `402` carries, because the body
+says nothing: `PAYMENT-REQUIRED` (`error`) or `PAYMENT-RESPONSE` (`errorReason`).
+[`examples/agent_pays.py`](examples/agent_pays.py) does (`refusal`).
+
+What counts as "settled" is the service's own reading of the facilitator's answer
+(`payments/settle.py`), not the SDK's strict one, because by then the payer's money may have
+moved: any 2xx answer whose JSON says `"success": true` is a settlement however the rest is
+worded (the amount as a number, no `network`, the hash under `txHash` or `transactionHash`),
+unless something beside it says otherwise (an error, reason or message, a `status` such as
+"failed", `ok: false`); `"success": false` is a refusal; `success` set to anything else (null,
+"failed", -1) is not settled; an answer with no `success` is a settlement only if it names a
+transaction id of the network's shape (0x and 64 hex digits on Base, a base58 signature on
+Solana) and nothing that says otherwise; everything else, and every status that is not 2xx, is
+not settled. Each answer read outside the SDK's schema is one log line (`aimart.payments.settle`:
+the facilitator's URL, the HTTP status, the transaction), which is what the owner reconciles
+against the chain. A refusal that names a transaction (a transfer submitted and perhaps still
+pending) is logged the same way, however it is worded: it stays a refusal, and the transfer
+may still land.
 
 Prices are also published, for free, in OpenAPI: every paid operation in `/openapi.json`
 carries `x-payment-info`, for example
@@ -107,7 +136,7 @@ The format follows the x402 v2 MCP transport spec. It is implemented in
 | unpaid `tools/call` to a paid tool | result `isError: true`. `structuredContent` is the `PaymentRequired` object (same shape as above, `resource.url` = `https://host/mcp#<tool>`), and the same JSON is the first text block |
 | paid retry | same call with `params._meta["x402/payment"]` = the `PaymentPayload` JSON (an object, not base64) |
 | success | the tool's normal result plus `_meta["x402/payment-response"]` = the settlement |
-| settlement failure after the tool ran | `isError: true` with the payment error and `x402/payment-response.success = false`. The tool output is withheld |
+| settlement failure after the tool ran | `isError: true`. `structuredContent` is a `PaymentRequired` object whose `error` is `Payment settlement failed: <reason>`, and the receipt sits in it, at `structuredContent["x402/payment-response"]` (not in `_meta`, where a successful one is): `{"success": false, "errorReason": …, "transaction": …, "network": …}`, with the transaction the facilitator named or `""`. The same JSON is the first text block. The tool output is withheld |
 | x402 v1 payload | rejected with a PaymentRequired that asks for `x402Version` 2 |
 
 `verify_provenance` is free and never gated.

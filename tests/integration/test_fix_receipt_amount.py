@@ -11,6 +11,7 @@ states it when the facilitator does not, on REST and on MCP; a failed settlement
 from __future__ import annotations
 
 import importlib.util
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -93,12 +94,76 @@ async def test_an_mcp_receipt_states_it_too(settings: Settings) -> None:
     assert receipt["amount"] == unpaid.structured_content["accepts"][0]["amount"] == "20000"
 
 
-async def test_an_amount_the_facilitator_states_is_passed_on_as_it_is(settings: Settings) -> None:
-    """The fill-in is for a missing amount only: what a facilitator reports is its to report."""
-    facilitator = TerseFacilitator(stated_amount="19999")
-    async with kit.running_app(settings, facilitator=facilitator) as app:
-        paid = await app.paying.post("/v1/convert", json=BODY)
-    assert kit.payment_response(paid)["amount"] == "19999"
+# Was test_an_amount_the_facilitator_states_is_passed_on_as_it_is, which pinned a stated
+# "19999" reaching the payer as the receipt's amount ("what a facilitator reports is its to
+# report"). Review of 2026-11-16 (S3): under 'exact' the payer signed a transfer of exactly the
+# quoted amount, and a settlement that succeeded moved that and nothing else, so a receipt
+# saying 19999, "", "2e4" or "20000.5" misstates what was paid. The receipt now always names
+# the quoted amount, and a facilitator that states another one is logged, not repeated.
+@pytest.mark.parametrize(
+    ("stated", "warned"),
+    [
+        ("19999", True),  # different
+        ("20001", True),
+        ("20000.5", True),  # not a whole number of atomic units
+        ("2e4", True),
+        ("0.02", True),  # dollars, not atomic units
+        ("-20000", True),
+        ("twenty thousand", True),
+        ("", False),  # empty: nothing was stated
+        ("   ", False),
+        ("20000", False),  # the quote itself
+        (" 20000 ", False),  # the same number, written otherwise
+        ("020000", False),
+    ],
+)
+async def test_an_exact_receipt_names_the_quoted_amount_whatever_the_facilitator_states(
+    stated: str, warned: bool, settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    payer = kit.paying_client()
+    args = {"content_base64": kit.b64(CSV), "filename": "sales.csv"}
+    with caplog.at_level(logging.INFO):
+        async with kit.running_app(
+            settings, facilitator=TerseFacilitator(stated_amount=stated)
+        ) as app:
+            paid = await app.paying.post("/v1/convert", json=BODY)
+            async with kit.mcp_over_http(app.app) as client:
+                unpaid = await client.call_tool("convert_to_parquet", args)
+                meta = await kit.mcp_payment_meta(payer, unpaid.structured_content)
+                paid_mcp = await client.call_tool("convert_to_parquet", args, meta=meta)
+    assert paid.status_code == 200, paid.text
+    assert kit.payment_response(paid)["amount"] == "20000"
+    assert not paid_mcp.is_error
+    assert paid_mcp.meta["x402/payment-response"]["amount"] == "20000"
+    lines = [r for r in caplog.records if "another amount" in r.getMessage()]
+    # One line per settlement (REST, then MCP) for the owner: who said it, and both amounts.
+    assert len(lines) == (2 if warned else 0)
+    for line in lines:
+        assert line.levelno == logging.WARNING
+        assert (line.facilitator, line.stated_amount, line.quoted_amount) == (  # type: ignore[attr-defined]
+            "https://facilitator.test",
+            stated,
+            "20000",
+        )
+
+
+@pytest.mark.parametrize("stated", [19999, 20000.5, "19999", ""])
+async def test_an_amount_read_from_the_wire_is_replaced_the_same_way(
+    stated: Any, settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The same through the service's own client over a mock socket: a JSON number is read
+    leniently (payments/settle.py) and then replaced like any other stated amount."""
+    answer = {"success": True, "transaction": kit.TX_HASH, "network": kit.BASE_SEPOLIA}
+    facilitator = kit.wire_facilitator({**answer, "amount": stated})
+    with caplog.at_level(logging.INFO):
+        async with kit.running_app(settings, facilitators=[facilitator]) as app:
+            paid = await app.paying.post("/v1/convert", json=BODY)
+    assert paid.status_code == 200
+    assert kit.payment_response(paid)["amount"] == "20000"
+    lines = [r for r in caplog.records if "another amount" in r.getMessage()]
+    assert [(r.facilitator, r.stated_amount, r.quoted_amount) for r in lines] == (  # type: ignore[attr-defined]
+        [("https://wire.facilitator.test", str(stated), "20000")] if stated != "" else []
+    )
 
 
 async def test_a_failed_settlement_is_given_no_amount(settings: Settings) -> None:
