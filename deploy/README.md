@@ -515,9 +515,10 @@ Run pricing page before relying on them.
   evicted at any time, downloads are V4 signed GCS URLs, and they leave Cloud Run's 1 GiB egress
   allowance alone.
 - **Retention** (what `/pricing` publishes as `data_retention`): an artifact becomes unreachable
-  at `AIMART_ARTIFACT_TTL_S` (60 minutes) and is normally deleted within minutes after that, by a
-  sweep that runs at most once a minute while the service has traffic (local files and their
-  GCS copies). A GCS copy whose local record was lost in an instance restart is caught by a
+  at `AIMART_ARTIFACT_TTL_S` (60 minutes) and is deleted after that by a sweep that runs when
+  the service starts and then at most once a minute while it runs (local files and their GCS
+  copies). On Modal the outputs are on a Volume that outlives a stopped container: one that
+  expires while the service is stopped is deleted when it next starts, normally within a day ([docs/privacy.md](../docs/privacy.md#when-outputs-are-deleted)). A GCS copy whose local record was lost in an instance restart is caught by a
   bucket-listing sweep (at most every 6 hours) or, worst case, by the bucket's 1-day lifecycle
   rule from `setup-gcp.sh`: about a day. Without that rule there is no worst-case bound, so keep
   it on any bucket you use.

@@ -25,6 +25,13 @@ DESCRIPTION = (
     "Built for AI agents: no signup, pay per call in USDC via x402."
 )
 
+# One line for indexes that show an API's purpose (OpenAPI info.x-guidance); /llms.txt has more.
+GUIDANCE = (
+    "Turn a messy data file into Parquet with POST /v1/convert (a public url, or base64 "
+    "content), then inspect, preview or query it with SQL by the returned artifact_id. Each "
+    "call is paid in USDC with x402, and a call that fails is not charged. Guide: /llms.txt."
+)
+
 
 def _tools(settings: Settings) -> list[str]:
     """MCP tool names, from the same table that prices them."""
@@ -91,14 +98,18 @@ def retention_policy(settings: Settings) -> dict[str, Any]:
 
     Every buyer persona we asked raised data handling before price. These are facts about the
     code paths (per-request work directories, artifact TTL, log fields), not aspirations. The
-    TTL makes an artifact unreachable; deletion is a later sweep, run from the request path at
-    most once a minute (and over the bucket listing at most every 6 h), with the bucket's 1-day
-    lifecycle rule as the last resort. "Deleted at 60 minutes" was promised once and was false.
+    TTL makes an artifact unreachable; deletion is a later sweep, run when the service starts
+    and from the request path at most once a minute (and over the bucket listing at most every
+    6 h), with the bucket's 1-day lifecycle rule as the last resort. "Deleted at 60 minutes" was
+    promised once and was false, and so was "normally within minutes after that" on a host that
+    stops when idle (Modal, 60 s after the last request), where it is the next start.
     """
     minutes = settings.artifact_ttl_s // 60
     outputs = (
-        f"converted files become unreachable {minutes} minutes after creation and are normally "
-        "deleted within minutes after that (cleanup runs while the service has traffic)"
+        f"converted files become unreachable {minutes} minutes after creation and are deleted "
+        "after that by a cleanup that runs when the service starts and once a minute while it "
+        "runs; a host that stops the service when idle (the hosted one does) deletes a file that "
+        "expired meanwhile when it next starts, which can be hours later"
     )
     if settings.gcs_bucket:
         outputs += (

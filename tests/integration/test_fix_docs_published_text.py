@@ -56,7 +56,41 @@ def test_retention_promises_unreachable_at_the_ttl_not_deletion(
     outputs = retention_policy(make_settings(gcs_bucket=bucket, artifact_ttl_s=1800))["outputs"]
     assert "unreachable 30 minutes after creation" in outputs
     assert "deleted 30 minutes" not in outputs
-    assert "within minutes" in outputs
+    assert "when the service starts" in outputs
+
+
+@pytest.mark.parametrize("bucket", [None, "aimart-test-artifacts"])
+def test_retention_does_not_promise_deletion_minutes_after_expiry(
+    make_settings: Callable[..., Settings], bucket: str | None
+) -> None:
+    # Review of docs/listing-readiness: "normally deleted within minutes after that" was served
+    # by /pricing and /llms.txt, but the hosted service stops 60 s after its last request
+    # (SCALEDOWN_S) and the TTL is an hour, so an expired file is usually deleted at the next
+    # start, hours later. The cleanup runs then and once a minute while the service runs.
+    outputs = retention_policy(make_settings(gcs_bucket=bucket))["outputs"]
+    assert "within minutes" not in outputs
+    assert "normally" not in outputs
+    assert "once a minute while it runs" in outputs
+    assert "hours later" in outputs  # what a host that stops when idle means
+
+
+@pytest.mark.parametrize("rel", ["README.md", "docs/privacy.md", "deploy/README.md", "SECURITY.md"])
+def test_docs_do_not_promise_deletion_minutes_after_expiry(rel: str) -> None:
+    text = doc(rel)
+    for overpromise in ("normally deleted within minutes", "normally within minutes"):
+        assert overpromise not in text, (rel, overpromise)
+
+
+def test_privacy_bounds_hosted_deletion_by_what_github_runs_not_the_cron() -> None:
+    # Review of docs/listing-readiness: privacy.md said the synthetic check starts the hosted
+    # service "every six hours, so that is the usual upper bound". Only its cron is every 6 h:
+    # GitHub ran it 2.35 times a day (gaps 4.4 to 15.5 h, typically 11 to 13 h) from
+    # 2026-11-11 to 2026-11-16, so an expired upload stayed stored 12 to 16 h on a quiet day.
+    text = section("docs/privacy.md", "## When outputs are deleted")
+    for overpromise in ("every six hours", "upper bound", "within minutes of the TTL"):
+        assert overpromise not in text, overpromise
+    assert "within a day" in text
+    assert "not a guarantee" in text
 
 
 def test_retention_cites_the_one_day_backstop_only_where_it_exists(

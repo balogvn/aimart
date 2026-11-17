@@ -10,10 +10,20 @@ Parquet. You can then inspect the result (footer only), preview rows, and query 
 sandboxed, read-only DuckDB SQL, including joins across several files. Agents pay per call in
 USDC with [x402 v2](https://www.x402.org/). There is no signup and no API key.
 
+**Live:** the hosted service is at `https://balogvn--aimart-parquet.us-east.modal.run` and takes
+USDC on Base mainnet. Its MCP endpoint is `https://balogvn--aimart-parquet.us-east.modal.run/mcp`.
+Prices, limits and data handling, as that service applies them, are at
+[`/pricing`](https://balogvn--aimart-parquet.us-east.modal.run/pricing) and
+[`/llms.txt`](https://balogvn--aimart-parquet.us-east.modal.run/llms.txt). The package is on
+[PyPI](https://pypi.org/project/aimart-parquet/) (`uvx aimart-parquet mcp` runs the free local
+server), and the server is in the official MCP Registry as `io.github.balogvn/aimart-parquet`.
+
 **Your data:** inputs are deleted when the call ends. Converted files become unreachable after
-60 minutes and are normally deleted within minutes after that; with Cloud Storage the worst case
-is about a day (the bucket's 1-day lifecycle rule). File contents are never logged or used for
-training. Details: [docs/privacy.md](docs/privacy.md).
+60 minutes and are deleted by a cleanup that runs when the service starts and once a minute
+while it runs. The hosted service stops when idle, so one that expires while it is stopped stays
+stored, unreachable, until it next starts: normally within a day. A deployment that keeps
+outputs in Cloud Storage has a worst case of about a day (the bucket's 1-day lifecycle rule).
+File contents are never logged or used for training. Details: [docs/privacy.md](docs/privacy.md).
 
 Why it exists: an agent that reads a 100,000-row CSV as text spends a large share of its
 context on raw rows. With this service it reads a compact schema report and then asks targeted
@@ -32,10 +42,9 @@ estimate covers only the column digest. The full JSON response is larger: it add
 notes and, on the hosted service, a provenance block with a 3,309-byte ML-DSA-65 signature
 (4,412 base64 characters).
 
-> **Status:** v0.1.0. It is not yet deployed or published to PyPI. Every
-> `https://YOUR-SERVICE.run.app` below is a **placeholder** for your own deployment's URL
-> ([hosting](#hosting)). Until the PyPI release, run the local server
-> from a checkout with `make mcp`.
+> The examples below call the hosted service, so a paid one spends real USDC (two cents for a
+> conversion). An unpaid call costs nothing and shows the price. If you run your own deployment
+> ([hosting](#hosting)), use its URL instead.
 
 ## Contents
 
@@ -66,11 +75,11 @@ An unpaid call returns HTTP **402** with an empty body. The quote is in the base
 `PAYMENT-REQUIRED` header:
 
 ```bash
-URL=https://YOUR-SERVICE.run.app   # placeholder
+URL=https://balogvn--aimart-parquet.us-east.modal.run   # the hosted service
 
 curl -s -D - -o /dev/null -X POST "$URL/v1/convert" \
   -H 'content-type: application/json' \
-  -d '{"url": "https://example.com/sales.csv"}' \
+  -d '{"url": "https://raw.githubusercontent.com/balogvn/aimart/main/docs/examples/sales.csv"}' \
   | awk 'tolower($1) == "payment-required:" {print $2}' | tr -d '\r' | base64 --decode | jq .
 ```
 
@@ -78,23 +87,25 @@ curl -s -D - -o /dev/null -X POST "$URL/v1/convert" \
 {
   "x402Version": 2,
   "error": "Payment required",
-  "resource": {"url": "https://YOUR-SERVICE.run.app/v1/convert", "mimeType": "application/json", "...": "..."},
+  "resource": {"url": "https://balogvn--aimart-parquet.us-east.modal.run/v1/convert", "mimeType": "application/json", "...": "..."},
   "accepts": [{
     "scheme": "exact",
-    "network": "eip155:84532",
-    "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+    "network": "eip155:8453",
+    "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     "amount": "20000",
     "payTo": "0x…",
     "maxTimeoutSeconds": 300,
-    "extra": {"name": "USDC", "version": "2"}
+    "extra": {"name": "USD Coin", "version": "2"}
   }]
 }
 ```
 
-`amount` is in USDC atomic units (6 decimals): `20000` is $0.02. `curl` cannot sign. An x402
-client signs the quote with your wallet and retries with a `PAYMENT-SIGNATURE` header. The
-settlement comes back in `PAYMENT-RESPONSE`. With the x402 Python SDK
-(`pip install "x402[evm,httpx]"`):
+`network` is Base mainnet and `asset` is USDC there. `amount` is in USDC atomic units
+(6 decimals): `20000` is $0.02. `curl` cannot sign. An x402 client signs the quote with your
+wallet and retries with a `PAYMENT-SIGNATURE` header. The settlement comes back in
+`PAYMENT-RESPONSE`. The payer needs USDC on Base and nothing else: the facilitator pays the
+network fee. With the x402 Python SDK (`pip install "x402[evm,httpx]"`), this spends $0.025 of
+real USDC, two cents to convert and half a cent to query:
 
 ```python
 import os
@@ -107,18 +118,20 @@ from x402.http.clients.httpx import x402AsyncTransport
 from x402.mechanisms.evm import EthAccountSigner
 from x402.mechanisms.evm.exact import ExactEvmClientScheme
 
-URL = "https://YOUR-SERVICE.run.app"  # placeholder
-TEST_KEY = os.environ["PAYER_PRIVATE_KEY"]  # a Base Sepolia test wallet; stays on your side
+URL = "https://balogvn--aimart-parquet.us-east.modal.run"  # the hosted service, on Base mainnet
+KEY = os.environ["PAYER_PRIVATE_KEY"]  # a wallet holding a little USDC on Base; stays on your side
 
 payer = x402Client()
-payer.register("eip155:84532", ExactEvmClientScheme(EthAccountSigner(Account.from_key(TEST_KEY))))
+payer.register("eip155:8453", ExactEvmClientScheme(EthAccountSigner(Account.from_key(KEY))))
 payer.register_policy(max_amount(20_000))  # never pay more than $0.02 per call
 
 
 async def main() -> None:
     transport = x402AsyncTransport(payer, httpx.AsyncHTTPTransport())
     async with httpx.AsyncClient(base_url=URL, transport=transport, timeout=180) as http:
-        r = await http.post("/v1/convert", json={"url": "https://example.com/sales.csv"})
+        # A 6-row sample from this repository; put your own file's public URL here.
+        sample = "https://raw.githubusercontent.com/balogvn/aimart/main/docs/examples/sales.csv"
+        r = await http.post("/v1/convert", json={"url": sample})
         artifact_id = r.json()["artifact"]["id"]
         r = await http.post(
             "/v1/query",
@@ -148,17 +161,17 @@ with the signed payload in `params._meta["x402/payment"]`.
 **Claude Code:**
 
 ```bash
-claude mcp add --transport http aimart https://YOUR-SERVICE.run.app/mcp
+claude mcp add --transport http aimart https://balogvn--aimart-parquet.us-east.modal.run/mcp
 ```
 
 **Cursor, or any client that takes a remote URL** (`.cursor/mcp.json` or equivalent):
 
 ```json
-{ "mcpServers": { "aimart": { "url": "https://YOUR-SERVICE.run.app/mcp" } } }
+{ "mcpServers": { "aimart": { "url": "https://balogvn--aimart-parquet.us-east.modal.run/mcp" } } }
 ```
 
 **Free local server** over stdio, for files on your machine. It needs no payments, no wallet
-and no network. After the PyPI release:
+and no network:
 
 ```bash
 claude mcp add aimart-local -- uvx aimart-parquet mcp
@@ -218,9 +231,11 @@ The floor is $0.002 because facilitators reject payments below about $0.0011–0
 charge up to about $0.002 per settlement. Below that floor a call is either unsettleable or
 loss-making. See [docs/economics.md](docs/economics.md).
 
-Networks: testnet by default (Base Sepolia `eip155:84532`, facilitator
-`https://x402.org/facilitator`). Mainnet (Base `eip155:8453` via xpay, Solana via Dexter)
-must be switched on explicitly by the operator. See [docs/payments.md](docs/payments.md).
+Networks: the hosted service takes USDC on Base mainnet (`eip155:8453`), settled through xpay,
+with Primer as the fallback. The software's own default is testnet (Base Sepolia
+`eip155:84532`, facilitator `https://x402.org/facilitator`): mainnet (Base via xpay or Primer,
+Solana via Dexter) must be switched on explicitly by the operator. See
+[docs/payments.md](docs/payments.md).
 
 ## Supported formats
 
@@ -388,22 +403,21 @@ The details and how to report a vulnerability are in [SECURITY.md](SECURITY.md).
 ## Hosting
 
 The hosted service runs on Modal; Google Cloud Run is the alternative (set `DEPLOY_HOST=cloudrun`).
-Both deploys, the free-tier budgets and the spend caps are in [deploy/README.md](deploy/README.md).
-To run the container yourself:
+Both deploys, the free-tier budgets and the spend caps are in [deploy/README.md](deploy/README.md),
+with the rationale in [ADR 0004](docs/adr/0004-hosting-cloud-run.md).
 
-The container image (`Dockerfile`: multi-stage, digest-pinned bases, non-root) serves REST and
-MCP on `$PORT`. The minimum configuration is `AIMART_PAY_TO_EVM` and/or `AIMART_PAY_TO_SVM`
-(receive addresses), `AIMART_PUBLIC_BASE_URL`, and `AIMART_SIGNING_KEY_MLDSA` from Secret
-Manager. Deployment steps, the spend cap and the free-tier budget are covered in
-[deploy/README.md](deploy/README.md), with the rationale in
-[ADR 0004](docs/adr/0004-hosting-cloud-run.md).
+To run it yourself, the container image (`Dockerfile`: multi-stage, digest-pinned bases,
+non-root) serves REST and MCP on `$PORT`. The minimum configuration is `AIMART_PAY_TO_EVM`
+and/or `AIMART_PAY_TO_SVM` (receive addresses), `AIMART_PUBLIC_BASE_URL`, and
+`AIMART_SIGNING_KEY_MLDSA` from your host's secret store. Each release publishes the image as
+`ghcr.io/balogvn/aimart-parquet`, tagged with its version:
 
 ```bash
+docker run --rm -p 8080:8080 -e AIMART_PAY_TO_EVM=0xYourReceiveAddress ghcr.io/balogvn/aimart-parquet:0.1
+# or build it from a checkout:
 make docker
 docker run --rm -p 8080:8080 -e AIMART_PAY_TO_EVM=0xYourReceiveAddress aimart-parquet:dev
 ```
-
-The image will be published as `ghcr.io/balogvn/aimart-parquet` once release automation exists.
 
 ## Development
 

@@ -31,7 +31,7 @@
   "remotes": [
     {
       "type": "streamable-http",
-      "url": "https://YOUR-SERVICE.run.app/mcp"
+      "url": "https://balogvn--aimart-parquet.us-east.modal.run/mcp"
     }
   ],
   "_meta": {
@@ -44,13 +44,8 @@
         "transport": "MCP tools/call _meta['x402/payment']; REST PAYMENT-REQUIRED / PAYMENT-SIGNATURE headers",
         "charged": "only on success (MCP isError=false, HTTP status < 400)",
         "networks": {
-          "testnet": [
-            "eip155:84532",
-            "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"
-          ],
           "mainnet": [
-            "eip155:8453",
-            "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+            "eip155:8453"
           ]
         },
         "prices": {
@@ -66,7 +61,7 @@
           "verify_provenance",
           "local stdio mode (uvx aimart-parquet mcp)"
         ],
-        "notes": "Hosted artifacts are signed with ML-DSA-65 (FIPS 204). Optional quantum tools (simulator-based, always with a classical baseline) are off unless an operator enables them."
+        "notes": "The hosted remote takes USDC on Base mainnet (eip155:8453). Hosted artifacts are signed with ML-DSA-65 (FIPS 204). Optional quantum tools (simulator-based, always with a classical baseline) are off unless an operator enables them."
       }
     }
   }

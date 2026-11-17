@@ -23,6 +23,7 @@ from x402.http.clients.httpx import PaymentError
 
 import aimart_testkit as kit
 from aimart_parquet.config import Settings
+from aimart_parquet.payments.bazaar import SAMPLES
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -76,11 +77,42 @@ async def live_quote(h: kit.AppHarness, path: str) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------------ README and payments.md samples
-async def test_readme_decoded_402_is_what_convert_sends(paid_app: kit.AppHarness) -> None:
-    sample = json_block_after("README.md", '"$URL/v1/convert"')["accepts"][0]
-    live = await live_quote(paid_app, "/v1/convert")
+HOSTED = "https://balogvn--aimart-parquet.us-east.modal.run"
+
+
+async def test_readme_decoded_402_is_what_the_hosted_service_sends(
+    make_settings: Callable[..., Settings],
+) -> None:
+    """The README's examples call the hosted service, which is on Base mainnet since 2026-11-15.
+    Until then the sample was a testnet quote under a placeholder address, beside a note that
+    said the service was not deployed: what every directory showed a visitor."""
+    block = json_block_after("README.md", '"$URL/v1/convert"')
+    sample = block["accepts"][0]
+    hosted = make_settings(network_mode="mainnet", facilitator_urls=None, public_base_url=HOSTED)
+    facilitator = kit.FakeFacilitator(networks=(kit.BASE_MAINNET,))
+    async with kit.running_app(hosted, facilitator=facilitator) as h:
+        quote = kit.payment_required(await h.http.post("/v1/convert", json={}))
+    live = quote["accepts"][0]
+    assert sample["network"] == kit.BASE_MAINNET
     for field in ("scheme", "network", "asset", "amount", "maxTimeoutSeconds", "extra"):
         assert sample[field] == live[field], field
+    assert block["resource"]["url"] == quote["resource"]["url"] == f"{HOSTED}/v1/convert"
+
+
+def test_readme_names_the_hosted_service_and_no_placeholder() -> None:
+    text = flat("README.md")
+    assert "YOUR-SERVICE" not in text
+    assert "not yet deployed" not in text
+    assert f"`{HOSTED}`" in text
+    assert f"claude mcp add --transport http aimart {HOSTED}/mcp" in text
+    # The Python sample pays where the hosted service is paid, with the cap the text promises.
+    assert f'URL = "{HOSTED}"' in text
+    assert 'payer.register("eip155:8453"' in text
+    assert "eip155:84532" in text  # still named, as the software's default (testnet)
+    # The samples it converts are the ones the catalog examples fetch: they exist (the replay
+    # test in test_bazaar_examples_are_real.py converts them), example.com/sales.csv never did.
+    assert "example.com/sales.csv" not in text
+    assert f"{SAMPLES}/sales.csv" in text
 
 
 async def test_payments_page_samples_quote_and_settle_the_same_amount(
