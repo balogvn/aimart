@@ -347,6 +347,14 @@ test suite.
   402 kept a `$0.01` amount after convert moved to `$0.02`; discovery summaries never mentioned
   PDFs or joins. Docs, samples and discovery text are interface: `tests/*/test_fix_docs_*.py`
   compare them with the wire and the code, so update both in one change.
+- **The release that reverted a PR.** PRs #31 and #32 were merged 16 seconds apart, and
+  release-please wrote the 0.1.2 release commit from `server.json` as it was before #32, plus
+  the version bump. Nobody reads a release PR line by line, so merging it silently reverted
+  #32 and the MCP Registry published 0.1.2 with the old x402 networks; the same race can undo a
+  dependency or security bump in `uv.lock`. `scripts/check_release_diff.py` now runs in
+  `release.yml` right after the release is created and fails the run, before anything is
+  published, unless the merge changed only version numbers in release-please's files and only
+  added to `CHANGELOG.md`. When it fails, the tag already exists: fix main and release again.
 - **Two callers of one script, one input short.** The synthetic smoke ran `smoke-flags.sh`
   without `AIMART_ENABLE_QUANTUM`, so it never required the quantum tools the deploy smoke did.
   A test now checks every workflow that calls it passes every input it reads.
