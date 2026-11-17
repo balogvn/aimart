@@ -180,7 +180,13 @@ async def test_the_reading_of_a_settle_answer_is_the_one_described(
         " `transactionHash`)" in PAYMENTS
     )
     assert (
-        "an answer that says neither is a settlement only if it names a transaction and no error;"
+        "unless something beside it says otherwise (an error, reason or message, a `status` such"
+        ' as "failed", `ok: false`)' in PAYMENTS
+    )
+    assert (
+        'set to anything else (null, "failed", -1) is not settled; an answer with no `success` is'
+        " a settlement only if it names a transaction id of the network's shape (0x and 64 hex"
+        " digits on Base, a base58 signature on Solana) and nothing that says otherwise;"
         " everything else, and every status that is not 2xx, is not settled" in PAYMENTS
     )
     assert (
@@ -192,6 +198,11 @@ async def test_the_reading_of_a_settle_answer_is_the_one_described(
         "neither_with_a_TX": (200, {"transactionHash": TX}, 200),
         "neither_with_a_TX_and_an_error": (200, {"transactionHash": TX, "error": "reverted"}, 402),
         "neither": (200, {"status": "ok"}, 402),
+        # Refusals in other words (review 2026-11-16, V1): each had unpaid work delivered.
+        "reverted_TX": (200, {"status": "reverted", "txHash": TX, "reason": "reverted"}, 402),
+        "success_null_TX": (200, {"success": None, "transaction": TX, "message": "reverted"}, 402),
+        "ok_false_TX": (200, {"ok": False, "transaction": TX, "message": "no funds"}, 402),
+        "true_and_failed_TX": (201, {"success": True, "transaction": TX, "status": "failed"}, 402),
         "not_2xx": (500, {"success": True, "transaction": TX, "network": N}, 402),
     }
     for name, (status, body, expected) in outcomes.items():

@@ -107,10 +107,13 @@ says nothing: `PAYMENT-REQUIRED` (`error`) or `PAYMENT-RESPONSE` (`errorReason`)
 What counts as "settled" is the service's own reading of the facilitator's answer
 (`payments/settle.py`), not the SDK's strict one, because by then the payer's money may have
 moved: any 2xx answer whose JSON says `"success": true` is a settlement however the rest is
-worded (the amount as a number, no `network`, the hash under `txHash` or `transactionHash`);
-`"success": false` is a refusal; an answer that says neither is a settlement only if it names
-a transaction and no error; everything else, and every status that is not 2xx, is not
-settled. Each answer read outside the SDK's schema is one log line (`aimart.payments.settle`:
+worded (the amount as a number, no `network`, the hash under `txHash` or `transactionHash`),
+unless something beside it says otherwise (an error, reason or message, a `status` such as
+"failed", `ok: false`); `"success": false` is a refusal; `success` set to anything else (null,
+"failed", -1) is not settled; an answer with no `success` is a settlement only if it names a
+transaction id of the network's shape (0x and 64 hex digits on Base, a base58 signature on
+Solana) and nothing that says otherwise; everything else, and every status that is not 2xx, is
+not settled. Each answer read outside the SDK's schema is one log line (`aimart.payments.settle`:
 the facilitator's URL, the HTTP status, the transaction), which is what the owner reconciles
 against the chain. A refusal that names a transaction (a transfer submitted and perhaps still
 pending) is logged the same way, however it is worded: it stays a refusal, and the transfer

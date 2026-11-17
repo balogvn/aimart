@@ -608,9 +608,18 @@ each test's docstring has the incident.
   left the payer charged, with a 402 or `isError` and the output deleted (found in review on
   2026-11-16, not on mainnet: xpay's answers are schema-valid). `payments/settle.py` now reads
   the answer for every facilitator: any 2xx saying `"success": true` is a settlement, read
-  leniently; `"success": false` is a refusal; an answer that says neither is a settlement only
-  if it names a transaction id and no error, so that no facilitator can have work delivered
-  by answering vaguely; a non-2xx is not settled; nothing raises after a 2xx. Each answer read
+  leniently, unless something beside it says otherwise (an error, reason or message key, a
+  `status`/`state` that is not a settled word, `ok`/`settled`/`isValid` not true);
+  `"success": false` is a refusal; `success` present as anything no reader takes for a
+  boolean (null, "failed", -1, an object) is unreadable, not settled; an answer with no
+  `success` is a settlement only if it names a transaction id of the quoted network's shape
+  (0x and 64 hex digits, not zero, on eip155; base58 on solana) and nothing that says
+  otherwise, a `message` included, so that no facilitator can have work delivered by
+  answering vaguely (review 2026-11-16, V1: `{"status": "reverted", "txHash": ...}`,
+  `{"ok": false, ...}` and `{"transaction": "pending"}` had delivered unpaid work); a schema
+  200 with `"success": true` beside an `errorReason` is still a settlement, as in the SDK, but
+  logged at WARNING and its receipt drops the error; a non-2xx is not settled; nothing raises
+  after a 2xx (the facilitator's amount is compared as digits, never `int()`). Each answer read
   outside the SDK's schema is one `aimart.payments.settle` line (URL, status, transaction;
   never the body), WARNING when read leniently and ERROR when unreadable: reconcile those
   against the chain. A successful 'exact' receipt names the quoted amount whatever the
@@ -671,6 +680,17 @@ that takes longer than `facilitator_timeout_s` (20 s) to answer `/settle` leaves
 unknown: the call is answered as failed and unsettled, yet the transfer may still complete
 (the bound keeps the call inside Modal's 150 s, where the alternative was a cut connection
 with the same doubt); read `duration_ms` in the access log at the first paid calls.
+The lenient settle reading recognises refusals by key names and words (`payments/settle.py`:
+`FAULT_WORDS`, `STATE_KEYS`, `FLAG_KEYS`, `WORDING_KEYS`); a refusal worded with none of them
+beside a well-formed transaction id and no `success` (say `{"outcome": "rejected",
+"txHash": "0x…"}`) would still be read as a settlement, so capture a real answer before
+trusting a new facilitator. The access log's `payment_settled` reads only the REST
+`PAYMENT-RESPONSE` header, so every paid MCP call is logged `/mcp 200 payment_settled=false`,
+settled or not (review 2026-11-16, low): count MCP revenue from the `payment settled` line,
+not the access log. A settled answer whose `extensions` nest about 300 levels deep makes the
+MCP response fail (ExceptionGroup at the client) after the settlement while REST delivers
+(review 2026-11-16, low; the SDK's own client does the same): the payer is charged and gets
+`isError`; no real facilitator is known to send that.
 (The 422 for a time past 9999 in preview and query and the 413 for
 `read_csv` running out of memory are tested in `integration/test_final_isolate_gaps.py`;
 DuckDB's `memory_limit` no longer sits above the job cap, `unit/test_fix_csv_memory.py`.)
