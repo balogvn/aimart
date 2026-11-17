@@ -160,6 +160,15 @@ them. Neither xpay nor Primer publishes a catalog today (see "Why settling payme
 list us"); Dexter's and PayAI's are at `/discovery/resources`, and CDP's Bazaar lists only
 resources settled through CDP.
 
+### 6a. Apify Store (pay-per-event, for callers who pay by card)
+
+The same converter is also sold as an Apify Actor, from the repository's `apify/` folder. Apify
+users and agents (through Apify's MCP server, mcp.apify.com) run it and pay through their Apify
+account per event: `file-converted` and `query-run`, priced like the hosted service. Apify keeps
+20% and deducts platform usage from the payout. It reaches callers who pay by card instead of
+USDC. The owner creates, prices and publishes it in Apify Console: step by step in
+[apify.md](apify.md).
+
 ### 7. The free local funnel
 
 `uvx aimart-parquet mcp` is free and open source, and it is listed in the registry next to the
