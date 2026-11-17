@@ -18,10 +18,27 @@ each operator's own pages (sources and the probes behind them:
 | Heurist | Base | free | n/a | The Base default until 2026-11-15; its `/supported` answered 502 from 11-12 on. Dropped. |
 | Mogami | Base | free | n/a | Lists x402 v1 only; this service speaks v2. |
 | PayAI | Base, Solana | 1,000 free credits per `payTo` ($1), then **$0.00166** per Base settlement (1.66 credits), $0.00099 on Solana | | Out of credits, `/settle` answers 403: every paid call fails after its work until credits are bought. |
-| CDP (Coinbase) | Base, Solana | 1,000 free per **month**, then **$0.001** per transaction | | needs a CDP API key; the only route into the CDP Bazaar |
+| **CDP (Coinbase)** | Base, Solana (and other chains) | first 1,000 settlements a **month** free, then **$0.001** each; it pays the gas | none published | Needs a CDP Secret API key; the only route into the CDP Bazaar and agentic.market. **First for Base on mainnet when the owner sets a key** (`AIMART_CDP_API_KEY_ID`/`_SECRET`); Solana stays with Dexter. Fee as published by CDP (last checked 2026-11-17, via search: its documentation site did not resolve from the build machine). |
 
 The defaults (`payments/__init__.py`, `DEFAULT_FACILITATORS`) are therefore xpay, Primer,
-then Dexter on mainnet: none needs a key, and none takes a fee from a settlement.
+then Dexter on mainnet: none needs a key, and none takes a fee from a settlement. With a CDP
+key, CDP settles Base before them.
+
+### What CDP's fee means for each price
+
+CDP's fee is per settlement, the same whatever the price, so it weighs most on the cheapest
+calls. Within the first 1,000 Base settlements a month it is nothing; past them, per call:
+
+| operation | price | CDP fee | net per call | fee as a share of the price |
+|---|---:|---:|---:|---:|
+| `inspect`, `preview` | $0.002 | $0.001 | +$0.001 | 50% |
+| `query` | $0.005 | $0.001 | +$0.004 | 20% |
+| `convert` | $0.02 | $0.001 | +$0.019 | 5% |
+
+Every price stays profitable, which is what the $0.002 floor was set for (below). At most the
+fee costs $0.001 a call: 10,000 Base sales in a month would pay $9 (9,000 past the free
+1,000). If the listing brings no buyers, delete the key: the next deploy settles through xpay
+again, at no fee.
 
 ## Why the floor is $0.002
 

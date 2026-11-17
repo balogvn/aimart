@@ -40,9 +40,21 @@ through that facilitator. The service settles through xpay, then Primer, and nei
 a catalog (`/discovery/resources` answers 404 on both). The indexes that crawl "the x402
 ecosystem" mostly read those catalogs (Agent402 reads CDP, PayAI, GoPlausible and Solvador), so
 real payments did not put the service in them: the origin is registered with each index
-instead (section 3). CDP's facilitator would list us automatically, but it needs a CDP API key
-and charges $0.001 per settlement after the first 1,000 a month, half the margin of a $0.002
-call ([economics.md](economics.md)), so it is not in the defaults.
+instead (section 3).
+
+CDP's facilitator lists automatically, and the service can now use it: with a CDP Secret API
+key in the `production` environment (`AIMART_CDP_API_KEY_ID`, `AIMART_CDP_API_KEY_SECRET`),
+CDP settles Base first, ahead of xpay and Primer ([payments.md](payments.md)). It is not a
+default because it needs that key, which only the owner can create, and charges $0.001 per
+settlement after the first 1,000 a month, half the margin of a $0.002 call
+([economics.md](economics.md)). What lists the service, per CDP's documentation and the x402
+Bazaar spec: a payment for a route that **settles through CDP**, whose payload echoes the
+`bazaar` extension of that route's 402. Every paid REST route here declares one, and the x402
+SDKs' clients echo it. Each route is listed after its own first such payment, asynchronously
+(CDP says within about 15 minutes); a route nobody paid for through CDP is not listed, and
+settlements through xpay or Primer do not count. agentic.market shows what the Bazaar holds.
+The steps, and how to check the listing, are in
+[deploy/README.md](../deploy/README.md), "List the service in the CDP Bazaar".
 
 ## What we serve (free)
 
@@ -159,6 +171,22 @@ is why the schemas in `payments/bazaar.py` are self-contained (no `$ref`) and a 
 them. Neither xpay nor Primer publishes a catalog today (see "Why settling payments does not
 list us"); Dexter's and PayAI's are at `/discovery/resources`, and CDP's Bazaar lists only
 resources settled through CDP.
+
+**CDP Bazaar and agentic.market.** Set up by the owner with a CDP key
+([deploy/README.md](../deploy/README.md), "List the service in the CDP Bazaar"); status: not
+listed until the owner adds the key and one paid call settles through CDP. CDP's discovery
+endpoints are public (no key): `GET
+https://api.cdp.coinbase.com/platform/v2/x402/discovery/merchant?payTo=<payee>` lists what
+CDP holds for our payee, `.../discovery/resources` and `.../discovery/search?query=parquet`
+the whole catalog. A settle answer may carry an `EXTENSION-RESPONSES` header whose `bazaar`
+entry says `success`, `processing` or `rejected` (with a reason); its absence says nothing
+(x402 Bazaar spec). CDP also has a public `POST .../v2/x402/validate` that probes a route's
+402 for a usable `bazaar` declaration without paying or listing anything (cdp-sdk 1.53.0,
+`validate_x402_resource`); worth a run on `/v1/convert` before the first paid call. Reported
+by other sellers on GitHub, not seen here: a resource whose first CDP settlement carried a
+malformed declaration may not be re-listed by later clean ones, and a changed price can stay
+stale in the merchant list; the declarations here are validated by a test before any
+release (`integration/test_bazaar_examples_are_real.py`).
 
 ### 7. The free local funnel
 

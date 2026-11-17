@@ -162,6 +162,36 @@ default until 2026-11-15: its `/supported` answered 502 for days. The fees and m
 in [economics.md](economics.md), and the choice and the survey behind it are recorded in
 [ADR 0003](adr/0003-facilitators-and-price-floors.md).
 
+**With a CDP key (optional).** When `AIMART_CDP_API_KEY_ID` and `AIMART_CDP_API_KEY_SECRET`
+are both set and the mode is mainnet, Coinbase's CDP facilitator is put before the defaults:
+
+| mode | facilitators | networks |
+|---|---|---|
+| mainnet, with a CDP key | `https://api.cdp.coinbase.com/platform/v2/x402`, then the three defaults | Base `eip155:8453` (CDP; xpay, then Primer, when CDP is skipped) and Solana (Dexter) |
+
+CDP is the one facilitator whose settlements list the service in a catalog other agents
+search: the CDP Bazaar, which agentic.market shows (see [discovery.md](discovery.md)). It
+charges $0.001 per settlement after 1,000 a month ([economics.md](economics.md)). Only Base
+is taken from what its `/supported` lists: Solana stays with Dexter, which is free. Without
+the key, or on testnet, nothing changes; an explicit `AIMART_FACILITATOR_URLS` is the whole
+list, and CDP gets the key wherever that list names it (`payments/cdp.py`).
+
+CDP's `/verify`, `/settle` and `/supported` need the key (its Bazaar lists do not): each request
+carries `Authorization: Bearer <JWT>`, a JWT signed with the key (EdDSA for an Ed25519 key,
+ES256 for ECDSA), valid 120 s and bound to that one request (`uris`: `POST
+api.cdp.coinbase.com/platform/v2/x402/settle`), as Coinbase's own SDKs make it. The settle
+answer is read by the same lenient reading as every facilitator's (`payments/settle.py`). The
+key is never logged, and a key CDP refuses costs nothing but the listing:
+
+- At start (or in a retry round), a 401 or 403 to `GET /supported` skips CDP like any
+  facilitator that fails it, and Base goes to xpay. A key that cannot be read leaves CDP out
+  with `CDP facilitator not used: ...`, which says what is wrong with it, never what it is.
+- Any 401 or 403 from CDP is logged at ERROR, `facilitator refused this service's API key`,
+  naming the facilitator and the endpoint. A refused verify or settle is that call's unpaid
+  failure, as for any facilitator.
+- The deploy's selftest (`deploy/modal_app.py`) asks CDP's `GET /supported` with the key,
+  which moves no money, and fails the deploy on a 401 or 403.
+
 **What a payer on Base needs.** USDC on Base for the price, and nothing else: no ETH and no
 approval. The client signs one EIP-3009 `TransferWithAuthorization` (EIP-712, domain
 `USD Coin` version `2` on chain 8453, the USDC contract) for the quoted amount to the quoted
@@ -226,7 +256,7 @@ fee-versus-margin arithmetic in [economics.md](economics.md). Do not set
 | `AIMART_NETWORK_MODE` | `testnet` | `mainnet` |
 | Base | Sepolia `eip155:84532`, USDC `0x036CbD53842c5426634e7929541eC2318f3dCF7e` | `eip155:8453`, USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
 | Solana | devnet `solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1` | `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` |
-| facilitators | x402.org | xpay, Primer, Dexter |
+| facilitators | x402.org | xpay, Primer, Dexter (CDP first for Base with a CDP key) |
 | money | test USDC from a faucet | **real** |
 
 To switch, an operator sets `AIMART_NETWORK_MODE=mainnet` plus mainnet `AIMART_PAY_TO_EVM`
