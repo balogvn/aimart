@@ -1,0 +1,12 @@
+{
+    "actorKeyValueStoreSchemaVersion": 1,
+    "title": "Converted Parquet files",
+    "collections": {
+        "parquet": {
+            "title": "Parquet files",
+            "description": "One zstd-compressed Parquet file per converted input, named parquet-NNN-<name>.parquet where NNN is the input's position in the run.",
+            "keyPrefix": "parquet-",
+            "contentTypes": ["application/vnd.apache.parquet"]
+        }
+    }
+}

@@ -1,0 +1,3 @@
+# `apify run` keeps a local run's input, dataset and key-value store here.
+storage/
+.venv/

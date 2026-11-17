@@ -1,0 +1,74 @@
+{
+    "title": "Files to convert, conversion options and an optional SQL query",
+    "description": "Give each file as a public link (urls) or as base64 bytes (files). Each file is converted to typed Parquet; one dataset item per file reports its Parquet link, schema and any error. Charged per file converted and per query run; failures are never charged.",
+    "type": "object",
+    "schemaVersion": 1,
+    "additionalProperties": false,
+    "properties": {
+        "urls": {
+            "title": "File links",
+            "type": "array",
+            "description": "Public http(s) links to the files to convert, one per entry (up to 20). Formats: CSV/TSV, JSON/NDJSON, Excel (xlsx, xls, ods), SPSS (sav, zsav, por), Stata (dta), SAS (sas7bdat, xpt), Parquet and tables in digital (not scanned) PDFs, optionally gzip, bz2 or zip compressed; the format is detected from the bytes. Each file may be up to 50 MB. Links must be reachable without signing in (a pre-signed S3 or Google Cloud Storage link works); private and local network addresses are refused.",
+            "editor": "stringList",
+            "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+            },
+            "maxItems": 20,
+            "prefill": ["https://raw.githubusercontent.com/balogvn/aimart/main/docs/examples/sales.csv"],
+            "example": ["https://raw.githubusercontent.com/balogvn/aimart/main/docs/examples/sales.csv"]
+        },
+        "files": {
+            "title": "Inline files (base64)",
+            "type": "array",
+            "description": "Files sent inline instead of by link, for small files (a few MB): each entry is {\"fileName\": \"data.csv\", \"contentBase64\": \"<the file's bytes in base64>\"}. fileName is optional; it names the output and helps detection when the bytes are ambiguous. Up to 10 entries.",
+            "editor": "json",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "fileName": {
+                        "title": "File name",
+                        "type": "string",
+                        "description": "The original file name, e.g. survey.sav.",
+                        "maxLength": 255
+                    },
+                    "contentBase64": {
+                        "title": "Content (base64)",
+                        "type": "string",
+                        "description": "The file's bytes, base64-encoded (standard or URL-safe alphabet; a data: URL prefix is accepted).",
+                        "minLength": 1
+                    }
+                },
+                "required": ["contentBase64"],
+                "additionalProperties": false
+            },
+            "maxItems": 10
+        },
+        "options": {
+            "title": "Conversion options",
+            "type": "object",
+            "description": "Optional, applied to every file; leave {} to auto-detect everything. Keys: format (force csv, tsv, json, ndjson, xlsx, xls, ods, sav, zsav, por, dta, sas7bdat, xpt, parquet or pdf), sheet (Excel sheet name or 0-based index), delimiter (one character), header (true/false), encoding (e.g. cp1252, latin-1), null_values (extra null tokens), date_order (auto, dmy, mdy or ymd), infer_types (false keeps text), normalize_column_names, json_records_path (e.g. data.items), flatten_nested, value_labels (metadata, apply or both), pdf_pages (e.g. 1-3,7), pdf_table, sort_by (columns), expected_schema with strict, compression (zstd, snappy, gzip or none), row_group_size. An unknown key or invalid value fails every file, unpaid.",
+            "editor": "json",
+            "default": {},
+            "example": {"sort_by": ["order_date"]}
+        },
+        "sql": {
+            "title": "SQL query (optional)",
+            "type": "string",
+            "description": "One read-only DuckDB SELECT run over each converted file, which is the table data, e.g. SELECT region, sum(units * unit_price) AS revenue FROM data GROUP BY region ORDER BY revenue DESC. CTEs, DESCRIBE and SUMMARIZE work; anything that writes is refused. Leave empty to only convert. Charged once per file it runs on; a failed query is not charged (the conversion still is).",
+            "editor": "textarea",
+            "maxLength": 20000,
+            "example": "SELECT region, sum(units * unit_price) AS revenue FROM data GROUP BY region ORDER BY revenue DESC"
+        },
+        "queryLimit": {
+            "title": "Query row limit",
+            "type": "integer",
+            "description": "The most rows the query returns per file (1 to 1000). The item's query.truncated is true when more rows matched.",
+            "editor": "number",
+            "minimum": 1,
+            "maximum": 1000,
+            "default": 100
+        }
+    }
+}
