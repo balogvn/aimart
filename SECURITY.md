@@ -135,8 +135,10 @@ interrupts DuckDB at the deadline, and file paths are scrubbed from error messag
 ### Artifacts and downloads
 
 Artifacts have random 144-bit IDs (`secrets.token_urlsafe(18)`) and become unreachable after
-`AIMART_ARTIFACT_TTL_S` (1 hour). A sweep that runs at most once a minute while the service has
-traffic then deletes them, normally within minutes. A size budget makes room before each
+`AIMART_ARTIFACT_TTL_S` (1 hour). A sweep that runs when the service starts and at most once a
+minute while it runs then deletes them: within minutes while requests keep the service running,
+at the next start on one that stops it when idle (the hosted service on Modal, see
+[docs/privacy.md](docs/privacy.md#when-outputs-are-deleted)). A size budget makes room before each
 output is stored, but never evicts an output whose payment is still settling, a local one
 that has not expired, or one a running call reads; an output that cannot fit is
 refused (413, or 503 `busy`), unpaid. Outputs of a paid call that does not settle are deleted

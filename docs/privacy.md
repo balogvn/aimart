@@ -7,7 +7,7 @@ and in `GET /llms.txt`, generated from the deployment's settings.
 | data | what happens | where in the code |
 |---|---|---|
 | **Inputs** (URL downloads, base64 content, uploads) | Written to a per-call work directory, created once the call holds a job slot and deleted when the call finishes, whether it succeeds or fails. An upload is held by the web framework while the request is read (in memory, or past 1 MiB in an unnamed temporary file), then copied into that directory. The isolated job's own temporary files (a query's links to its inputs, spill files) are in a per-job directory that is deleted when the job ends, even when it was killed at its deadline or memory cap. | `Service._job()`, `Service._workdir()` and the `finally: shutil.rmtree(...)` in every operation in `src/aimart_parquet/service.py`, where `Service.convert_upload` copies uploads; `run_isolated` in `engine/isolate.py` |
-| **Outputs** (converted Parquet, quantum outputs) | Kept as an artifact so you can query or download it. At the TTL (`AIMART_ARTIFACT_TTL_S`, default 3600 s = 60 minutes) it becomes **unreachable**: every lookup checks the expiry, and download links (HMAC-signed, or Cloud Storage V4 signed URLs) expire with it. Deletion follows, normally within minutes (see below). An output of a paid call that is not settled (the call failed, settlement failed, or the client went away) is deleted at once. | the TTL checks, `maybe_sweep` and the bucket-listing sweep in `artifacts.py`; `_sweeper` in `api/app.py`; `discard_withheld`, called from `payments/__init__.py` and `payments/mcp_gate.py`; `deploy/setup-gcp.sh` lifecycle rule |
+| **Outputs** (converted Parquet, quantum outputs) | Kept as an artifact so you can query or download it. At the TTL (`AIMART_ARTIFACT_TTL_S`, default 3600 s = 60 minutes) it becomes **unreachable**: every lookup checks the expiry, and download links (HMAC-signed, or Cloud Storage V4 signed URLs) expire with it. Deletion follows later (see below). An output of a paid call that is not settled (the call failed, settlement failed, or the client went away) is deleted at once. | the TTL checks, `maybe_sweep` and the bucket-listing sweep in `artifacts.py`; `_sweeper` in `api/app.py`; `discard_withheld`, called from `payments/__init__.py` and `payments/mcp_gate.py`; `deploy/setup-gcp.sh` lifecycle rule |
 | **Download links** | HMAC-signed (with Cloud Storage, V4 signed URLs) and expire with the artifact. | `artifacts.py` (`sign`, `verify`; `GcsArtifactStore` for signed URLs) |
 | **Logs** | Request method, path, status and duration. Demand signals record only a rejected file's *extension* and the text an agent chooses to send via `request_capability`. File contents are never logged. When a job fails with an unexpected error (a bug, not a refusal), the log records the error's type and where in the code it was raised (file, line, function), never its text, which could quote a column name or value; the caller sees only the type. | `api/middleware.py` (`AccessLogMiddleware`), `demand.py`, `run_isolated` and `_where` in `engine/isolate.py` |
 | **Training** | Never. The service runs no model on your data. | — |
@@ -16,16 +16,19 @@ and in `GET /llms.txt`, generated from the deployment's settings.
 
 ## When outputs are deleted
 
-- **Normally, within minutes of the TTL.** A cleanup sweep runs when the service starts, and
-  then at most once a minute while it has traffic. It deletes expired artifacts from local disk
-  and, on Google Cloud Storage deployments, their stored copies.
+- **While the service runs, within about a minute of the TTL.** A cleanup sweep runs when the
+  service starts, and then at most once a minute while it runs. It deletes expired artifacts
+  from local disk and, on Google Cloud Storage deployments, their stored copies.
 - **The hosted service** (on Modal) stops when it has had no request for a minute, and keeps
   outputs on a storage volume that outlives the stopped instance, so that an `artifact_id` and
   its download link work for their full 60 minutes. An output that expires while the service is
   stopped stays on that volume, unreachable, until the service next starts: the first thing a
-  starting instance does is delete what has expired. Any request starts it, and a scheduled
-  check (`.github/workflows/synthetic.yml`) does so every six hours, so that is the usual upper
-  bound. GitHub can delay or skip a scheduled run, so it is not a guarantee.
+  starting instance does is delete what has expired. Any request starts it, and so does a
+  scheduled check (`.github/workflows/synthetic.yml`). That check is scheduled four times a day,
+  but GitHub starts it less often: from 11 to 16 November 2026 it ran about twice a day, usually
+  11 to 13 hours apart and at most 16. So an output that expires on a quiet day is normally
+  deleted within a day. GitHub can delay or skip a scheduled run, and turns schedules off in a
+  repository with no activity for 60 days, so this is not a guarantee.
 - **Local disk** on Cloud Run is the instance's memory (`/tmp`), wiped when the instance stops.
 - **Worst case, about a day** (Cloud Storage only). A copy whose local record was lost when an
   instance restarted is found by a sweep of the bucket listing (at most every 6 hours, while the

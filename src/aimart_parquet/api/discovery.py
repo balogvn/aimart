@@ -101,13 +101,15 @@ def retention_policy(settings: Settings) -> dict[str, Any]:
     TTL makes an artifact unreachable; deletion is a later sweep, run when the service starts
     and from the request path at most once a minute (and over the bucket listing at most every
     6 h), with the bucket's 1-day lifecycle rule as the last resort. "Deleted at 60 minutes" was
-    promised once and was false.
+    promised once and was false, and so was "normally within minutes after that" on a host that
+    stops when idle (Modal, 60 s after the last request), where it is the next start.
     """
     minutes = settings.artifact_ttl_s // 60
     outputs = (
-        f"converted files become unreachable {minutes} minutes after creation and are normally "
-        "deleted within minutes after that (cleanup runs when the service starts and while it "
-        "has traffic)"
+        f"converted files become unreachable {minutes} minutes after creation and are deleted "
+        "after that by a cleanup that runs when the service starts and once a minute while it "
+        "runs; a host that stops the service when idle (the hosted one does) deletes a file that "
+        "expired meanwhile when it next starts, which can be hours later"
     )
     if settings.gcs_bucket:
         outputs += (

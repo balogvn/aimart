@@ -642,6 +642,12 @@ with the same doubt); read `duration_ms` in the access log at the first paid cal
 (The 422 for a time past 9999 in preview and query and the 413 for
 `read_csv` running out of memory are tested in `integration/test_final_isolate_gaps.py`;
 DuckDB's `memory_limit` no longer sits above the job cap, `unit/test_fix_csv_memory.py`.)
+On the hosted service (Modal stops it 60 s after the last request) an output that expired while
+it was stopped stays on the Volume, unreachable, until the next start; only traffic and the
+synthetic check start it, and GitHub ran that 6-hourly cron about twice a day (gaps 4.4 to
+15.5 h, 11 to 16 November 2026), so on a quiet day an expired upload is stored 12 to 16 h and
+there is no hard bound (GitHub skips runs and turns schedules off after 60 inactive days).
+`retention_policy()` and `docs/privacy.md` say so rather than promise minutes or six hours.
 
 ## Agent tooling
 
