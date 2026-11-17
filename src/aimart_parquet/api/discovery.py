@@ -22,7 +22,10 @@ DESCRIPTION = (
     "Converts messy CSV, JSON, Excel, SPSS, Stata and SAS files, and tables in digital (not "
     "scanned) PDFs, into clean, typed, schema-validated, zstd-compressed Parquet — then "
     "inspects, previews and queries it with DuckDB SQL, including joins across converted files. "
-    "Built for AI agents: no signup, pay per call in USDC via x402."
+    "Built for AI agents: no signup, pay per call in USDC via x402. Predictable cost: a fixed "
+    "price per call, so a spend cap is exact, and a call that fails is not charged. Every paid "
+    "call returns a receipt naming its on-chain transaction, and hosted outputs carry a signed "
+    "(ML-DSA-65) provenance record."
 )
 
 # One line for indexes that show an API's purpose (OpenAPI info.x-guidance); /llms.txt has more.
