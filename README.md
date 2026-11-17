@@ -10,6 +10,12 @@ Parquet. You can then inspect the result (footer only), preview rows, and query 
 sandboxed, read-only DuckDB SQL, including joins across several files. Agents pay per call in
 USDC with [x402 v2](https://www.x402.org/). There is no signup and no API key.
 
+**Predictable for agents:** each operation has a fixed price, so an agent's spend cap is exact,
+and a call that fails is not charged. Every paid call returns a receipt naming its on-chain
+transaction (the `PAYMENT-RESPONSE` header, or `x402/payment-response` over MCP), and every file
+the hosted service produces carries a signed provenance record (ML-DSA-65) that proves it came
+unaltered from the service ([how to verify](#post-quantum-provenance)).
+
 **Live:** the hosted service is at `https://balogvn--aimart-parquet.us-east.modal.run` and takes
 USDC on Base mainnet. Its MCP endpoint is `https://balogvn--aimart-parquet.us-east.modal.run/mcp`.
 Prices, limits and data handling, as that service applies them, are at
