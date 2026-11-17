@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.1.2](https://github.com/balogvn/aimart/compare/v0.1.1...v0.1.2) (2026-11-17)
+
+
+### Bug fixes
+
+* **api:** log payment_settled only for a settlement that succeeded ([144f6ca](https://github.com/balogvn/aimart/commit/144f6ca49c41f6897c7cc423e2496c40373bda8e))
+* **deps:** Bump the runtime group across 1 directory with 7 updates ([ad81faa](https://github.com/balogvn/aimart/commit/ad81faa90d6e8200736fc96de7144a25bc64a547))
+* **discovery:** make what catalogs and directories read about the live service true ([83bd64f](https://github.com/balogvn/aimart/commit/83bd64fd68806d69503b33fabe056f4a232e88c7))
+* **discovery:** what catalogs read about the service is true and works ([282da79](https://github.com/balogvn/aimart/commit/282da790bf8658912e0e3b2fc91e56bf15ff70d1))
+* **docker:** Bump astral-sh/uv from 0.13.0 to 0.13.7 in the docker-base-images group across 1 directory ([0407031](https://github.com/balogvn/aimart/commit/04070312af454bf587c28e59a8212293763cc28d))
+* **example:** say why a paid call was refused, in one line, whatever the 402 carries ([4f6ddc8](https://github.com/balogvn/aimart/commit/4f6ddc80e10e3602457412225bce72fe4618738b))
+* **mcp:** a failed settlement's receipt names the transaction the facilitator named ([1e2cdf5](https://github.com/balogvn/aimart/commit/1e2cdf5f18e9f946497e173a24cf89c8908366e4))
+* **payments:** an 'exact' receipt names the quoted amount, whatever the facilitator states ([63f8ada](https://github.com/balogvn/aimart/commit/63f8ada0d085fef4a68da44f79876701c839c833))
+* **payments:** believe a facilitator that settled, however it words its answer ([e1ffbb2](https://github.com/balogvn/aimart/commit/e1ffbb28ef1813fbf7c7ff60b9738393b11b0afe))
+* **payments:** log a refusal that names a transaction, and record what is not solved ([d7aa60a](https://github.com/balogvn/aimart/commit/d7aa60a4aea0ea199ae4db7042111fdbd567c9f5))
+* **payments:** read every facilitator's settle answer safely, and state exact receipts ([3000bee](https://github.com/balogvn/aimart/commit/3000bee19771f82f4f28567af2a9e8cbab744c4a))
+* **payments:** settle without a boolean success only on a real transaction id and no refusal ([5fa2974](https://github.com/balogvn/aimart/commit/5fa2974690a29a6df4eae940d2384bb0971c6536))
+* **privacy:** delete expired outputs when the service starts ([4c74ea3](https://github.com/balogvn/aimart/commit/4c74ea3b048da6d40248f7b33ec5d9f3de73235b))
+* **privacy:** retention text states when the hosted service deletes expired outputs ([2c51a7d](https://github.com/balogvn/aimart/commit/2c51a7d032b027cd862180fb6a22207fc33940ab))
+
+
+### Documentation
+
+* **discovery:** where the service is listed, and what each channel needs today ([cc141a7](https://github.com/balogvn/aimart/commit/cc141a7d2b2c06f2fc11c675df277efe9559679a))
+* **payments:** describe the 402 of a failed settlement, and where MCP puts its receipt ([355e68c](https://github.com/balogvn/aimart/commit/355e68cc7cbff7c9551a8e851154372f8fafaca5))
+* **payments:** describe the narrower settle reading, and record what it cannot see ([a64f3e7](https://github.com/balogvn/aimart/commit/a64f3e7767bdb934be2a09aaed72179c92ec980b))
+* the README describes the live service ([b5b3f71](https://github.com/balogvn/aimart/commit/b5b3f71035cb4dab493a831659f9ec9569dfdfaa))
+
 ## [0.1.1](https://github.com/balogvn/aimart/compare/v0.1.0...v0.1.1) (2026-11-15)
 
 
