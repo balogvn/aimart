@@ -14,8 +14,9 @@
 # Authentication: the production environment's secrets MODAL_TOKEN_ID and MODAL_TOKEN_SECRET (a
 # token from Modal's settings). Optional, in the same environment: AIMART_CDP_API_KEY_ID and
 # AIMART_CDP_API_KEY_SECRET, a CDP Secret API key that puts Coinbase's facilitator first for Base
-# (deploy/README.md, "List the service in the CDP Bazaar"); the selftest fails if CDP refuses it. Modal's Starter plan has no rollbacks: if a deploy fails its
-# checks, fix forward, or run this workflow on the previous release's tag.
+# (deploy/README.md, "List the service in the CDP Bazaar"); the selftest fails if CDP refuses it.
+# Modal's Starter plan has no rollbacks: if a deploy fails its checks, fix forward, or run this
+# workflow on the previous release's tag.
 
 name: Deploy to Modal
 
