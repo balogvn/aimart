@@ -169,7 +169,10 @@ def test_the_release_passes_the_modal_token_to_the_called_deploy() -> None:
     0.1.0 called the deploy with none, and it stopped at "no MODAL_TOKEN_ID" (checked on GitHub
     with a throwaway caller: by name and `secrets: inherit` both reach the job, nothing does not).
     """
-    names = {"MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"}
+    # Was the Modal token alone. The CDP key (optional) is a production secret too: a release
+    # that did not pass it would deploy without it and silently move Base off CDP, out of the
+    # Bazaar (test_modal_deploy_cdp.py has the rest of its plumbing).
+    names = {"MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", *_constants()["SECRET_KEYS"]}
     release = yaml.safe_load(RELEASE.read_text(encoding="utf-8"))["jobs"]["deploy"]
     assert release["secrets"] == {name: "${{ secrets." + name + " }}" for name in names}
     workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))

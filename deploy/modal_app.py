@@ -24,7 +24,10 @@ Shape, mirroring the Cloud Run service (deploy.yml):
   allowance, the operation, verify and settle) inside it, well inside the 300 s payment window;
   ``tests/unit/test_modal_deploy.py`` checks the arithmetic.
 * Secrets: ``aimart-parquet-keys`` (the ML-DSA signing seed and the download-link HMAC key, made
-  once by ``deploy/modal_keys.py``, never printed). Everything else is deploy-time configuration
+  once by ``deploy/modal_keys.py``, never printed), and the CDP API key when the deploying
+  environment has one (``SECRET_KEYS``: GitHub secrets, never variables, kept apart from the
+  configuration so nothing that shows the configuration can show them). Everything else is
+  deploy-time configuration
   from the deploying environment (GitHub variables in CI), passed whole on every deploy: a value
   changed by hand in Modal is replaced by the next deploy, as on Cloud Run.
 * The client address is Modal's own (``request.client``), so X-Forwarded-For is not trusted.
@@ -78,6 +81,11 @@ CONFIG_KEYS = (
     "AIMART_ARTIFACT_MAX_TOTAL_BYTES",
 )
 
+# Deploy-time secrets, from the production environment's secrets (deploy-modal.yml): the CDP
+# Secret API key that puts CDP's facilitator first for Base (payments/cdp.py). Both or neither;
+# modal-deploy.sh checks their shape without printing them.
+SECRET_KEYS = ("AIMART_CDP_API_KEY_ID", "AIMART_CDP_API_KEY_SECRET")
+
 DIST = Path(__file__).resolve().parent.parent / "dist" / "modal"
 
 
@@ -96,6 +104,13 @@ def _config() -> dict[str, str | None]:
     if not (values.get("AIMART_PAY_TO_EVM") or values.get("AIMART_PAY_TO_SVM")):
         raise RuntimeError("Set AIMART_PAY_TO_EVM (or AIMART_PAY_TO_SVM): the address that is paid")
     return values
+
+
+def _secrets() -> dict[str, str | None]:
+    """SECRET_KEYS' non-empty values, trimmed; never part of ``_config()``. Empty in a container."""
+    if not modal.is_local():
+        return {}
+    return {k: v for k in SECRET_KEYS if (v := os.environ.get(k, "").strip())}
 
 
 def _wheel() -> Path:
@@ -117,7 +132,11 @@ image = (
 )
 app = modal.App(APP_NAME, image=image)
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
-secrets = [modal.Secret.from_name(KEYS_SECRET), modal.Secret.from_dict(_config())]
+secrets = [
+    modal.Secret.from_name(KEYS_SECRET),
+    modal.Secret.from_dict(_config()),
+    modal.Secret.from_dict(_secrets()),
+]
 
 
 @app.function(
@@ -145,7 +164,11 @@ async def selftest() -> dict[str, Any]:
     """Convert and read back a small CSV through the isolated job child, then check the memory
     watchdog stops a job, in this image on Modal's hardware. The deploy runs it before the smoke
     test: job isolation (a forkserver child, RSS read from /proc) is what Modal's sandbox could
-    break, and no unpaid route exercises it. Uses a scratch store, never the Volume."""
+    break, and no unpaid route exercises it. Uses a scratch store, never the Volume.
+
+    With a CDP key configured, one authenticated GET /supported (no payment) fails the deploy
+    when CDP refuses the key: in production a refused key only moves Base to xpay, and nothing
+    else would show that the listing it was set up for stopped."""
     import base64  # noqa: PLC0415
     import tempfile  # noqa: PLC0415
 
@@ -153,6 +176,7 @@ async def selftest() -> dict[str, Any]:
     from aimart_parquet.config import Settings  # noqa: PLC0415
     from aimart_parquet.engine.models import ConvertOptions  # noqa: PLC0415
     from aimart_parquet.errors import InputTooLarge  # noqa: PLC0415
+    from aimart_parquet.payments import cdp  # noqa: PLC0415
     from aimart_parquet.service import Service, SourceRef  # noqa: PLC0415
 
     def source(rows: int) -> SourceRef:
@@ -184,7 +208,11 @@ async def selftest() -> dict[str, Any]:
                 raise RuntimeError(f"the watchdog did not stop the job: {watchdog}") from exc
         else:
             raise RuntimeError("a 1 MB job memory cap did not stop the job")
-        return {"rows": inspected.rows, "watchdog": watchdog}
+        return {
+            "rows": inspected.rows,
+            "watchdog": watchdog,
+            "cdp": await cdp.check_key(settings),  # raises CdpKeyError on 401/403 or a bad key
+        }
 
     try:
         return await run()

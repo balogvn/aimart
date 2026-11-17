@@ -36,6 +36,7 @@ from x402.schemas.config import ResourceConfig
 from aimart_parquet.artifacts import discard_withheld, outputs_of
 from aimart_parquet.config import PAYMENT_WINDOW_S, SETTLE_MARGIN_S, NetworkMode, Settings
 from aimart_parquet.errors import AimartError
+from aimart_parquet.payments import cdp
 from aimart_parquet.payments.bazaar import EXAMPLES, example_output
 from aimart_parquet.payments.mcp_gate import (
     PaymentsUnavailable,
@@ -107,9 +108,17 @@ def carries_payment(request: Request) -> bool:
 
 
 def facilitator_urls(settings: Settings) -> list[str]:
+    """The facilitators, in order. CDP first when its key is configured on mainnet (cdp.py).
+
+    An explicit ``AIMART_FACILITATOR_URLS`` is the whole list, as it always was: CDP is in it
+    only where the operator put it, and gets the key there.
+    """
     if settings.facilitator_urls:
         return [u.strip() for u in settings.facilitator_urls.split(",") if u.strip()]
-    return list(DEFAULT_FACILITATORS[settings.network_mode])
+    defaults = list(DEFAULT_FACILITATORS[settings.network_mode])
+    if settings.network_mode is NetworkMode.MAINNET and cdp.credentials(settings) is not None:
+        return [cdp.CDP_FACILITATOR_URL, *defaults]
+    return defaults
 
 
 class ClientDisconnected(AimartError):
@@ -316,10 +325,22 @@ class Payments:
     def from_settings(cls, settings: Settings) -> Payments:
         # Not the SDK's client as it is: that one reads a settle answer it cannot parse, or
         # a 201, as "not settled" after the money has moved (payments/settle.py).
-        clients: list[FacilitatorClient] = [
-            LenientSettleClient(FacilitatorConfig(url=url, timeout=settings.facilitator_timeout_s))
-            for url in facilitator_urls(settings)
-        ]
+        clients: list[FacilitatorClient] = []
+        if cdp.half_configured(settings):
+            log.error("CDP facilitator not used: set both %s, or neither", cdp.SETTINGS_NAMES)
+        for url in facilitator_urls(settings):
+            if url.rstrip("/") == cdp.CDP_FACILITATOR_URL:
+                # Its subclass: the same reading, plus the key. A key that cannot be read
+                # leaves CDP out (one error line), as a facilitator that fails /supported is.
+                client = cdp.cdp_client(settings)
+                if client is not None:
+                    clients.append(client)
+                continue
+            clients.append(
+                LenientSettleClient(
+                    FacilitatorConfig(url=url, timeout=settings.facilitator_timeout_s)
+                )
+            )
         return cls(settings, clients)
 
     def _new_server(self, facilitators: list[Any]) -> x402ResourceServer:

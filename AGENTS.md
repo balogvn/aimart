@@ -145,7 +145,10 @@ Module docstrings explain the why; read the one you are about to change.
   response whose client has disconnected a 499 `client_disconnected` before the SDK settles
   it), `settle.py` (`LenientSettleClient`, the facilitator client `from_settings` builds:
   the service's own reading of a `/settle` answer, and the only place that touches the SDK's
-  private helpers), `mcp_gate.py` (x402
+  private helpers), `cdp.py` (Coinbase's CDP facilitator, first for Base on mainnet when
+  `AIMART_CDP_API_KEY_ID`/`_SECRET` are set: the per-request JWT, `CdpFacilitatorClient`, a
+  `LenientSettleClient` that logs every 401/403 at ERROR, and `check_key`, the deploy
+  selftest's money-free key check; the key is never logged), `mcp_gate.py` (x402
   for MCP tool calls, same commit or delete), `bazaar.py` (catalog examples).
 - `mcp/server.py`: `build_mcp(...)`, the tools and their descriptions (the whole interface an
   agent sees). Remote: `convert_to_parquet` takes `url`/`content_base64`/`artifact_id`, every

@@ -94,7 +94,47 @@ else
   token_note="token from your modal profile"
 fi
 
+# The CDP Secret API key (optional; payments/cdp.py): both or neither, each of its shape. Like the
+# Modal token, never printed: only what is wrong with it, and lengths.
+cdp_id="${AIMART_CDP_API_KEY_ID:-}"
+cdp_secret="${AIMART_CDP_API_KEY_SECRET:-}"
+uuid_re='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+cdp_id_re="^(${uuid_re}|organizations/${uuid_re}/apiKeys/${uuid_re})\$"
+ed25519_re='^[A-Za-z0-9+/]{86}==$'
+if [ -n "$cdp_id" ] || [ -n "$cdp_secret" ]; then
+  { [ -n "$cdp_id" ] && [ -n "$cdp_secret" ]; } \
+    || fail "set both AIMART_CDP_API_KEY_ID and AIMART_CDP_API_KEY_SECRET (the CDP key's ID and its secret), or neither"
+  case "$cdp_id" in
+    *BEGIN* | *PRIVATE* | *==)
+      fail "AIMART_CDP_API_KEY_ID and AIMART_CDP_API_KEY_SECRET look swapped: the ID is the short one (a UUID), the secret the long one"
+      ;;
+  esac
+  [[ "$cdp_id" =~ $cdp_id_re ]] \
+    || fail "AIMART_CDP_API_KEY_ID does not look like a CDP API key ID: a UUID such as 1a2b3c4d-..., or organizations/<id>/apiKeys/<id>; it has ${#cdp_id} characters"
+  case "$cdp_secret" in
+    \{*)
+      fail "AIMART_CDP_API_KEY_SECRET holds the whole downloaded key file: paste only the value of its privateKey field, without the quotes"
+      ;;
+    *"-----BEGIN EC PRIVATE KEY-----"*"-----END EC PRIVATE KEY-----"* | *"-----BEGIN PRIVATE KEY-----"*"-----END PRIVATE KEY-----"*)
+      cdp_kind="ECDSA"
+      ;;
+    *)
+      [[ "$cdp_secret" =~ $ed25519_re ]] \
+        || fail "AIMART_CDP_API_KEY_SECRET does not look like a CDP secret: an Ed25519 secret is 88 characters ending in ==, an ECDSA one a block from -----BEGIN EC PRIVATE KEY----- to -----END EC PRIVATE KEY-----; it has ${#cdp_secret} characters"
+      cdp_kind="Ed25519"
+      ;;
+  esac
+  if [ "${AIMART_NETWORK_MODE:-testnet}" = "mainnet" ]; then
+    cdp_note="CDP key (${cdp_kind}) has the right shape: CDP settles Base first"
+  else
+    cdp_note="CDP key (${cdp_kind}) has the right shape, unused until AIMART_NETWORK_MODE is mainnet"
+  fi
+else
+  cdp_note="no CDP key: Base settles through xpay, then Primer"
+fi
+
 echo "modal-deploy: inputs look right: payee ${evm:-$svm}, URL ${url%/}, ${token_note}"
+echo "modal-deploy: ${cdp_note}"
 if [ "${1:-}" = "--check" ]; then exit 0; fi
 
 with_modal=(uv run --no-project --python 3.13 --with "modal==${MODAL_VERSION}")

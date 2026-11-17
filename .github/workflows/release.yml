@@ -346,9 +346,13 @@ jobs:
     # Named here so the called job, which runs in the production environment, receives that
     # environment's values: without this the first release deployed with an empty token. A job
     # that calls a workflow cannot itself name an environment.
+    # The CDP key too (optional): passed the same way, or a release would deploy without it and
+    # move Base back to xpay, out of the CDP Bazaar, with nothing failing.
     secrets:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      AIMART_CDP_API_KEY_ID: ${{ secrets.AIMART_CDP_API_KEY_ID }}
+      AIMART_CDP_API_KEY_SECRET: ${{ secrets.AIMART_CDP_API_KEY_SECRET }}
 
   deploy-cloudrun:
     name: deploy (Cloud Run)
