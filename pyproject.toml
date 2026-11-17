@@ -125,6 +125,8 @@ max-line-length = 120  # the formatter wraps code at 100; this leaves room for l
 "src/aimart_parquet/mcp/server.py" = ["S608", "N806", "E501"]
 "src/aimart_parquet/payments/bazaar.py" = ["E501"]
 "scripts/**" = ["T20", "S603", "S607"]
+# A recipe imports its wallet SDK inside the one function that uses it: tests run without it.
+"docs/recipes/*.py" = ["PLC0415"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "parents"

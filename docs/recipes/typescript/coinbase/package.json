@@ -1,0 +1,28 @@
+{
+  "name": "aimart-parquet-coinbase-recipe",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pay AImart Parquet per call (x402, USDC on Base) from a Coinbase CDP server wallet.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "tsx coinbase-cdp.ts",
+    "x402client": "tsx coinbase-x402client.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@coinbase/cdp-sdk": "1.60.0",
+    "@x402/core": "2.29.0",
+    "@x402/evm": "2.29.0",
+    "@x402/extensions": "2.29.0",
+    "@x402/fetch": "2.29.0",
+    "@x402/svm": "2.29.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  }
+}

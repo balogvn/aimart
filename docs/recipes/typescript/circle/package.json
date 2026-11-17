@@ -1,0 +1,25 @@
+{
+  "name": "aimart-parquet-circle-recipe",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pay AImart Parquet per call (x402, USDC on Base) from a Circle developer-controlled wallet.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "tsx circle.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@circle-fin/developer-controlled-wallets": "10.8.1",
+    "@x402/core": "2.29.0",
+    "@x402/evm": "2.29.0",
+    "@x402/fetch": "2.29.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  }
+}
