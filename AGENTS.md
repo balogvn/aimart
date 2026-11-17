@@ -355,6 +355,12 @@ test suite.
   `release.yml` right after the release is created and fails the run, before anything is
   published, unless the merge changed only version numbers in release-please's files and only
   added to `CHANGELOG.md`. When it fails, the tag already exists: fix main and release again.
+  Known gaps of the guard (review 2026-11-17, all low): in `pyproject.toml`, `server.json` and
+  `__init__.py` a non-version line passes if its only change is the old version string becoming
+  the new one (`uv.lock` is checked strictly); a file-mode change is missed when the same file's
+  content also changes; a line holding the version twice would be blocked wrongly (no managed
+  file has one today); a managed file turned into a symlink is reported with garbled lines,
+  though it still fails.
 - **Two callers of one script, one input short.** The synthetic smoke ran `smoke-flags.sh`
   without `AIMART_ENABLE_QUANTUM`, so it never required the quantum tools the deploy smoke did.
   A test now checks every workflow that calls it passes every input it reads.
