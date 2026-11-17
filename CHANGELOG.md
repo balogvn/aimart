@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.3](https://github.com/balogvn/aimart/compare/v0.1.2...v0.1.3) (2026-11-17)
+
+
+### Bug fixes
+
+* **registry:** restore server.json's mainnet-only networks and hosted remote ([546d9ae](https://github.com/balogvn/aimart/commit/546d9ae3866265d50dd21f76535647cb354a4d28))
+* **release:** restore server.json, and stop a release that changes more than versions ([0b0fef8](https://github.com/balogvn/aimart/commit/0b0fef88f06e6d7761ac52c7830c1d6baadf886b))
+
+
+### Documentation
+
+* record the release guard's known gaps from its review ([2704d21](https://github.com/balogvn/aimart/commit/2704d21c5ca347b6b1b7da2e044c1476da46e20e))
+* record the reverted-release incident and the release guard ([0159c19](https://github.com/balogvn/aimart/commit/0159c19c054f9dda915305cc72e268e22d3540cb))
+
 ## [0.1.2](https://github.com/balogvn/aimart/compare/v0.1.1...v0.1.2) (2026-11-17)
 
 
