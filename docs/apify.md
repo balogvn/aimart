@@ -24,20 +24,41 @@ named in each step still exists under **Development > My Actors > (the Actor)**.
   | event name (type it exactly) | price | charged when |
   |---|---|---|
   | `file-converted` | $0.02 | a file was converted and its Parquet stored |
-  | `query-run` | $0.005 | the optional SQL ran over one converted file |
+  | `query-run` | $0.005 | the optional SQL ran successfully over one converted file (even if it matched no rows) |
 
   These are the hosted service's prices. A failed input is never charged. Before each event the
   Actor checks that the run's maximum charge (set by the user) still covers it; if not, it stops
   and reports the remaining inputs as `skipped`, uncharged.
 - Apify keeps 20% of what users pay. The platform's cost of running the Actor (memory and time)
-  is taken from your share: a run of a few small files takes a few seconds at 2 GB of memory,
-  about $0.001 to $0.002 at Apify's $0.20 per compute unit (1 GB for one hour), so a $0.02
-  conversion leaves you about $0.014. Users on Apify's free plan pay nothing and earn you
-  nothing (Apify covers their usage).
+  is taken from your share (Apify's formula: profit = 0.8 x revenue - platform costs): a run of
+  a few small files takes a few seconds at 2 GB of memory, about $0.001 to $0.002 at Apify's
+  $0.20 per compute unit (1 GB for one hour), so a $0.02 conversion leaves you about $0.014.
+  Users on Apify's free plan pay nothing and earn you nothing (Apify covers their usage).
+- **Failed inputs cost you, not the user.** A failure is free for the user, but the time the
+  Actor spent on it is platform cost, taken from your share. Most failures take under a second
+  (a broken link, an unreadable file). The expensive one is a file that runs into the 120-second
+  conversion limit. So the Actor keeps a **failure budget**: once failed inputs have used
+  more than 120 seconds of a run in total, it does not start the remaining inputs. It reports them
+  as `skipped` with the code `failure_budget_reached`, and nothing is charged for them. The most
+  a run can then spend on failures is just under 4 minutes at 2 GB, about 0.13 compute units,
+  or about **$0.03 per run**, paid by you. Someone who sends only bad files, run after run,
+  costs you about that much per run, and Apify bills them nothing. If that happens, Apify's
+  Insights pages show many runs with no revenue. The only full protection is charging for the
+  platform's usage as well ("Pay per event + usage" in the monetization settings), but then a
+  failure is no longer free for the user, so this guide leaves it off.
+- **Restarted runs are not charged twice.** Apify sometimes moves a running Actor to another
+  server, and a user can resurrect a finished run. Either way the Actor starts again from its
+  first input, with the same storage. The Actor records each input's progress in the run's
+  key-value store (records named `progress-001`, `progress-002` and so on), so a restarted run
+  skips what it already reported and charges nothing again. In the rare case that the server
+  stops during a charge, the Actor treats that charge as made. It never charges twice; at worst
+  one file is delivered without payment.
 
 ## Steps only you can do
 
-You need your Apify account (you have one) and about 30 minutes. Nothing here costs money.
+You need your Apify account (you have one) and about 30 minutes. Setting up costs nothing; the
+test runs in steps 3 and "How to check that it works" each use a few seconds of platform time
+on your account.
 
 ### 1. Create the Actor from the GitHub repository
 
@@ -100,17 +121,20 @@ First add your billing details, which Apify asks for before monetization (step 6
    - **Delete** the event `apify-default-dataset-item` (Apify adds it by default). It charges
      for every dataset item, including the items that report a failed input. **This is
      required**: while it has a price, the Actor refuses every run, with a message saying so.
-   - **Delete** the event `apify-actor-start` too (recommended). It charges $0.00005 per run
-     start (more above 1 GB of memory) even when every input fails, which breaks the rule that
-     a failure costs nothing. The cost: Apify no longer covers the first 5 seconds of each run,
-     so that compute (about $0.0006 a run at 2 GB) comes out of your share. If you prefer to
-     keep it, nothing in the Actor stops you; the README does not promise there is no start fee.
+   - **Delete** the event `apify-actor-start` too. **This is required**: it charges $0.00005
+     for each GB of memory (so $0.0001 at the Actor's 2 GB) every time a run starts, even when
+     every input fails. The Store page promises that failures cost nothing and that there is no
+     fee beyond the two events above. The cost to you: Apify no longer covers the first 5
+     seconds of each run, so that compute (about $0.0006 a run at 2 GB) comes out of your
+     share. The Actor cannot check this one for you, because Apify charges it before the Actor's
+     code starts.
    - Leave **Pay per event + usage** (under additional options) **off**: the prices above
      include the platform's cost.
    - If asked for a minimal **max cost per run**, enter `0.03` (one file and its query).
 3. **Primary event**: choose `file-converted`.
 4. **Review**: check that exactly two events are listed, `file-converted` at $0.02 and
-   `query-run` at $0.005, and confirm.
+   `query-run` at $0.005 (no `apify-actor-start`, no `apify-default-dataset-item`), and
+   confirm.
 
 Spelling matters: an event name the code does not use is never charged, and if either name is
 missing, every run stops at once with "This Actor's pricing has no flat-priced event named ...".
@@ -192,6 +216,17 @@ Apify writes the invoice on the 11th of each month for the previous month and pa
 
   Paste the output under the comment at the top of `apify/requirements.txt`, update the dates
   in that comment, and run `make check` (a test reads the pins).
+- Known limitations (each errs on the side of the user, never charging twice or for a
+  failure):
+  - A run restarted while a charge was in flight counts that charge as made (its outcome
+    cannot be read back). At most one input per restart may be delivered unpaid.
+  - If the restart came right after a file's conversion was charged and before its query ran,
+    that query is reported as `query_interrupted`, unpaid; it is not run again.
+  - A charge refused at the limit withdraws the stored Parquet and then records the result; a
+    restart in the instant between the two would report that file as converted and charged
+    although nothing was charged and its link no longer works.
+  - Failed inputs cost the owner up to about $0.03 of compute per run (the failure budget,
+    `FAILURE_BUDGET_S` in `core.py`); runs made only of failing inputs are paid by the owner.
 - To try the Actor locally: install the pinned packages into a virtual environment, install
   `apify-cli` (`npm install apify-cli@1.11.0` in a scratch folder), and from `apify/` run
   `apify run --purge --entrypoint aimart_actor --input-file input.json` with that environment's

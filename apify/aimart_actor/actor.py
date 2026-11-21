@@ -87,6 +87,20 @@ class ApifyPlatform:
     async def push(self, item: dict[str, Any]) -> None:
         await Actor.push_data(item)
 
+    async def recall(self, key: str) -> Any:
+        return await self._kvs.get_value(key)
+
+    async def remember(self, key: str, value: dict[str, Any]) -> None:
+        await self._kvs.set_value(key, value, content_type="application/json")
+
+    async def last_index(self) -> int:
+        dataset = await Actor.open_dataset()
+        # The platform returns only the field asked for; the local file storage does not take
+        # `fields` (it warns), so it reads the whole last item.
+        fields = ["index"] if Actor.is_at_home() else None
+        page = await dataset.get_data(desc=True, limit=1, fields=fields)
+        return int(page.items[0]["index"]) if page.items else 0
+
 
 async def main() -> None:
     await Actor.init()

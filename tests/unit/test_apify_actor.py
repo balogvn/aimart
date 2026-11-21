@@ -45,9 +45,19 @@ core = importlib.import_module("aimart_actor.core")
 pytestmark = pytest.mark.anyio
 
 
+class Killed(BaseException):
+    """The process dies (a migration, a crash): nothing in the Actor catches it."""
+
+
 @dataclass
 class StubPlatform:
-    """``core.Platform`` with a budget counted in events, recording everything it is asked."""
+    """``core.Platform`` with a budget counted in events, recording everything it is asked.
+
+    Its storages (records, dataset items) and charges outlive a run, as the platform's do when
+    it restarts a run (a migration or a resurrection): call ``core.run`` again on the same stub.
+    ``kill_after`` names steps (``charge:<event>``, ``push``, ``remember:<state>``) after which
+    the process dies, once each, the step itself done.
+    """
 
     budget: int | None = None  # events the run's maximum charge still covers; None: unlimited
     charge_answers: list[bool | Exception | None] = field(default_factory=list)
@@ -56,6 +66,23 @@ class StubPlatform:
     discarded: list[str] = field(default_factory=list)
     items: list[dict[str, Any]] = field(default_factory=list)
     asked: list[str] = field(default_factory=list)
+    records: dict[str, Any] = field(default_factory=dict)
+    kill_after: set[str] = field(default_factory=set)
+
+    def _step(self, name: str) -> None:
+        if name in self.kill_after:
+            self.kill_after.discard(name)
+            raise Killed(name)
+
+    async def recall(self, key: str) -> Any:
+        return json.loads(json.dumps(self.records[key])) if key in self.records else None
+
+    async def remember(self, key: str, value: dict[str, Any]) -> None:
+        self.records[key] = json.loads(json.dumps(value))
+        self._step(f"remember:{value['state']}")
+
+    async def last_index(self) -> int:
+        return int(self.items[-1]["index"]) if self.items else 0
 
     def affordable(self, event: str) -> bool:
         self.asked.append(event)
@@ -69,6 +96,7 @@ class StubPlatform:
             self.charges.append((event, key))
             if self.budget is not None:
                 self.budget -= 1
+        self._step(f"charge:{event}")
         return answer
 
     async def save(self, key: str, path: Path) -> str:
@@ -82,6 +110,7 @@ class StubPlatform:
     async def push(self, item: dict[str, Any]) -> None:
         # What the platform stores: JSON. A value JSON cannot hold must fail here, as it would.
         self.items.append(json.loads(json.dumps(item)))
+        self._step("push")
 
     @property
     def events(self) -> list[str]:
@@ -502,6 +531,146 @@ async def test_a_run_that_is_not_pay_per_event_delivers_and_lists_no_charge(
     assert summary.charged == {"file-converted": 0, "query-run": 0}
 
 
+# ------------------------------------------------------------------ restarts: no second charge
+
+
+def two_files() -> dict[str, Any]:
+    return {
+        "files": [
+            {"fileName": "a.csv", "contentBase64": b64(SAMPLE.read_bytes())},
+            {"fileName": "b.csv", "contentBase64": b64(SAMPLE.read_bytes())},
+        ],
+        "sql": QUERY,
+    }
+
+
+ONCE_EACH = [
+    ("file-converted", "parquet-001-a.parquet-convert"),
+    ("query-run", "parquet-001-a.parquet-query"),
+    ("file-converted", "parquet-002-b.parquet-convert"),
+    ("query-run", "parquet-002-b.parquet-query"),
+]
+
+
+async def test_a_restarted_run_charges_nothing_twice_and_reports_each_input_once(
+    service: Service,
+) -> None:
+    """The platform restarts a migrated or resurrected run from the start with the same
+    storages; the SDK forgets an idempotency key after three minutes, so the Actor must."""
+    platform = StubPlatform()
+    first = await core.run(two_files(), service, platform)
+    again = await core.run(two_files(), service, platform)
+    assert platform.charges == ONCE_EACH
+    assert [i["index"] for i in platform.items] == [1, 2]
+    assert again.message == first.message == "Converted 2 file(s), ran 2 queries."
+    assert again.charged == {"file-converted": 2, "query-run": 2}
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        "charge:query-run",
+        "remember:ready",
+        "push",
+        "remember:pushed",
+    ],
+)
+async def test_a_run_killed_mid_input_resumes_without_a_second_charge_or_item(
+    service: Service, step: str
+) -> None:
+    platform = StubPlatform(kill_after={step})
+    with pytest.raises(Killed):
+        await core.run(two_files(), service, platform)
+    summary = await core.run(two_files(), service, platform)
+    assert platform.charges == ONCE_EACH
+    assert [i["index"] for i in platform.items] == [1, 2]
+    assert [i["charged"] for i in platform.items] == [["file-converted", "query-run"]] * 2
+    assert all("query" in i for i in platform.items)
+    assert summary.charged == {"file-converted": 2, "query-run": 2}
+
+
+async def test_a_run_killed_while_its_conversion_was_charged_delivers_that_file(
+    service: Service,
+) -> None:
+    """The charge went through and the process died before the item was written: the next
+    attempt delivers the stored file without converting or charging it again; the query that
+    never ran is reported as not run, unpaid."""
+    raw = {"files": [{"fileName": "a.csv", "contentBase64": b64(SAMPLE.read_bytes())}]}
+    raw["sql"] = QUERY  # type: ignore[assignment]
+    platform = StubPlatform(kill_after={"charge:file-converted"})
+    with pytest.raises(Killed):
+        await core.run(raw, service, platform)
+    calls: list[Any] = []
+
+    async def must_not_convert(*args: Any, **kwargs: Any) -> Any:
+        calls.append(args)
+        raise AssertionError
+
+    service.convert = must_not_convert  # type: ignore[method-assign]
+    await core.run(raw, service, platform)
+    [item] = platform.items
+    assert item["status"] == "converted"
+    assert item["parquetKey"] in platform.saved
+    assert item["charged"] == ["file-converted"]
+    assert item["queryError"]["code"] == "query_interrupted"
+    assert "not charged" in item["queryError"]["hint"]
+    assert platform.charges == [("file-converted", "parquet-001-a.parquet-convert")]
+    assert calls == []
+
+
+async def test_progress_from_another_input_is_ignored(service: Service) -> None:
+    platform = StubPlatform()
+    await core.run(two_files(), service, platform)
+    other = two_files()
+    other["sql"] = "SELECT count(*) AS n FROM data"
+    await core.run(other, service, platform)
+    assert len(platform.charges) == 8
+    assert platform.items[2]["query"]["columns"] == ["n"]
+
+
+async def test_progress_records_stay_out_of_the_parquet_collection(service: Service) -> None:
+    platform = StubPlatform()
+    await core.run(two_files(), service, platform)
+    prefix = load("key_value_store_schema.json")["collections"]["parquet"]["keyPrefix"]
+    assert platform.records
+    assert not any(key.startswith(prefix) for key in platform.records)
+    # Once reported, an input's record is small: the dataset holds the item.
+    assert all(len(json.dumps(r)) < 500 for r in platform.records.values())
+
+
+# ------------------------------------------------------------------ the owner's compute
+
+
+async def test_failing_inputs_stop_the_run_once_they_used_the_failure_budget(
+    service: Service, fetched: Net, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure is free for the user and costs the owner compute: past a total time spent on
+    failures, the remaining inputs are not started, and not charged."""
+    monkeypatch.setattr(core, "FAILURE_BUDGET_S", 0.0)
+    platform = StubPlatform()
+    summary = await core.run(
+        {"urls": ["http://127.0.0.1/x.csv", SAMPLE_URL, SAMPLE_URL]}, service, platform
+    )
+    assert [i["status"] for i in platform.items] == ["failed", "skipped", "skipped"]
+    assert {i["error"]["code"] for i in platform.items[1:]} == {"failure_budget_reached"}
+    assert all(i["error"]["hint"] for i in platform.items)
+    assert fetched.asked == []
+    assert platform.charges == []
+    assert summary.message == (
+        "Converted 0 file(s); 1 failed (not charged); 2 skipped: earlier inputs failed after "
+        "using this run's time for failures (not charged)."
+    )
+
+
+async def test_the_failure_budget_lets_quick_failures_through(
+    service: Service, fetched: Net
+) -> None:
+    platform = StubPlatform()
+    await core.run({"urls": ["http://127.0.0.1/x.csv"] * 5 + [SAMPLE_URL]}, service, platform)
+    assert [i["status"] for i in platform.items] == ["failed"] * 5 + ["converted"]
+    assert service.settings.convert_timeout_s >= core.FAILURE_BUDGET_S
+
+
 @pytest.mark.parametrize(
     ("prices", "problem"),
     [
@@ -722,5 +891,15 @@ def test_the_store_page_and_the_owner_guide_state_the_real_events_and_prices() -
     assert "https://balogvn--aimart-parquet.us-east.modal.run" in readme
     assert core.DATASET_ITEM_EVENT in guide  # the owner removes it: it would charge failures
     assert "apify-actor-start" in guide
+    # The Store page promises no fee beyond the two events: the guide must not leave the start
+    # event optional, and both pages state the failure budget the code applies.
+    assert "Pay per event, nothing else" in readme
+    assert "**This is required**: it charges" in guide
+    budget = f"more than {core.FAILURE_BUDGET_S:.0f} seconds"
+    assert budget in readme
+    assert budget in guide
+    assert core.FAILURE_BUDGET_CODE in readme
+    assert core.FAILURE_BUDGET_CODE in guide
+    assert "returned rows" not in readme  # an empty result is a successful, charged query
     discovery = (ROOT / "docs" / "discovery.md").read_text()
     assert "(apify.md)" in discovery

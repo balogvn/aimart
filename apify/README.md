@@ -101,7 +101,7 @@ Pay per event, nothing else:
 | event | price | when |
 |---|---|---|
 | `file-converted` | **$0.02** per file | a file was converted and its Parquet stored |
-| `query-run` | **$0.005** per query | your SQL ran over one converted file and returned rows |
+| `query-run` | **$0.005** per query | your SQL ran successfully over one converted file (even if it matched no rows) |
 
 So converting 100 files costs $2.00, and converting and querying them $2.50. **Failed inputs are
 never charged**: a link that cannot be fetched, a file that cannot be read, an invalid option or
@@ -112,6 +112,9 @@ You control the most a run may cost (**Max cost per run** in the run options, or
 `maxTotalChargeUsd` through the API and MCP). The Actor checks the remaining budget before every
 file: when it cannot pay for the next one, that file and the rest are marked `skipped`
 (`charge_limit_reached`), uncharged, and the run ends normally.
+
+If Apify moves your run to another server mid-way, or you resurrect a finished run, the Actor
+picks up where it stopped: inputs already reported are not converted, charged or reported again.
 
 ## For AI agents
 
@@ -139,6 +142,9 @@ file: when it cannot pay for the next one, that file and the rest are marked `sk
   refused, and every redirect is checked again. Files on the machine running the Actor cannot be
   named as inputs.
 - Logs record errors by type only, never file contents or query results.
+- The run's key-value store also holds one small `progress-NNN` record per input (its status and
+  the events charged), so that a restarted run does not charge you twice. While an input is
+  being charged, its record briefly holds that input's result.
 
 ## Limits
 
@@ -146,6 +152,9 @@ file: when it cannot pay for the next one, that file and the rest are marked `sk
   256 MB decompressed).
 - Each conversion has 120 seconds, each query 15 seconds; a query returns at most 1,000 rows
   (`queryLimit`, default 100).
+- If failed inputs use more than 120 seconds of a run in total (usually one file that hits the
+  conversion limit), the inputs after them are not started. They are reported as `skipped`
+  (`failure_budget_reached`), uncharged; run them again in a new run.
 - Scanned PDFs (images of tables) are not read: there is no OCR.
 - SQL is DuckDB's dialect: one `SELECT` (CTEs, `DESCRIBE`, `SUMMARIZE` too) over `data`.
 

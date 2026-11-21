@@ -19,13 +19,25 @@ Money, as on the hosted service: a failure is never charged and unpaid work is n
   run" (apify 4.2.0, ``ChargingManager.charge``); checking first keeps the run off that path.
 * A charge that does not go through (``Platform.charge`` answers False or raises) withdraws
   what it was for: the stored Parquet is deleted, the query rows are dropped.
+* A run can be restarted from the start, with the same input and storages: Apify migrates runs
+  between servers "at any time", and a user can resurrect a finished run (docs.apify.com/
+  platform/actors/development/builds-and-runs/state-persistence). The SDK forgets an
+  idempotency key after three minutes (apify 4.2.0, ``ChargingManager._idempotent_charges``), so
+  each input's progress is written to the run's key-value store (``progress-NNN``) before each
+  charge and around each push, and a restarted run resumes from it: nothing is charged twice,
+  converted twice or reported twice. A charge interrupted by the restart counts as made (the
+  conservative side: at worst one result is delivered unpaid, never one charged twice).
+* Failures cost the user nothing and the owner compute, so once failing inputs have used
+  ``FAILURE_BUDGET_S`` of the run's time in total, the remaining inputs are not started.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -53,6 +65,14 @@ EVENTS = (EVENT_CONVERT, EVENT_QUERY)
 # The platform's own per-item event: when it has a price, every dataset item costs the user that
 # price, a failure's item included. docs/apify.md has the owner delete it.
 DATASET_ITEM_EVENT = "apify-default-dataset-item"
+
+# Every input's progress, so that a restarted run resumes instead of charging again. Outside the
+# key-value store schema's parquet collection (keyPrefix "parquet-").
+PROGRESS_PREFIX = "progress-"
+# Seconds of failing work after which the rest of the run's inputs are not started: one input
+# that runs into the conversion deadline (120 s). Failures are free for the user and cost the
+# owner compute (docs/apify.md, "How it works and what it charges").
+FAILURE_BUDGET_S = 120.0
 
 MAX_URLS = 20
 MAX_FILES = 10
@@ -88,6 +108,15 @@ class Platform(Protocol):
     async def push(self, item: dict[str, Any]) -> None:
         """Append ``item`` to the run's default dataset."""
 
+    async def recall(self, key: str) -> Any:
+        """The JSON record ``key`` of the run's key-value store, or None when there is none."""
+
+    async def remember(self, key: str, value: dict[str, Any]) -> None:
+        """Store ``value`` as the JSON record ``key`` of the run's key-value store."""
+
+    async def last_index(self) -> int:
+        """The ``index`` of the last item in the run's default dataset; 0 when it is empty."""
+
 
 @dataclass(frozen=True)
 class Job:
@@ -117,23 +146,38 @@ class Plan:
     refusal: AimartError | None = None
 
 
+def brief(item: Mapping[str, Any]) -> dict[str, Any]:
+    """What the run's summary needs of a dataset item, kept once the item is reported."""
+    error = item.get("error") or {}
+    return {
+        "status": item["status"],
+        "code": error.get("code"),
+        "query": item.get("query") is not None,
+        "charged": list(item["charged"]),
+    }
+
+
 @dataclass
 class Summary:
     converted: int = 0
     failed: int = 0
     skipped: int = 0
+    halted: int = 0  # skipped because failures used the run's failure budget
     queries: int = 0
     charged: dict[str, int] = field(default_factory=lambda: dict.fromkeys(EVENTS, 0))
 
     def add(self, item: Mapping[str, Any]) -> None:
+        """Count one item, given as ``brief(item)``."""
         status = item["status"]
         if status == "converted":
             self.converted += 1
+        elif status == "skipped" and item["code"] == FAILURE_BUDGET_CODE:
+            self.halted += 1
         elif status == "skipped":
             self.skipped += 1
         else:
             self.failed += 1
-        if item.get("query") is not None:
+        if item["query"]:
             self.queries += 1
         for event in item["charged"]:
             self.charged[event] += 1
@@ -147,6 +191,11 @@ class Summary:
             text += f"; {self.failed} failed (not charged)"
         if self.skipped:
             text += f"; {self.skipped} skipped: the run's maximum charge was reached (not charged)"
+        if self.halted:
+            text += (
+                f"; {self.halted} skipped: earlier inputs failed after using this run's time "
+                "for failures (not charged)"
+            )
         return text + "."
 
 
@@ -354,6 +403,28 @@ def limit_reached(event: str) -> dict[str, Any]:
     }
 
 
+FAILURE_BUDGET_CODE = "failure_budget_reached"
+
+
+def failure_budget_reached() -> dict[str, Any]:
+    return {
+        "code": FAILURE_BUDGET_CODE,
+        "message": f"Earlier inputs of this run failed after more than {FAILURE_BUDGET_S:.0f} "
+        "seconds of work in total, so this input was not started.",
+        "hint": "Fix the failed inputs (see their error.hint), then run this one again in a new "
+        "run; you were not charged for it.",
+    }
+
+
+def query_interrupted() -> dict[str, Any]:
+    return {
+        "code": "query_interrupted",
+        "message": "The platform restarted the run while this file's query was due, so the "
+        "query did not run.",
+        "hint": "Run the query again over the file at parquetUrl; you were not charged for it.",
+    }
+
+
 def charge_failed(event: str) -> dict[str, Any]:
     return {
         "code": "charge_failed",
@@ -362,12 +433,12 @@ def charge_failed(event: str) -> dict[str, Any]:
     }
 
 
-def _skipped(job: Job, event: str = EVENT_CONVERT) -> dict[str, Any]:
+def _skipped(job: Job, error: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "index": job.index,
         "input": job.label,
         "status": "skipped",
-        "error": limit_reached(event),
+        "error": error or limit_reached(EVENT_CONVERT),
         "charged": [],
     }
 
@@ -404,8 +475,53 @@ def _converted(
     }
 
 
+@dataclass
+class Progress:
+    """Each input's progress in the run's key-value store, for a restarted run to resume from.
+
+    One record per input (``progress-NNN``), tagged with the run input's fingerprint so that
+    records left by another input (a local run without purge) are ignored. States:
+
+    * ``charging``: written just before a charge, with the item as it is if the charge went
+      through. A restart finds it when the charge's outcome is unknown, and counts the charge as
+      made: the item is delivered, nothing is charged again.
+    * ``ready``: the item, final, about to be pushed. A restart pushes it unless the dataset's
+      last item shows the push went through.
+    * ``pushed``: the item is in the dataset; only its ``brief`` is kept.
+    """
+
+    platform: Platform
+    fingerprint: str
+    _last_index: int | None = None
+
+    @staticmethod
+    def key(index: int) -> str:
+        return f"{PROGRESS_PREFIX}{index:03d}"
+
+    async def load(self, index: int) -> dict[str, Any] | None:
+        record = await self.platform.recall(self.key(index))
+        if not isinstance(record, dict) or record.get("input") != self.fingerprint:
+            return None
+        return record
+
+    async def mark(self, index: int, state: str, **fields: Any) -> None:
+        record = {"input": self.fingerprint, "state": state, **fields}
+        await self.platform.remember(self.key(index), record)
+
+    async def was_pushed(self, index: int) -> bool:
+        """Whether the item of input ``index`` is in the dataset (items are pushed in order)."""
+        if self._last_index is None:
+            self._last_index = await self.platform.last_index()
+        return self._last_index >= index
+
+
+def fingerprint(raw: object) -> str:
+    text = json.dumps(raw, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 async def process(
-    job: Job, plan: Plan, service: Service, platform: Platform
+    job: Job, plan: Plan, service: Service, platform: Platform, progress: Progress
 ) -> tuple[dict[str, Any], bool]:
     """Convert one input (and query it); return its dataset item and whether to stop the run.
 
@@ -431,7 +547,12 @@ async def process(
             return _failed(job, _error(exc)), False
         except Exception as exc:  # noqa: BLE001 - every failure becomes an unpaid item
             return _failed(job, _error(_unexpected(exc, job, "convert"))), False
+        # The item as delivered if the run is restarted before the charge's outcome is known.
+        draft = _converted(job, result, key, url, charged=True)
+        if plan.sql is not None:
+            draft |= {"sql": plan.sql, "queryError": query_interrupted()}
         try:
+            await progress.mark(job.index, "charging", item=draft, stop=None)
             charged = await platform.charge(EVENT_CONVERT, key=f"{key}-convert")
         except Exception as exc:  # noqa: BLE001
             _log_charge_error(exc, job)
@@ -443,7 +564,7 @@ async def process(
         item = _converted(job, result, key, url, charged=charged is True)
         stop = False
         if plan.sql is not None:
-            stop = await _query(job, plan, service, platform, artifact_id, key, item)
+            stop = await _query(job, plan, service, platform, progress, artifact_id, key, item)
         return item, stop
     finally:
         if artifact_id is not None:
@@ -455,6 +576,7 @@ async def _query(
     plan: Plan,
     service: Service,
     platform: Platform,
+    progress: Progress,
     artifact_id: str,
     key: str,
     item: dict[str, Any],
@@ -491,6 +613,8 @@ async def _query(
         item["queryError"] = _error(_unexpected(exc, job, "query"))
         return False
     try:
+        draft = item | {"query": rows, "charged": [*item["charged"], EVENT_QUERY]}
+        await progress.mark(job.index, "charging", item=draft, stop=None)
         charged = await platform.charge(EVENT_QUERY, key=f"{key}-query")
     except Exception as exc:  # noqa: BLE001
         _log_charge_error(exc, job)
@@ -522,15 +646,50 @@ async def _withdraw(platform: Platform, key: str, job: Job) -> None:
 
 async def run(raw: object, service: Service, platform: Platform) -> Summary:
     """Process every input in order, one dataset item each. Raises ``InvalidRequest`` (nothing
-    fetched, nothing charged) when the input names nothing to convert or is malformed."""
+    fetched, nothing charged) when the input names nothing to convert or is malformed.
+
+    A restarted run (same input, same storages) resumes from each input's ``Progress``.
+    """
     plan = parse_input(raw, max_query_rows=service.settings.max_query_rows)
+    progress = Progress(platform, fingerprint(raw))
     summary = Summary()
-    stop = False
+    stop: dict[str, Any] | None = None  # why the remaining inputs are skipped
+    failing_s = 0.0  # time spent on inputs that failed, this attempt and earlier ones
     for job in plan.jobs:
-        if stop:
-            item = _skipped(job)
+        record = await progress.load(job.index)
+        seconds = 0.0
+        if record is not None and record["state"] == "pushed":
+            summary.add(record["brief"])
+            stop, failing_s = record["stop"], failing_s + record["seconds"]
+            continue
+        if record is not None:  # an earlier attempt prepared this item: deliver it as it is
+            item, stop, seconds = record["item"], record["stop"], record.get("seconds", 0.0)
+            if record["state"] == "ready" and await progress.was_pushed(job.index):
+                await _reported(progress, job, item, stop, seconds)
+                summary.add(brief(item))
+                failing_s += seconds
+                continue
         else:
-            item, stop = await process(job, plan, service, platform)
+            if stop is None and failing_s > FAILURE_BUDGET_S:
+                stop = failure_budget_reached()
+            if stop is not None:
+                item = _skipped(job, stop)
+            else:
+                started = time.monotonic()
+                item, limit = await process(job, plan, service, platform, progress)
+                if item["status"] == "failed":
+                    seconds = time.monotonic() - started
+                if limit:
+                    stop = limit_reached(EVENT_CONVERT)
+        failing_s += seconds
+        await progress.mark(job.index, "ready", item=item, stop=stop, seconds=seconds)
         await platform.push(item)
-        summary.add(item)
+        await _reported(progress, job, item, stop, seconds)
+        summary.add(brief(item))
     return summary
+
+
+async def _reported(
+    progress: Progress, job: Job, item: dict[str, Any], stop: Any, seconds: float
+) -> None:
+    await progress.mark(job.index, "pushed", brief=brief(item), stop=stop, seconds=seconds)

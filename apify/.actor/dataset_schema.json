@@ -91,7 +91,7 @@
             "error": {
                 "type": "object",
                 "title": "Error",
-                "description": "Why the input was not converted: code (e.g. fetch_failed, unsupported_format, invalid_input, input_too_large, charge_limit_reached), message and hint (what to do next). Not charged.",
+                "description": "Why the input was not converted: code (e.g. fetch_failed, unsupported_format, invalid_input, input_too_large, charge_limit_reached, failure_budget_reached), message and hint (what to do next). Not charged.",
                 "example": {"code": "unsupported_format", "message": "Unrecognized file format.", "hint": "Pass options.format, or send one of the supported formats; you were not charged."}
             },
             "charged": {
