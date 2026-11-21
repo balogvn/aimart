@@ -150,6 +150,15 @@ paid by x402gle, grades the answer, and lists the routes that pass. The bazaar e
 what it sends, which is why they must be real calls. Not run yet: it executes a third-party
 npm package, so it is the owner's decision.
 
+### 5a. Apify Store (pay-per-event, for callers who pay by card)
+
+The same converter is also sold as an Apify Actor, from the repository's `apify/` folder. Apify
+users and agents (through Apify's MCP server, mcp.apify.com) run it and pay through their Apify
+account per event: `file-converted` and `query-run`, priced like the hosted service. Apify keeps
+20% and deducts platform usage from the payout. It reaches callers who pay by card instead of
+USDC. The owner creates, prices and publishes it in Apify Console: step by step in
+[apify.md](apify.md).
+
 ### 6. Facilitator catalogs (Bazaar)
 
 Facilitators that settle our payments can list the resources in their catalogs, using the
@@ -159,15 +168,6 @@ is why the schemas in `payments/bazaar.py` are self-contained (no `$ref`) and a 
 them. Neither xpay nor Primer publishes a catalog today (see "Why settling payments does not
 list us"); Dexter's and PayAI's are at `/discovery/resources`, and CDP's Bazaar lists only
 resources settled through CDP.
-
-### 6a. Apify Store (pay-per-event, for callers who pay by card)
-
-The same converter is also sold as an Apify Actor, from the repository's `apify/` folder. Apify
-users and agents (through Apify's MCP server, mcp.apify.com) run it and pay through their Apify
-account per event: `file-converted` and `query-run`, priced like the hosted service. Apify keeps
-20% and deducts platform usage from the payout. It reaches callers who pay by card instead of
-USDC. The owner creates, prices and publishes it in Apify Console: step by step in
-[apify.md](apify.md).
 
 ### 7. The free local funnel
 
