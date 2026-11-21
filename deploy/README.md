@@ -1,7 +1,8 @@
 # Deploying AImart Parquet
 
 The hosted service runs on **Modal** (section 0): the Starter plan's $30 of monthly credits pay
-for it, it scales to zero, and the workspace budget stops it rather than billing past them.
+for it, one copy is kept running (about $11.70 a month), and the workspace budget stops it
+rather than billing past them.
 GitHub Actions deploys it with a Modal token kept in the `production` environment; the signing
 keys live in Modal and never pass through GitHub. **Google Cloud Run** (section 1) is the
 alternative: set the repository variable `DEPLOY_HOST=cloudrun` and a release deploys the
@@ -66,9 +67,10 @@ downloads, 15 s waiting for a job slot (`RUNTIME_ENV` in `modal_app.py`;
 
 Cost: Modal bills the higher of what a container reserves and what it uses, for every second
 it is up (a core at $0.0000131/s, memory at $0.00000222 per GiB-second), and nothing while it
-is stopped. Idle, this container costs about $0.016 an hour: about $11 if it never stopped for
-a month, inside the $30 of monthly credits; a job adds the core and memory it uses for its few
-seconds. The Volume holds at most the 1 GiB budget of outputs, each for an hour.
+is stopped. Idle, this container costs about $0.016 an hour, and one is kept running
+(`MIN_CONTAINERS` in `modal_app.py`): about $11.70 a month, inside the $30 of monthly credits; a
+job adds the core and memory it uses for its few seconds. Kept running, no caller waits for a
+cold start (about 7 s), and expired outputs are deleted within a minute or two. The Volume holds at most the 1 GiB budget of outputs, each for an hour.
 
 **The $30 needs a payment method on file.** Without one a Starter workspace gets $1 a month,
 about 60 hours awake at this size, and once it is spent Modal disables the workspace: every

@@ -102,6 +102,18 @@ def test_an_idle_container_is_cheap_enough_to_be_awake_all_month() -> None:
     assert constants["SCALEDOWN_S"] <= 60
 
 
+def test_one_container_is_kept_running_and_never_more() -> None:
+    """Scaled to zero, every directory health check woke the service and its first caller waited
+    about 7 s for the start (2026-11-21), and expired outputs waited for the next wake-up to be
+    deleted. One container is kept running; the cost ceiling is still one."""
+    constants = _constants()
+    assert constants["MIN_CONTAINERS"] == 1
+    source = APP.read_text(encoding="utf-8")
+    assert source.count("min_containers=MIN_CONTAINERS") == 1  # the web function only
+    assert "min_containers=0" not in source
+    assert source.count("max_containers=1") == 1
+
+
 def test_the_function_timeout_is_the_request_limit() -> None:
     source = APP.read_text(encoding="utf-8")
     assert "timeout=HTTP_LIMIT_S," in source

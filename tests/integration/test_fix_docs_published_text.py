@@ -81,15 +81,18 @@ def test_docs_do_not_promise_deletion_minutes_after_expiry(rel: str) -> None:
         assert overpromise not in text, (rel, overpromise)
 
 
-def test_privacy_bounds_hosted_deletion_by_what_github_runs_not_the_cron() -> None:
+def test_privacy_states_the_hosted_cleanup_the_deployment_runs() -> None:
     # Review of docs/listing-readiness: privacy.md said the synthetic check starts the hosted
-    # service "every six hours, so that is the usual upper bound". Only its cron is every 6 h:
-    # GitHub ran it 2.35 times a day (gaps 4.4 to 15.5 h, typically 11 to 13 h) from
-    # 2026-11-11 to 2026-11-16, so an expired upload stayed stored 12 to 16 h on a quiet day.
+    # service "every six hours, so that is the usual upper bound"; GitHub ran it about twice a
+    # day, so an expired upload stayed stored 12 to 16 h on a quiet day. Since 2026-11-21 one
+    # container is kept running (deploy/modal_app.py MIN_CONTAINERS), so the sweep runs about
+    # once a minute; the page says so, and says it is how the service is run, not a guarantee.
     text = section("docs/privacy.md", "## When outputs are deleted")
     for overpromise in ("every six hours", "upper bound", "within minutes of the TTL"):
         assert overpromise not in text, overpromise
-    assert "within a day" in text
+    app = (ROOT / "deploy" / "modal_app.py").read_text(encoding="utf-8")
+    kept_running = "MIN_CONTAINERS = 1" in app
+    assert ("keeps one copy running at all times" in text) == kept_running
     assert "not a guarantee" in text
 
 

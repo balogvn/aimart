@@ -19,16 +19,16 @@ and in `GET /llms.txt`, generated from the deployment's settings.
 - **While the service runs, within about a minute of the TTL.** A cleanup sweep runs when the
   service starts, and then at most once a minute while it runs. It deletes expired artifacts
   from local disk and, on Google Cloud Storage deployments, their stored copies.
-- **The hosted service** (on Modal) stops when it has had no request for a minute, and keeps
-  outputs on a storage volume that outlives the stopped instance, so that an `artifact_id` and
-  its download link work for their full 60 minutes. An output that expires while the service is
-  stopped stays on that volume, unreachable, until the service next starts: the first thing a
-  starting instance does is delete what has expired. Any request starts it, and so does a
-  scheduled check (`.github/workflows/synthetic.yml`). That check is scheduled four times a day,
-  but GitHub starts it less often: from 11 to 16 November 2026 it ran about twice a day, usually
-  11 to 13 hours apart and at most 16. So an output that expires on a quiet day is normally
-  deleted within a day. GitHub can delay or skip a scheduled run, and turns schedules off in a
-  repository with no activity for 60 days, so this is not a guarantee.
+- **The hosted service** (on Modal) keeps one copy running at all times, so the cleanup runs
+  about once a minute and an output is normally deleted within a minute or two of becoming
+  unreachable. Outputs are kept on a storage volume that outlives any one copy, so that an
+  `artifact_id` and its download link work for their full 60 minutes. Modal sometimes replaces
+  the running copy (a redeploy, or a machine it reclaims); an output that expires in that gap
+  is deleted as soon as the next copy starts, normally within a minute. This is how the service
+  is run, not a guarantee: if Modal stops it for longer (an outage, or the month's budget
+  running out), deletion waits for the next start. Until 21 November 2026 the service stopped
+  when idle, and an output that expired on a quiet day could stay stored for up to about 16
+  hours.
 - **Local disk** on Cloud Run is the instance's memory (`/tmp`), wiped when the instance stops.
 - **Worst case, about a day** (Cloud Storage only). A copy whose local record was lost when an
   instance restarted is found by a sweep of the bucket listing (at most every 6 hours, while the

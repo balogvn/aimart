@@ -8,12 +8,17 @@ Modal builds image definitions lazily, and inside a container the deployed defin
 
 Shape, mirroring the Cloud Run service (deploy.yml):
 
-* A quarter of a CPU core and 512 MiB reserved, up to 2 GiB used, 4 concurrent requests, at
-  most one container, scale to zero. Modal bills the higher of what a container reserves and
+* A quarter of a CPU core and 512 MiB reserved, up to 2 GiB used, 4 concurrent requests, and
+  exactly one container, kept running (``MIN_CONTAINERS``). Modal bills the higher of what a container reserves and
   what it uses for every second it is up, so the reservation is what an idle container costs:
   about $0.016 an hour here. The first deploy reserved a whole core and 2 GiB (Cloud Run's
   shape, where CPU is billed only during requests): $0.063 an hour awake, which spent the
   Starter plan's card-less $1 of credit in a day and a half and got the workspace disabled.
+  Kept running, the container costs about $11.70 a month, inside the $30 of monthly credits.
+  It scaled to zero until 2026-11-21: directory and index health checks woke it many times a
+  day, each wake-up made its first caller wait about 7 s for the start, and the wake-ups cost
+  about as much (about $0.45 a day). Kept running, it also deletes expired outputs within a
+  minute or two instead of at the next wake-up (docs/privacy.md).
 * Stored outputs on the Volume ``aimart-artifacts`` (background commits every few seconds and a
   final one at shutdown), so a download link outlives the container's scale-down. The Volume's
   version is the workspace's default: nothing here needs hard links on it.
@@ -45,7 +50,8 @@ VOLUME_NAME = "aimart-artifacts"
 ARTIFACT_DIR = "/artifacts"
 UV_VERSION = "0.13.0"  # as in ci.yml and the Dockerfile
 HTTP_LIMIT_S = 150  # Modal's limit for one web request before it redirects (303)
-SCALEDOWN_S = 60  # idle seconds before the container stops; an idle minute costs ~$0.0003
+MIN_CONTAINERS = 1  # one container always up: no cold start for the first caller (see above)
+SCALEDOWN_S = 60  # idle seconds before a container beyond MIN_CONTAINERS stops
 # What the container reserves is billed whenever it is up; what it uses beyond that is billed
 # only while it is used (a job's seconds). The limit is the 2 GiB the job caps are sized for.
 CPU_REQUEST = 0.25
@@ -124,7 +130,7 @@ secrets = [modal.Secret.from_name(KEYS_SECRET), modal.Secret.from_dict(_config()
     cpu=CPU_REQUEST,
     memory=(MEMORY_REQUEST_MB, MEMORY_LIMIT_MB),
     timeout=HTTP_LIMIT_S,
-    min_containers=0,  # scale to zero
+    min_containers=MIN_CONTAINERS,  # kept running: no 7 s cold start, cleanup every minute
     max_containers=1,  # the cost ceiling's first line, as on Cloud Run
     scaledown_window=SCALEDOWN_S,
     volumes={ARTIFACT_DIR: volume},
