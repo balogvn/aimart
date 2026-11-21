@@ -65,3 +65,11 @@ goes there unless `DEPLOY_HOST=cloudrun`. Differences that matter:
 - The Starter plan has no rollbacks: a failed deploy is fixed forward or redeployed from the
   previous release's tag.
 
+## Amendment, 2026-11-21: one container kept running
+
+Directory and index health checks (Glama, Agent402, x402scan, 402 Index) woke the scaled-to-zero
+container many times a day. Each wake-up made its first caller wait about 7 s for the start,
+and the wake-ups cost about $0.45 a day, close to keeping a container up. The web function now
+keeps one running (`min_containers=1`, still at most one): about $11.70 a month at the quarter
+core and 512 MiB it reserves, inside the $30 of monthly credits, with no cold start for callers
+and the cleanup of expired outputs running about once a minute.

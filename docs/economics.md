@@ -42,7 +42,9 @@ is not in the defaults.
 
 Cloud Run's free tier is about **50 hours of 1 vCPU request time a month** (180,000
 vCPU-seconds and 360,000 GiB-seconds: 50 hours of a 1 vCPU / 2 GiB instance). It also includes
-2 million requests. The service scales to zero, so idle time costs nothing. A hard budget cap
+2 million requests. The service scales to zero, so idle time costs nothing. On Modal, where the
+hosted service runs, one container is kept running: about $11.70 a month, inside the Starter
+plan's $30 of monthly credits. A hard budget cap
 is part of the deployment ([deploy/README.md](../deploy/README.md),
 [ADR 0004](adr/0004-hosting-cloud-run.md)).
 

@@ -108,13 +108,14 @@ def retention_policy(settings: Settings) -> dict[str, Any]:
     and from the request path at most once a minute (and over the bucket listing at most every
     6 h), with the bucket's 1-day lifecycle rule as the last resort. "Deleted at 60 minutes" was
     promised once and was false, and so was "normally within minutes after that" on a host that
-    stops when idle (Modal, 60 s after the last request), where it is the next start.
+    stops when idle, where it is the next start. The hosted service keeps one container running
+    (deploy/modal_app.py MIN_CONTAINERS), so there the sweep runs about once a minute.
     """
     minutes = settings.artifact_ttl_s // 60
     outputs = (
         f"converted files become unreachable {minutes} minutes after creation and are deleted "
         "after that by a cleanup that runs when the service starts and once a minute while it "
-        "runs; a host that stops the service when idle (the hosted one does) deletes a file that "
+        "runs; a host that stops the service when idle deletes a file that "
         "expired meanwhile when it next starts, which can be hours later"
     )
     if settings.gcs_bucket:

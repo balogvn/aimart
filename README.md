@@ -26,8 +26,8 @@ server), and the server is in the official MCP Registry as `io.github.balogvn/ai
 
 **Your data:** inputs are deleted when the call ends. Converted files become unreachable after
 60 minutes and are deleted by a cleanup that runs when the service starts and once a minute
-while it runs. The hosted service stops when idle, so one that expires while it is stopped stays
-stored, unreachable, until it next starts: normally within a day. A deployment that keeps
+while it runs. The hosted service keeps a copy running, so that cleanup normally deletes an
+expired file within a minute or two. A deployment that keeps
 outputs in Cloud Storage has a worst case of about a day (the bucket's 1-day lifecycle rule).
 File contents are never logged or used for training. Details: [docs/privacy.md](docs/privacy.md).
 
