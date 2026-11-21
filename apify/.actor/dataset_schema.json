@@ -1,0 +1,148 @@
+{
+    "actorSpecification": 1,
+    "fields": {
+        "type": "object",
+        "properties": {
+            "index": {
+                "type": "integer",
+                "title": "Input number",
+                "description": "Position of the input in the run: urls first, then files, counting from 1.",
+                "example": 1
+            },
+            "input": {
+                "type": "string",
+                "title": "Input",
+                "description": "The link converted, or file:<fileName> for an inline file.",
+                "example": "https://raw.githubusercontent.com/balogvn/aimart/main/docs/examples/sales.csv"
+            },
+            "status": {
+                "type": "string",
+                "title": "Status",
+                "description": "converted: the Parquet is ready (and charged). failed: see error, not charged. skipped: the run's maximum charge was reached before this input, not charged.",
+                "enum": ["converted", "failed", "skipped"],
+                "example": "converted"
+            },
+            "fileName": {
+                "type": "string",
+                "title": "Parquet file name",
+                "example": "sales.parquet"
+            },
+            "parquetKey": {
+                "type": "string",
+                "title": "Key-value store key",
+                "description": "Key of the Parquet file in the run's default key-value store.",
+                "example": "parquet-001-sales.parquet"
+            },
+            "parquetUrl": {
+                "type": "string",
+                "title": "Parquet download link",
+                "description": "Direct link to the Parquet file; works without an Apify account for as long as the run's storage is kept.",
+                "example": "https://api.apify.com/v2/key-value-stores/<storeId>/records/parquet-001-sales.parquet?signature=<signature>"
+            },
+            "sizeBytes": {
+                "type": "integer",
+                "title": "Parquet size (bytes)"
+            },
+            "sha256": {
+                "type": "string",
+                "title": "SHA-256 of the Parquet file"
+            },
+            "sourceFormat": {
+                "type": "string",
+                "title": "Detected input format",
+                "example": "csv"
+            },
+            "rows": {
+                "type": "integer",
+                "title": "Rows",
+                "example": 6
+            },
+            "columns": {
+                "type": "array",
+                "title": "Columns",
+                "description": "Each output column's name and Arrow type, in order.",
+                "example": [{"name": "order_id", "type": "int64"}, {"name": "order_date", "type": "date32[day]"}]
+            },
+            "warnings": {
+                "type": "array",
+                "title": "Warnings",
+                "description": "What the conversion assumed or could not read (e.g. an ambiguous date order)."
+            },
+            "report": {
+                "type": "object",
+                "title": "Conversion report",
+                "description": "The full report: per-column types, null and rejected counts with examples, encoding, delimiter, sheets, warnings and token estimates."
+            },
+            "sql": {
+                "type": "string",
+                "title": "SQL",
+                "description": "The query run over this file, when one was given."
+            },
+            "query": {
+                "type": "object",
+                "title": "Query result",
+                "description": "columns, types, rows (a list of row arrays), row_count and truncated (true when more rows matched than queryLimit)."
+            },
+            "queryError": {
+                "type": "object",
+                "title": "Query error",
+                "description": "Why the query gave no result (code, message, hint). The query was not charged."
+            },
+            "error": {
+                "type": "object",
+                "title": "Error",
+                "description": "Why the input was not converted: code (e.g. fetch_failed, unsupported_format, invalid_input, input_too_large, charge_limit_reached, failure_budget_reached), message and hint (what to do next). Not charged.",
+                "example": {"code": "unsupported_format", "message": "Unrecognized file format.", "hint": "Pass options.format, or send one of the supported formats; you were not charged."}
+            },
+            "charged": {
+                "type": "array",
+                "title": "Events charged",
+                "description": "The pay-per-event events charged for this input: file-converted, and query-run when the query ran.",
+                "example": ["file-converted", "query-run"]
+            }
+        },
+        "required": ["index", "input", "status", "charged"]
+    },
+    "views": {
+        "overview": {
+            "title": "Overview",
+            "description": "One row per input: what happened and where the Parquet file is.",
+            "transformation": {
+                "fields": ["index", "input", "status", "parquetUrl", "rows", "sourceFormat", "sizeBytes", "warnings", "error", "queryError", "charged"]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "index": {"label": "#", "format": "number"},
+                    "input": {"label": "Input", "format": "text"},
+                    "status": {"label": "Status", "format": "text"},
+                    "parquetUrl": {"label": "Parquet file", "format": "link"},
+                    "rows": {"label": "Rows", "format": "number"},
+                    "sourceFormat": {"label": "Format", "format": "text"},
+                    "sizeBytes": {"label": "Size (bytes)", "format": "number"},
+                    "warnings": {"label": "Warnings", "format": "array"},
+                    "error": {"label": "Error", "format": "object"},
+                    "queryError": {"label": "Query error", "format": "object"},
+                    "charged": {"label": "Charged", "format": "array"}
+                }
+            }
+        },
+        "query": {
+            "title": "Query results",
+            "description": "The SQL result of each converted file.",
+            "transformation": {
+                "fields": ["index", "input", "sql", "query", "queryError"]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "index": {"label": "#", "format": "number"},
+                    "input": {"label": "Input", "format": "text"},
+                    "sql": {"label": "SQL", "format": "text"},
+                    "query": {"label": "Result", "format": "object"},
+                    "queryError": {"label": "Query error", "format": "object"}
+                }
+            }
+        }
+    }
+}

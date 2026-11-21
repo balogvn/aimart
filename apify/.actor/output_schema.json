@@ -1,0 +1,19 @@
+{
+    "actorOutputSchemaVersion": 1,
+    "title": "Converted files and query results",
+    "description": "One dataset item per input: its Parquet link and schema report, the query rows when sql was given, or the error (code, message, hint) when the input failed. The Parquet files are in the run's key-value store under keys starting with parquet-.",
+    "properties": {
+        "results": {
+            "type": "string",
+            "title": "Results",
+            "description": "One item per input, in input order: status (converted, failed or skipped), parquetUrl, rows, columns, report, query or queryError, error, and the events charged for it.",
+            "template": "{{links.apiDefaultDatasetUrl}}/items"
+        },
+        "parquetFiles": {
+            "type": "string",
+            "title": "Parquet files",
+            "description": "The converted Parquet files, one record per converted input (key parquet-NNN-<name>.parquet).",
+            "template": "{{links.apiDefaultKeyValueStoreUrl}}/keys?collection=parquet"
+        }
+    }
+}

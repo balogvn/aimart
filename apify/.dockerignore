@@ -1,0 +1,6 @@
+# Allow-list, as for the repository's own image: only what the image needs reaches the build
+# context, never a local storage/ folder of test runs or a virtual environment.
+*
+!requirements.txt
+!aimart_actor/
+**/__pycache__
