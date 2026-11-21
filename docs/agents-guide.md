@@ -323,6 +323,10 @@ is an `isError` result with the receipt at `structuredContent["x402/payment-resp
 
 ## 7. Runnable example (REST and MCP, real URL)
 
+Paying from a Coinbase CDP or Circle developer-controlled wallet you already have? Use the
+[wallet recipes](recipes/README.md) instead: one script per wallet, in Python and TypeScript,
+against the live service, with a spend cap. The example below pays from a raw test key.
+
 [`docs/examples/agent_pays.py`](examples/agent_pays.py) runs the whole flow against a
 deployment. It is a PEP 723 script, so `uv run` installs its dependencies:
 
