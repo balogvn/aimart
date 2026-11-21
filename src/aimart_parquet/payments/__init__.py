@@ -15,6 +15,7 @@ The server holds no private key. A facilitator submits the transfer and pays the
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -32,6 +33,7 @@ from x402.mechanisms.svm import SOLANA_DEVNET_CAIP2, SOLANA_MAINNET_CAIP2
 from x402.mechanisms.svm.exact import ExactSvmServerScheme
 from x402.schemas import ResourceInfo
 from x402.schemas.config import ResourceConfig
+from x402.server_base import is_retryable_settlement_pending
 
 from aimart_parquet.artifacts import discard_withheld, outputs_of
 from aimart_parquet.config import PAYMENT_WINDOW_S, SETTLE_MARGIN_S, NetworkMode, Settings
@@ -95,6 +97,15 @@ RETRY_SKIPPED_S = 300.0
 # not, and one 502 must not move a network to the next in the list. After them (15 minutes)
 # it is dropped until it answers again, so a host that died is not quoted until a restart.
 KEPT_ROUNDS = 3
+# How long a facilitator whose verify failed (a non-200, a timeout: not an answer that the
+# payment is invalid) is passed over for verify while another facilitator offers the network:
+# CDP failing verify mid-run used to make every Base call a 402 while xpay stood behind it,
+# and a timeout would otherwise cost each call ``facilitator_timeout_s`` before the next.
+VERIFY_REST_S = 60.0
+# The most payments remembered between verify and settle (``_Failover``): far above what the
+# job queue lets run at once. One pushed out settles with the facilitator first in line, which
+# did not verify it: that settle fails, and the call is unpaid, never charged twice.
+SETTLERS_KEPT = 1024
 
 # Where a paying client puts its signed payload (v2, then v1): what the SDK middleware reads.
 PAYMENT_HEADERS = ("payment-signature", "x-payment")
@@ -140,6 +151,56 @@ def _same_units(stated: str, quoted: str) -> bool:
     return stated.lstrip("0") == quoted.lstrip("0") if whole else stated == quoted
 
 
+def _refused(client: Any) -> bool:
+    """Whether a facilitator refused this service's key (CDP: a 401 or 403, ``cdp.py``)."""
+    return bool(getattr(client, "refused", False))
+
+
+def _payment_key(payload: Any) -> str:
+    """What identifies one payment between its verify and its settle: its signed part."""
+    inner = getattr(payload, "payload", None)
+    try:
+        return json.dumps(inner, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return repr(inner)
+
+
+class _Failover:
+    """Per paid call: verify may fall through to the next facilitator; settle never does.
+
+    The SDK gives a network to one facilitator for the life of an initialization. When that
+    one's verify fails (raises: a non-200, a timeout, a refused key), the next facilitator that
+    offers the network is asked instead, once. Verify moves no money, so asking another is
+    safe; the facilitator that verified a payment is remembered and settles it, so a payment is
+    never settled by one that did not verify it, and a settle that fails is never repeated
+    elsewhere (the call is then unpaid, as always). A facilitator whose verify failed is
+    passed over for ``VERIFY_REST_S`` (a refused key: for the life of the process) while
+    another can take the network.
+    """
+
+    def __init__(self, clock: Callable[[], float]) -> None:
+        self._clock = clock
+        self._resting: dict[int, float] = {}  # id(client) -> when it may verify again
+        self._settlers: dict[str, Any] = {}  # payment -> the client that verified it
+
+    def usable(self, client: Any) -> bool:
+        return not _refused(client) and self._clock() >= self._resting.get(id(client), 0.0)
+
+    def rest(self, client: Any) -> None:
+        self._resting[id(client)] = self._clock() + VERIFY_REST_S
+
+    def remember(self, payload: Any, client: Any) -> None:
+        self._settlers[_payment_key(payload)] = client
+        while len(self._settlers) > SETTLERS_KEPT:
+            del self._settlers[next(iter(self._settlers))]
+
+    def settler(self, payload: Any) -> Any | None:
+        return self._settlers.get(_payment_key(payload))
+
+    def forget(self, payload: Any) -> None:
+        self._settlers.pop(_payment_key(payload), None)
+
+
 class _Answered:
     """A facilitator, with the answer its GET /supported gave this initialization.
 
@@ -150,7 +211,11 @@ class _Answered:
     """
 
     def __init__(
-        self, client: FacilitatorClient, supported: SupportedResponse, methods: dict[str, str]
+        self,
+        client: FacilitatorClient,
+        supported: SupportedResponse,
+        methods: dict[str, str],
+        failover: _Failover | None = None,
     ) -> None:
         """``methods``: per accepted network, the assetTransferMethod a 402 on it names.
 
@@ -173,6 +238,8 @@ class _Answered:
                 continue
             kinds.append(kind)
         self.supported = supported.model_copy(update={"kinds": kinds})
+        self.failover = failover or _Failover(time.monotonic)
+        self.behind: list[_Answered] = []  # the facilitators after it, in order (``Payments``)
 
     def get_supported(self) -> SupportedResponse:
         return self.supported
@@ -180,12 +247,44 @@ class _Answered:
     async def verify(
         self, payload: PaymentPayload, requirements: PaymentRequirements
     ) -> VerifyResponse:
-        return await self.client.verify(payload, requirements)
+        network = getattr(requirements, "network", None)
+        after = next((a for a in self.behind if network and a.offers(network)), None)
+        if after is None or self.failover.usable(self.client):
+            try:
+                return await self.client.verify(payload, requirements)
+            except Exception as exc:
+                if after is None:
+                    raise
+                if not _refused(self.client):
+                    self.failover.rest(self.client)
+                # The type only: the SDK puts the facilitator's body in the message.
+                log.warning(
+                    "facilitator verify failed: the next facilitator verifies and settles",
+                    extra={
+                        "facilitator": self.url,
+                        "next": after.url,
+                        "network": network,
+                        "error": type(exc).__name__,
+                    },
+                )
+        verified = await after.client.verify(payload, requirements)
+        self.failover.remember(payload, after.client)
+        return verified
 
     async def settle(
         self, payload: PaymentPayload, requirements: PaymentRequirements
     ) -> SettleResponse:
-        settled = await self.client.settle(payload, requirements)
+        # Whoever verified it, never another: a settle is not repeated elsewhere.
+        client = self.failover.settler(payload) or self.client
+        url = str(getattr(client, "url", type(client).__name__))
+        try:
+            settled = await client.settle(payload, requirements)
+        except Exception:
+            self.failover.forget(payload)
+            raise
+        if not is_retryable_settlement_pending(settled):
+            # Kept for the SDK's one retry of a pending settlement, which must go there too.
+            self.failover.forget(payload)
         # x402 v2 makes the amount optional and xpay leaves it out: the first receipts on
         # mainnet named a transaction and no amount, and the example client crashed on them.
         # Under 'exact' the payer signed a transfer of exactly the quoted amount, so that is
@@ -204,7 +303,7 @@ class _Answered:
                     "facilitator's receipt states another amount than was quoted: "
                     "the receipt names the quoted amount",
                     extra={
-                        "facilitator": self.url,
+                        "facilitator": url,
                         "stated_amount": stated[:80],
                         "quoted_amount": quoted,
                     },
@@ -287,6 +386,7 @@ class Payments:
         self._failed_rounds = 0  # so a request that waited behind one does not repeat it
         self._retry_at: float | None = None  # when to ask again; None when nothing was skipped
         self._clock = time.monotonic
+        self._failover = _Failover(self._now)  # tests move _clock: read it per call
         self._mcp_requirements: dict[str, list[PaymentRequirements]] = {}
         # Only what this deployment serves: the quantum tools (off by default) used to be
         # quoted at $0.50/$1.00 and verified, and only then answered "Unknown tool".
@@ -386,10 +486,19 @@ class Payments:
                 self._failed_rounds += 1
                 raise
 
+    def _now(self) -> float:
+        return self._clock()
+
     def _due(self, paying: bool) -> bool:
         if not self._initialized:
             return True
-        return not paying and self._retry_at is not None and self._clock() >= self._retry_at
+        if paying:
+            return False
+        if any(_refused(self._facilitators[i]) for i in self._answers):
+            # A key refused since the last round (CDP, mid-call): the next quote is built
+            # without it. Its paid calls fall through to the next facilitator meanwhile.
+            return True
+        return self._retry_at is not None and self._clock() >= self._retry_at
 
     async def _initialize(self) -> None:
         if self._initialized:
@@ -402,12 +511,22 @@ class Payments:
             if answer is not None:
                 fresh[index] = answer
 
+        # A facilitator that refused this service's key is not asked again: the key is only
+        # changed by a redeploy, which starts a new process.
+        asked = [i for i, client in enumerate(self._facilitators) if not _refused(client)]
         async with anyio.create_task_group() as tg:
-            for index, client in enumerate(self._facilitators):
-                tg.start_soon(ask, index, client)
+            for index in asked:
+                tg.start_soon(ask, index, self._facilitators[index])
         for index, client in enumerate(self._facilitators):
-            if index in fresh:
+            if index in fresh and not _refused(client):
                 self._answers[index], self._misses[index] = fresh[index], 0
+            elif index in self._answers and _refused(client):
+                # Not KEPT_ROUNDS: a refused key does not come back by itself.
+                del self._answers[index]
+                log.warning(
+                    "facilitator dropped: it refused this service's key",
+                    extra={"facilitator": getattr(client, "url", type(client).__name__)},
+                )
             elif index in self._answers:
                 # One failed GET moved Base from the facilitator serving it to the next that
                 # answered, for 300 s or more: its last answer stands, for a while.
@@ -419,9 +538,11 @@ class Payments:
                         extra={"facilitator": getattr(client, "url", type(client).__name__)},
                     )
         answered = [
-            _Answered(self._facilitators[i], self._answers[i], self._methods)
+            _Answered(self._facilitators[i], self._answers[i], self._methods, self._failover)
             for i in sorted(self._answers)
         ]
+        for place, facilitator in enumerate(answered):
+            facilitator.behind = answered[place + 1 :]
         routes = {n: self._serving(answered, n) for n, _ in self.accepted}
         served = [(n, pay_to) for n, pay_to in self.accepted if routes[n] is not None]
         if not served:
@@ -444,7 +565,7 @@ class Payments:
                 "network left out of quotes: no facilitator offers x402 v2 'exact' on it",
                 extra={"network": network},
             )
-        missing = len(fresh) < len(self._facilitators) or len(served) < len(self.accepted)
+        missing = len(fresh) < len(asked) or len(served) < len(self.accepted)
         self._retry_at = self._clock() + RETRY_SKIPPED_S if missing else None
 
     async def _supported(self, client: FacilitatorClient) -> SupportedResponse | None:

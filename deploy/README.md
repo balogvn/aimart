@@ -462,7 +462,7 @@ and agentic.market, where agents with Coinbase wallets look for services, shows 
 Bazaar holds. xpay and Primer settle for free but publish no list, so sales through them list
 the service nowhere ([discovery.md](../docs/discovery.md)). With a CDP key in the `production`
 environment, CDP settles Base first, and xpay, then Primer, take over when CDP does not
-answer. Cost: the first 1,000 settlements a month are free, then $0.001 each
+answer or fails to verify a payment. Cost: the first 1,000 settlements a month are free, then $0.001 each
 ([economics.md](../docs/economics.md)). Without the key nothing changes.
 
 The key is a **CDP Secret API key**: an ID and a secret. It lets the service ask CDP to verify
@@ -514,10 +514,14 @@ GitHub secrets below.
 
 In the app's log on modal.com, `facilitator refused this service's API key` (ERROR) means CDP
 answered 401 or 403 to a verify, a settle or `/supported`: the key was deleted, disabled or
-changed. Base then goes to xpay (sales continue, unlisted) until the key is fixed and the
-service redeployed. `CDP facilitator not used: ...` at start names a key that cannot be read.
+changed. Base then goes to xpay at once (sales continue, unlisted) until the key is fixed and
+the service redeployed; only a call CDP had already verified when it started refusing fails,
+unpaid. `CDP facilitator not used: ...` at start names a key that cannot be read.
 
-To stop using CDP: delete the two secrets and run Deploy to Modal again.
+To stop using CDP: delete the two secrets and run Deploy to Modal again, and only after that
+deploy is green delete the key in the portal (**API Keys → Secret API Keys**).
+In the other order nothing is lost either, but each running copy of the
+service logs the ERROR line above once.
 
 ### Logs
 

@@ -167,7 +167,7 @@ are both set and the mode is mainnet, Coinbase's CDP facilitator is put before t
 
 | mode | facilitators | networks |
 |---|---|---|
-| mainnet, with a CDP key | `https://api.cdp.coinbase.com/platform/v2/x402`, then the three defaults | Base `eip155:8453` (CDP; xpay, then Primer, when CDP is skipped) and Solana (Dexter) |
+| mainnet, with a CDP key | `https://api.cdp.coinbase.com/platform/v2/x402`, then the three defaults | Base `eip155:8453` (CDP; xpay, then Primer, when CDP is skipped or fails a verify) and Solana (Dexter) |
 
 CDP is the one facilitator whose settlements list the service in a catalog other agents
 search: the CDP Bazaar, which agentic.market shows (see [discovery.md](discovery.md)). It
@@ -181,14 +181,20 @@ carries `Authorization: Bearer <JWT>`, a JWT signed with the key (EdDSA for an E
 ES256 for ECDSA), valid 120 s and bound to that one request (`uris`: `POST
 api.cdp.coinbase.com/platform/v2/x402/settle`), as Coinbase's own SDKs make it. The settle
 answer is read by the same lenient reading as every facilitator's (`payments/settle.py`). The
-key is never logged, and a key CDP refuses costs nothing but the listing:
+key is never logged, and a key CDP refuses costs the listing, and at most the one call CDP
+had already verified when it started refusing:
 
-- At start (or in a retry round), a 401 or 403 to `GET /supported` skips CDP like any
-  facilitator that fails it, and Base goes to xpay. A key that cannot be read leaves CDP out
-  with `CDP facilitator not used: ...`, which says what is wrong with it, never what it is.
-- Any 401 or 403 from CDP is logged at ERROR, `facilitator refused this service's API key`,
-  naming the facilitator and the endpoint. A refused verify or settle is that call's unpaid
-  failure, as for any facilitator.
+- Any 401 or 403 from CDP, on any endpoint, marks the key refused for the life of the process
+  (`CdpFacilitatorClient.refused`): CDP is not asked again, the next quote is built without it
+  (the request that makes it starts a round at once, not after `KEPT_ROUNDS`), and Base goes
+  to xpay, unlisted, until a redeploy starts a process with a key CDP accepts. A key that
+  cannot be read leaves CDP out from the start with `CDP facilitator not used: ...`, which
+  says what is wrong with it, never what it is.
+- A refused verify falls through to the next facilitator, as every failed verify does (see
+  "Verify falls through; settle never does" below), so that call is still sold. A refused
+  settle is that call's unpaid failure: settle never falls through.
+- Each refusal is logged at ERROR, `facilitator refused this service's API key`, naming the
+  facilitator and the endpoint.
 - The deploy's selftest (`deploy/modal_app.py`) asks CDP's `GET /supported` with the key,
   which moves no money, and fails the deploy on a 401 or 403.
 
@@ -234,10 +240,19 @@ warning `facilitator dropped`, until it answers again: its networks go to the ne
 facilitator that lists them, or out of the quote, or, with nothing left, to the 503. A
 facilitator that answers and no longer lists a network loses it at once.
 
-Verify and settle have no failover: once a payment is being verified, its facilitator's
-failure is that call's typed, unpaid failure, as in the tables above. When every facilitator
-answered at the start nobody is asked again, so one that dies afterwards is quoted until the
-process restarts (on Modal, after 60 idle seconds) and its paid calls fail unpaid.
+**Verify falls through; settle never does.** When every facilitator answered nobody is asked
+`/supported` again, so a facilitator that fails afterwards stays first for its networks.
+Its verify failing (a non-200 such as 401, 429 or 503, a timeout, a connection error: not an
+answer that the payment is invalid, which is the payer's) is therefore not the call's end:
+the next facilitator that offers the network verifies the payment instead, once, with the
+warning `facilitator verify failed: the next facilitator verifies and settles`. Verify moves
+no money, so asking another is safe. The facilitator that verified a payment settles it
+(also the SDK's one retry of a `settlement_pending` answer); a settle that fails is the
+call's typed, unpaid failure and is never repeated elsewhere. The facilitator whose verify
+failed is passed over for verify for `VERIFY_REST_S` (60 s) while another offers the network,
+so a host that times out does not cost every call `facilitator_timeout_s`; a refused key is
+passed over for good (above). With nobody behind it, a failed verify is the call's unpaid
+402, as before (`tests/integration/test_fixup_cdp_failover.py`).
 
 ## Price floors
 

@@ -124,6 +124,10 @@ def secret() -> tuple[str, ed25519.Ed25519PublicKey]:
 
 @pytest.fixture
 def wire(monkeypatch: pytest.MonkeyPatch) -> Callable[[FakeCdp], CdpFacilitatorClient]:
+    return cdp_wire(monkeypatch)
+
+
+def cdp_wire(monkeypatch: pytest.MonkeyPatch) -> Callable[[FakeCdp], CdpFacilitatorClient]:
     """The service's CDP client with its sockets, async and the SDK's sync one, on ``fake``."""
 
     def build(fake: FakeCdp, secret: str) -> CdpFacilitatorClient:

@@ -209,9 +209,16 @@ already declares the extension on every paid REST route. The original trade-off 
 - The JWT is made per request in `payments/cdp.py` with `cryptography` (no new dependency),
   and handed to the SDK as an `AuthProvider`. Settle answers keep the lenient reading
   (`CdpFacilitatorClient` is a `LenientSettleClient`).
-- A key CDP refuses costs the listing, never a sale: a 401/403 to `/supported` skips CDP like
-  any facilitator that fails it (xpay serves Base), every 401/403 is logged at ERROR, and the
-  deploy's selftest fails on a refused key with one authenticated `GET /supported`.
+- A key CDP refuses costs the listing, and at most the one call CDP had verified when it
+  started refusing: any 401/403 keeps CDP out for the life of the process (not asked again,
+  dropped from the next quote without `KEPT_ROUNDS`), every 401/403 is logged at ERROR, and
+  the deploy's selftest fails on a refused key with one authenticated `GET /supported`.
+- After review (2026-11-17): CDP failing verify in a warm container (401/403, 429, 5xx, a
+  timeout) made every Base call a 402 with xpay never asked, because a container where every
+  facilitator answered never asks again. Verify now falls through, once, to the next
+  facilitator offering the network, and that one settles; settle never falls through, and a
+  facilitator whose verify failed rests for `VERIFY_REST_S` (docs/payments.md, "Verify falls
+  through; settle never does"). This also amends "Verify and settle are unchanged" above.
 
 ### Consequences
 
@@ -222,6 +229,7 @@ already declares the extension on every paid REST route. The original trade-off 
   ([economics.md](../economics.md)). Deleting the key and redeploying undoes it.
 - Not verified: a request to CDP with a real key (none exists yet; the deploy's selftest is
   the first), and CDP's listing behaviour beyond its documentation and other sellers'
-  reports. CDP's verify answers an invalid payment with HTTP 400 and a schema body; the SDK
-  reads any non-200 verify as a failure, so such a call is refused before any work, unpaid
-  (a 402 on REST, `isError` on MCP), as a refusal from any facilitator is.
+  reports. CDP's verify answers an invalid payment with HTTP 400 and a schema body
+  (`X402VerifyPaymentRejection`, `isValid: false`); `CdpFacilitatorClient` reads that as the
+  payer's answer, so the call is refused before any work, unpaid (a 402 on REST, `isError`
+  on MCP), without asking xpay or resting CDP.

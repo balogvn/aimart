@@ -40,8 +40,11 @@ import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+from pydantic import ValidationError
 from x402.http import FacilitatorConfig
+from x402.http.facilitator_client import _attach_extension_responses, _parse_facilitator_response
 from x402.http.facilitator_client_base import AuthHeaders
+from x402.schemas import VerifyResponse
 
 from aimart_parquet.config import NetworkMode
 from aimart_parquet.payments.settle import LenientSettleClient
@@ -190,9 +193,14 @@ class CdpFacilitatorClient(LenientSettleClient):
     """CDP's facilitator: the service's settle reading, CDP's auth, Base only.
 
     A 401 or 403 from any of its endpoints is a key CDP no longer accepts (revoked, deleted,
-    or never right): every Base sale would fall to the fallbacks, unlisted, or, mid-call,
-    fail unpaid. It is logged at ERROR naming the facilitator, never the key or the body.
+    or never right). It sets ``refused``, which ``Payments`` reads: CDP is not asked again by
+    this process, a paid call whose verify CDP refused is verified and settled by the next
+    facilitator (xpay), unlisted, and the next quote is built without CDP. A settle CDP refuses
+    after verifying is an unpaid failure (settle never falls through). It is logged at ERROR
+    naming the facilitator, never the key or the body.
     """
+
+    refused = False
 
     def __init__(
         self, config: FacilitatorConfig, *, networks: frozenset[str] = frozenset({BASE_MAINNET})
@@ -206,6 +214,32 @@ class CdpFacilitatorClient(LenientSettleClient):
         supported = super().get_supported()
         kinds = [kind for kind in supported.kinds if kind.network in self.networks]
         return supported.model_copy(update={"kinds": kinds})
+
+    async def _verify_http(
+        self, version: int, payload_dict: dict[str, Any], requirements_dict: dict[str, Any]
+    ) -> VerifyResponse:
+        """The SDK's verify, plus CDP's answer to an invalid payment: HTTP 400 with
+        ``{"isValid": false, "invalidReason": ...}`` (cdp-sdk 1.53.0,
+        ``x402_facilitator_api.verify_x402_payment``: '400' is ``X402VerifyPaymentRejection``).
+
+        That is the payer's answer, read as one: the SDK raises on any non-200, which would
+        make ``Payments`` ask the next facilitator and rest CDP for a payer's bad signature.
+        """
+        response = await self._get_async_client().post(
+            f"{self._url}/verify",
+            headers=self._get_verify_headers(),
+            json=self._build_request_body(version, payload_dict, requirements_dict),
+        )
+        if response.status_code == 400:
+            rejection = _rejection(response)
+            if rejection is not None:
+                return rejection
+        if response.status_code != 200:
+            # The status only: Payments logs the exception's type, never this message.
+            msg = f"Facilitator verify failed ({response.status_code})"
+            raise ValueError(msg)
+        verified = _parse_facilitator_response(response, VerifyResponse, "verify")
+        return _attach_extension_responses(verified, response)
 
     def _get_sync_client(self) -> httpx.Client:
         client = super()._get_sync_client()
@@ -221,9 +255,11 @@ class CdpFacilitatorClient(LenientSettleClient):
 
     def _note(self, response: httpx.Response) -> None:
         if response.status_code in AUTH_REFUSED:
+            self.refused = True
             log.error(
                 "facilitator refused this service's API key: check %s (the key may be "
-                "deleted, disabled or mistyped); Base is served by the next facilitator",
+                "deleted, disabled or mistyped); Base is served, unlisted, by the next "
+                "facilitator until the service restarts with a key CDP accepts",
                 SETTINGS_NAMES,
                 extra={
                     "facilitator": self.url,
@@ -237,6 +273,15 @@ class CdpFacilitatorClient(LenientSettleClient):
 
     async def _refused(self, response: httpx.Response) -> None:
         self._note(response)
+
+
+def _rejection(response: httpx.Response) -> VerifyResponse | None:
+    """A 400 body that says, in the schema, that the payment is invalid; else None."""
+    try:
+        answer = VerifyResponse.model_validate(response.json())
+    except (ValueError, TypeError, ValidationError):
+        return None
+    return answer if answer.is_valid is False and answer.invalid_reason else None
 
 
 def _values(settings: Settings) -> tuple[str, str]:
