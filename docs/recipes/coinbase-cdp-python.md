@@ -13,14 +13,17 @@ Pay AImart Parquet from the CDP server wallet your agent already has. Script:
 
 ## Install
 
-Nothing to install by hand. The script declares its dependencies (PEP 723), pinned exactly:
+Nothing to install by hand. The script declares its dependencies (PEP 723), pinned exactly,
+and every package they pull in is resolved as it was on 2026-11-03 (`exclude-newer`), so nothing
+in the signing path is younger than two weeks:
 
 ```
 cdp-sdk==1.51.0
 x402[evm,httpx]==2.25.0
 ```
 
-In your own project: `pip install cdp-sdk==1.51.0 'x402[evm,httpx]==2.25.0'`.
+In your own project, with the same cutoff:
+`uv pip install --exclude-newer 2026-11-03 cdp-sdk==1.51.0 'x402[evm,httpx]==2.25.0'`.
 
 ## Run
 
@@ -56,6 +59,9 @@ Python client). `convert_and_query` takes any signer.
 # /// script
 # requires-python = ">=3.12"
 # dependencies = ["cdp-sdk==1.51.0", "x402[evm,httpx]==2.25.0"]
+#
+# [tool.uv]
+# exclude-newer = "2026-11-03T00:00:00Z"
 # ///
 import asyncio
 
@@ -117,6 +123,8 @@ header `PAYMENT-RESPONSE` (base64 JSON: `success`, `transaction`, `network`, `am
 | `Coinbase: cannot use account ...` | the CDP variables or the account are wrong; nothing was paid |
 | `/v1/convert: no payment made: ... filtered out by policies` | the quote is above `--max-usd`; nothing was signed |
 | `/v1/convert: no payment made: ...` (anything else) | CDP refused to sign (credentials, or a policy denying the sign-hash call) |
+| `/v1/convert: no response, nothing paid: ...` | the service did not answer before anything was signed: a wrong `--url`, no network, or a cold start that timed out. Nothing was paid; run it again |
+| `/v1/convert: outcome unknown, a signed payment of 0.02 USDC was sent and may have been settled (...): look up https://basescan.org/address/0x… before paying again` | the paid request went out but its answer was lost (the connection dropped, or no answer within 180 seconds). The service may have settled it: open the link and look for that USDC transfer before you run it again. An authorization that was never settled expires after 300 seconds |
 | `payment rejected, not charged: insufficient_funds` | the account has too little USDC on Base. Other reasons come from the `PAYMENT-REQUIRED` header's `error` |
 | `payment not settled, result withheld: <reason>` | the work ran but the settlement failed: not charged, unless the line names a transaction; then look it up on basescan.org before paying again |
 | `HTTP 4xx, not charged: <message> <hint>` | the call itself failed (bad file, bad SQL); fix what the hint says |

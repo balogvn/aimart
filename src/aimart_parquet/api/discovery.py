@@ -168,7 +168,7 @@ def llms_txt(settings: Settings) -> str:
         f"- [Pricing]({base}/pricing): per-call prices in USDC",
         f"- [x402 discovery]({base}/.well-known/x402): payable resources",
         f"- [Wallet recipes]({RECIPES_URL}): pay from a Coinbase or Circle wallet in minutes; "
-        "coding agents: `npx skills add balogvn/aimart`",
+        "coding agents: `npx skills@1.7.5 add balogvn/aimart`",
         "",
         "## Operations",
         "",

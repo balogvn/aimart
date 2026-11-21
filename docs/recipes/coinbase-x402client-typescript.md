@@ -23,11 +23,13 @@ one was run end to end. If you want the path that was exercised, use that one.
 ```bash
 git clone --depth 1 https://github.com/balogvn/aimart
 cd aimart/docs/recipes/typescript/coinbase
-npm install
+npm ci
 ```
 
-In your own project:
-`npm install --save-exact @coinbase/cdp-sdk@1.60.0 @x402/core@2.29.0 @x402/evm@2.29.0 @x402/fetch@2.29.0 @x402/extensions@2.29.0 @x402/svm@2.29.0`.
+`npm ci` installs the folder's `package-lock.json`: every package as npm resolved it on 2026-11-03.
+
+In your own project, with the same cutoff:
+`npm install --save-exact --before=2026-11-03 @coinbase/cdp-sdk@1.60.0 @x402/core@2.29.0 @x402/evm@2.29.0 @x402/fetch@2.29.0 @x402/extensions@2.29.0 @x402/svm@2.29.0`.
 All four `@x402` packages are needed: the client imports them as soon as it loads.
 
 ## Run

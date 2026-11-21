@@ -200,7 +200,7 @@ build the most requested format or tool next.
 Coding agents (Claude Code, Cursor, Codex and others) install skills with the `skills` CLI
 (github.com/vercel-labs/skills). [`skills/aimart-parquet/SKILL.md`](../skills/aimart-parquet/SKILL.md)
 tells such an agent when to use the service, the calls, prices and bodies, and how to pay from a
-Coinbase or Circle wallet; developers install it with `npx skills add balogvn/aimart`. The CLI
+Coinbase or Circle wallet; developers install it with `npx skills@1.7.5 add balogvn/aimart`. The CLI
 reads its `name` and `description` frontmatter and finds it under `skills/`;
 `tests/integration/test_wallet_recipes.py` checks both, and that its prices, routes and pins
 match the code. The ready-made wallet code it points to is in [docs/recipes](recipes/README.md).

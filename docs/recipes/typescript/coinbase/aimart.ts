@@ -38,13 +38,42 @@ export function makePayer(signer: ClientEvmSigner, network: Network, maxUsd = "0
 }
 
 /** A base64 JSON payment header as an object; {} when it is absent or unreadable. */
-export function readHeader(response: Response, name: string): Record<string, any> {
+export function decode(header: string | null): Record<string, any> {
   try {
-    const value = JSON.parse(Buffer.from(response.headers.get(name) ?? "", "base64").toString("utf8"));
+    const value = JSON.parse(Buffer.from(header ?? "", "base64").toString("utf8"));
     return value && typeof value === "object" && !Array.isArray(value) ? value : {};
   } catch {
     return {};
   }
+}
+
+export function readHeader(response: Response, name: string): Record<string, any> {
+  return decode(response.headers.get(name));
+}
+
+/** The fetch under x402's: it notes each signed payment it hands to the network, so a call
+ * that gets no answer can say whether money may have moved. */
+export function watchPayments(fetchImpl: typeof fetch) {
+  const sent: Record<string, any>[] = []; // each PAYMENT-SIGNATURE sent, decoded
+  const watched = (input: RequestInfo | URL, init?: RequestInit) => {
+    const headers = input instanceof Request ? input.headers : new Headers(init?.headers);
+    const signed = headers.get("PAYMENT-SIGNATURE") ?? headers.get("X-PAYMENT");
+    if (signed) sent.push(decode(signed));
+    return fetchImpl(input, init);
+  };
+  return { fetch: watched as typeof fetch, sent };
+}
+
+/** A signed payment went out and no answer came back: it may have been settled. */
+export function outcomeUnknown(payment: Record<string, any>, reason: string): string {
+  const accepted = payment.accepted ?? {};
+  const payer = String(payment.payload?.authorization?.from ?? "");
+  const explorer = EXPLORERS[accepted.network] ?? "https://basescan.org";
+  const where = payer.startsWith("0x") ? `${explorer}/address/${payer}` : `your wallet on ${explorer}`;
+  return (
+    `outcome unknown, a signed payment of ${usdc(BigInt(accepted.amount ?? 0))} USDC was sent and may ` +
+    `have been settled (${reason}): look up ${where} before paying again`
+  );
 }
 
 /** Why a paid call did not deliver. A 402's body is {}: the reason is in a header. */
@@ -73,40 +102,50 @@ export function failure(response: Response, text: string): string {
   return `payment not settled, result withheld: ${why}`;
 }
 
+/** Atomic units as USDC: 20000n is "0.02". */
+function usdc(amount: bigint): string {
+  const unit = 10n ** BigInt(USDC_DECIMALS);
+  return `${amount / unit}.${(amount % unit).toString().padStart(USDC_DECIMALS, "0")}`.replace(/\.?0+$/, "");
+}
+
 export function paidLine(receipt: Record<string, any>): string {
-  const amount = BigInt(receipt.amount ?? 0);
-  const usdc = `${amount / 10n ** 6n}.${(amount % 10n ** 6n).toString().padStart(6, "0")}`.replace(/\.?0+$/, "");
+  const amount = usdc(BigInt(receipt.amount ?? 0));
   const transaction: string = receipt.transaction || "not named";
   const explorer = EXPLORERS[receipt.network];
   const link = explorer && transaction.startsWith("0x") ? ` ${explorer}/tx/${transaction}` : "";
-  return `paid ${usdc} USDC, tx ${transaction}${link}`;
+  return `paid ${amount} USDC, tx ${transaction}${link}`;
 }
 
 /**
  * Convert `source` (default: the sample CSV's URL) and query it: two paid calls. Throws NotPaid
- * with one line when a call does not deliver; a call that fails is not charged. The artifact is
- * printed as soon as the conversion is paid for.
+ * with one line when a call does not deliver: a call that fails is not charged, and a paid call
+ * whose answer is lost says so. The artifact is printed as soon as the conversion is paid for.
  */
 export async function convertAndQuery(
   payer: x402Client,
   { baseUrl = AIMART_URL, source = { url: SAMPLE_CSV } as Record<string, unknown>, sql = SQL, fetchImpl = fetch } = {},
 ) {
-  const pay = wrapFetchWithPayment(fetchImpl, payer);
+  const watch = watchPayments(fetchImpl);
+  const pay = wrapFetchWithPayment(watch.fetch, payer);
   const post = async (path: string, body: unknown) => {
+    const before = watch.sent.length;
     let response: Response;
+    let text: string;
     try {
       response = await pay(`${baseUrl}${path}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
       });
+      text = await response.text();
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const reason = `${error instanceof Error ? error.message : error}`.split(/\s+/).join(" ");
+      // Only the watch knows whether a signed payment left before the answer was lost.
+      if (watch.sent.length > before) throw new NotPaid(`${path}: ${outcomeUnknown(watch.sent.at(-1)!, reason)}`);
       // The x402 client throws this before anything is signed: over the cap, or the wallet failed.
-      const unpaid = message.startsWith("Failed to create payment payload");
-      throw new NotPaid(`${path}: ${unpaid ? "no payment made" : "no response"}: ${message}`);
+      const unpaid = reason.startsWith("Failed to create payment payload");
+      throw new NotPaid(`${path}: ${unpaid ? "no payment made" : "no response, nothing paid"}: ${reason}`);
     }
-    const text = await response.text();
     if (response.status !== 200) throw new NotPaid(`${path}: ${failure(response, text)}`);
     return { result: JSON.parse(text), receipt: readHeader(response, "PAYMENT-RESPONSE") };
   };
@@ -134,21 +173,32 @@ export async function runFromCommandLine(
   walletFlag: string,
   makeClient: (wallet: string, network: Network, maxUsd: string) => Promise<x402Client>,
 ): Promise<void> {
-  const { values } = parseArgs({
-    options: {
-      [walletFlag]: { type: "string" },
-      "max-usd": { type: "string", default: "0.02" },
-      network: { type: "string", default: "base" },
-      url: { type: "string", default: process.env.AIMART_URL ?? AIMART_URL },
-    },
-  });
-  const wallet = values[walletFlag];
-  const network = NETWORKS[values.network as keyof typeof NETWORKS];
+  const usage = `usage: --${walletFlag} <value> [--max-usd 0.02] [--network base|base-sepolia] [--url ${AIMART_URL}]`;
   const stop = (line: string) => {
     console.error(line);
     process.exit(1);
   };
-  if (typeof wallet !== "string") return stop(`pass --${walletFlag}`);
+  let values: Record<string, string | boolean | undefined>;
+  try {
+    ({ values } = parseArgs({
+      options: {
+        [walletFlag]: { type: "string" },
+        "max-usd": { type: "string", default: "0.02" },
+        network: { type: "string", default: "base" },
+        url: { type: "string", default: process.env.AIMART_URL ?? AIMART_URL },
+        help: { type: "boolean", short: "h" },
+      },
+    }));
+  } catch (error) {
+    return stop(`${error instanceof Error ? error.message : error}; ${usage}`);
+  }
+  if (values.help) {
+    console.log(usage);
+    return;
+  }
+  const wallet = values[walletFlag];
+  const network = NETWORKS[values.network as keyof typeof NETWORKS];
+  if (typeof wallet !== "string") return stop(`pass --${walletFlag}; ${usage}`);
   if (!network) return stop(`--network is one of: ${Object.keys(NETWORKS).join(", ")}`);
   if (network === NETWORKS.base && process.env.AIMART_MAINNET_CONFIRM !== MAINNET_CONFIRM) {
     return stop(`this spends real USDC on Base: set AIMART_MAINNET_CONFIRM=${MAINNET_CONFIRM}`);

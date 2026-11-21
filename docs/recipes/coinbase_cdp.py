@@ -2,6 +2,9 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = ["cdp-sdk==1.51.0", "x402[evm,httpx]==2.25.0"]
+#
+# [tool.uv]
+# exclude-newer = "2026-11-03T00:00:00Z"  # every package at least 14 days old
 # ///
 """Pay AImart Parquet from a Coinbase CDP server wallet: convert a CSV, then query it.
 
@@ -75,13 +78,54 @@ def make_payer(signer: Any, *, network: str, max_usd: Decimal) -> x402Client:
     return payer
 
 
-def read_header(response: httpx.Response, name: str) -> dict[str, Any]:
+def decode(header: str | None) -> dict[str, Any]:
     """A base64 JSON payment header as a dict; {} when it is absent or unreadable."""
     try:
-        value = json.loads(base64.b64decode(response.headers.get(name) or ""))
+        value = json.loads(base64.b64decode(header or ""))
     except ValueError:
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def read_header(response: httpx.Response, name: str) -> dict[str, Any]:
+    return decode(response.headers.get(name))
+
+
+class PaymentWatch(httpx.AsyncBaseTransport):
+    """The transport under x402's. It notes each signed payment it hands to the network, so a
+    call that gets no answer can say whether money may have moved."""
+
+    def __init__(self, transport: httpx.AsyncBaseTransport) -> None:
+        self._transport = transport
+        self.sent: list[dict[str, Any]] = []  # each PAYMENT-SIGNATURE sent, decoded
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        signed = request.headers.get("PAYMENT-SIGNATURE") or request.headers.get("X-PAYMENT")
+        if signed:
+            self.sent.append(decode(signed))
+        return await self._transport.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
+
+
+def reason(error: Exception) -> str:
+    return " ".join(str(error).split()) or type(error).__name__
+
+
+def outcome_unknown(payment: dict[str, Any], error: Exception) -> str:
+    """A signed payment went out and no answer came back: it may have been settled."""
+    accepted = payment.get("accepted") or {}
+    payer = str(((payment.get("payload") or {}).get("authorization") or {}).get("from") or "")
+    amount = Decimal(str(accepted.get("amount") or 0)) / USDC
+    explorer = EXPLORERS.get(str(accepted.get("network")), "https://basescan.org")
+    where = (
+        f"{explorer}/address/{payer}" if payer.startswith("0x") else f"your wallet on {explorer}"
+    )
+    return (
+        f"outcome unknown, a signed payment of {amount} USDC was sent and may have been settled"
+        f" ({reason(error)}): look up {where} before paying again"
+    )
 
 
 def failure(response: httpx.Response) -> str:
@@ -109,12 +153,21 @@ def failure(response: httpx.Response) -> str:
     return f"payment not settled, result withheld: {why}"
 
 
-async def paid_post(http: httpx.AsyncClient, path: str, body: dict[str, Any]) -> dict[str, Any]:
+async def paid_post(
+    http: httpx.AsyncClient, watch: PaymentWatch, path: str, body: dict[str, Any]
+) -> dict[str, Any]:
     """POST through the paying transport; the JSON result, with the receipt under ``_receipt``."""
+    sent = len(watch.sent)
     try:
         response = await http.post(path, json=body)
-    except PaymentError as error:  # over the cap, or the wallet could not sign
-        raise NotPaid(f"{path}: no payment made: {error}") from error
+    except (PaymentError, httpx.HTTPError) as error:
+        # x402 reports every failure after the 402 as a PaymentError, a lost answer to the paid
+        # request included; only the watch knows whether a signed payment left.
+        if len(watch.sent) > sent:
+            raise NotPaid(f"{path}: {outcome_unknown(watch.sent[-1], error)}") from error
+        if isinstance(error, PaymentError):  # over the cap, or the wallet could not sign
+            raise NotPaid(f"{path}: no payment made: {reason(error)}") from error
+        raise NotPaid(f"{path}: no response, nothing paid: {reason(error)}") from error
     if response.status_code != 200:
         raise NotPaid(f"{path}: {failure(response)}")
     result: dict[str, Any] = response.json()
@@ -140,16 +193,19 @@ async def convert_and_query(
 ) -> dict[str, Any]:
     """Convert ``source`` (default: the sample CSV's URL) and query it; two paid calls.
 
-    Raises NotPaid with one line when a call does not deliver; a call that fails is not
-    charged. The artifact is printed as soon as the conversion is paid for.
+    Raises NotPaid with one line when a call does not deliver: a call that fails is not
+    charged, and a paid call whose answer is lost says so. The artifact is printed as soon as
+    the conversion is paid for.
     """
-    paying = x402AsyncTransport(payer, transport or httpx.AsyncHTTPTransport(retries=2))
+    watch = PaymentWatch(transport or httpx.AsyncHTTPTransport(retries=2))
+    paying = x402AsyncTransport(payer, watch)
     async with httpx.AsyncClient(base_url=base_url, transport=paying, timeout=180) as http:
-        converted = await paid_post(http, "/v1/convert", source or {"url": SAMPLE_CSV})
+        converted = await paid_post(http, watch, "/v1/convert", source or {"url": SAMPLE_CSV})
         artifact = converted["artifact"]
         print(f"convert: {converted['report']['rows']} rows; {paid_line(converted['_receipt'])}")
         print(f"artifact: {artifact['id']} (until {artifact['expires_at']})")
-        queried = await paid_post(http, "/v1/query", {"artifact_id": artifact["id"], "sql": sql})
+        query = {"artifact_id": artifact["id"], "sql": sql}
+        queried = await paid_post(http, watch, "/v1/query", query)
         print(f"query: {queried['columns']} {queried['rows']}; {paid_line(queried['_receipt'])}")
     return {"artifact_id": artifact["id"], "convert": converted, "query": queried}
 

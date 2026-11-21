@@ -77,7 +77,10 @@ AIMART_MAINNET_CONFIRM=I_UNDERSTAND_THIS_SPENDS_REAL_USDC \
 TypeScript versions are in the same folder. In your own code: Python `x402[evm,httpx]==2.25.0`
 (`x402Client` + `ExactEvmClientScheme` + `x402AsyncTransport`, with
 `register_policy(max_amount(20000))`), or TypeScript `@x402/fetch@2.29.0` (`wrapFetchWithPayment`)
-with a policy that drops quotes above 20000. These clients also pay the MCP tools.
+with a policy that drops quotes above 20000. The same payer pays the MCP tools, but not through
+these HTTP wrappers: in TypeScript wrap the MCP client with `@x402/mcp@2.29.0`
+(`wrapMCPClientWithPayment`); in Python sign the `PaymentRequired` a tool returns with
+`create_payment_payload` and call again with `_meta["x402/payment"]`.
 
 ### Coinbase Agentic Wallet CLI (not yet confirmed)
 
@@ -103,13 +106,18 @@ Payments MCP's `make_http_request_with_x402` tool takes the same values (`baseUR
 
 Circle agent wallets are smart accounts, which this service's facilitator is not confirmed to
 accept, and the wallet must have made one transaction on Base before it can sign. REST only.
-First call a $0.002 inspect the same way:
+`--estimate` shows the quote without paying; then make the first paid call a $0.002 inspect,
+and only after it succeeds call convert and query the same way (`--max-amount 0.02` and `0.005`):
 
 ```bash
-circle services pay "https://balogvn--aimart-parquet.us-east.modal.run/v1/convert" -X POST \
+npx @circle-fin/cli@1.2.2 services pay "https://balogvn--aimart-parquet.us-east.modal.run/v1/inspect" -X POST \
   --address 0xYourAgentWallet --chain BASE \
-  -d '{"url":"https://raw.githubusercontent.com/balogvn/aimart/main/docs/examples/sales.csv"}' \
-  --max-amount 0.02 --timeout 120 --output json
+  -d '{"url":"https://raw.githubusercontent.com/balogvn/aimart/main/docs/examples/sales.parquet"}' \
+  --max-amount 0.002 --timeout 120 --output json --estimate
+npx @circle-fin/cli@1.2.2 services pay "https://balogvn--aimart-parquet.us-east.modal.run/v1/inspect" -X POST \
+  --address 0xYourAgentWallet --chain BASE \
+  -d '{"url":"https://raw.githubusercontent.com/balogvn/aimart/main/docs/examples/sales.parquet"}' \
+  --max-amount 0.002 --timeout 120 --output json
 ```
 
 `--max-amount` is in USDC here, and `--timeout 120` covers a cold start. Do not use Circle

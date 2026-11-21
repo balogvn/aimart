@@ -13,14 +13,17 @@ Pay AImart Parquet from the Circle developer-controlled wallet your agent alread
 
 ## Install
 
-Nothing to install by hand. The script declares its dependencies (PEP 723), pinned exactly:
+Nothing to install by hand. The script declares its dependencies (PEP 723), pinned exactly,
+and every package they pull in is resolved as it was on 2026-11-03 (`exclude-newer`), so nothing
+in the signing path is younger than two weeks:
 
 ```
 circle-developer-controlled-wallets==9.6.0
 x402[evm,httpx]==2.25.0
 ```
 
-In your own project: `pip install circle-developer-controlled-wallets==9.6.0 'x402[evm,httpx]==2.25.0'`.
+In your own project, with the same cutoff:
+`uv pip install --exclude-newer 2026-11-03 circle-developer-controlled-wallets==9.6.0 'x402[evm,httpx]==2.25.0'`.
 
 ## Run
 
@@ -56,6 +59,9 @@ string, as Circle's own x402 quickstart does. `convert_and_query` takes any sign
 # /// script
 # requires-python = ">=3.12"
 # dependencies = ["circle-developer-controlled-wallets==9.6.0", "x402[evm,httpx]==2.25.0"]
+#
+# [tool.uv]
+# exclude-newer = "2026-11-03T00:00:00Z"
 # ///
 import asyncio
 import json
@@ -158,6 +164,8 @@ header `PAYMENT-RESPONSE` (base64 JSON: `success`, `transaction`, `network`, `am
 | `Circle: cannot use wallet ...` | the Circle client could not start (for example a malformed entity secret); nothing was paid |
 | `/v1/convert: no payment made: ... filtered out by policies` | the quote is above `--max-usd`; Circle was not asked to sign |
 | `/v1/convert: no payment made: ...` (anything else) | Circle refused to sign: a wrong key or entity secret, a wallet not found on `BASE`, or an SCA wallet that is not deployed yet |
+| `/v1/convert: no response, nothing paid: ...` | the service did not answer before anything was signed: a wrong `--url`, no network, or a cold start that timed out. Nothing was paid; run it again |
+| `/v1/convert: outcome unknown, a signed payment of 0.02 USDC was sent and may have been settled (...): look up https://basescan.org/address/0x… before paying again` | the paid request went out but its answer was lost (the connection dropped, or no answer within 180 seconds). The service may have settled it: open the link and look for that USDC transfer before you run it again. An authorization that was never settled expires after 300 seconds |
 | `payment rejected, not charged: insufficient_funds` | the wallet has too little USDC on Base. Other reasons come from the `PAYMENT-REQUIRED` header's `error`; an SCA wallet may be refused here too |
 | `payment not settled, result withheld: <reason>` | the work ran but the settlement failed: not charged, unless the line names a transaction; then look it up on basescan.org before paying again |
 | `HTTP 4xx, not charged: <message> <hint>` | the call itself failed (bad file, bad SQL); fix what the hint says |

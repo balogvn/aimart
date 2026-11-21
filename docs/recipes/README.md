@@ -16,7 +16,7 @@ queries it for $0.025.
 | Circle developer-controlled wallet (EOA on BASE) | TypeScript | 5 | [circle-typescript.md](circle-typescript.md) |
 
 A coding agent (Claude Code, Cursor, Codex and others) can also learn the service as a skill:
-`npx skills add balogvn/aimart` installs [skills/aimart-parquet](../../skills/aimart-parquet/SKILL.md).
+`npx skills@1.7.5 add balogvn/aimart` installs [skills/aimart-parquet](../../skills/aimart-parquet/SKILL.md).
 
 ## Where and how much
 

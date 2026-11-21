@@ -14,16 +14,18 @@ payment part [`aimart.ts`](typescript/coinbase/aimart.ts). Other wallets: [recip
 
 ## Install
 
-The folder's `package.json` pins every package exactly:
+The folder's `package.json` pins every package exactly, and its `package-lock.json` pins every
+package they pull in, as npm resolved them on 2026-11-03: nothing in the signing path is younger
+than two weeks. `npm ci` installs exactly the lock:
 
 ```bash
 git clone --depth 1 https://github.com/balogvn/aimart
 cd aimart/docs/recipes/typescript/coinbase
-npm install
+npm ci
 ```
 
-In your own project:
-`npm install --save-exact @coinbase/cdp-sdk@1.60.0 @x402/core@2.29.0 @x402/evm@2.29.0 @x402/fetch@2.29.0 @x402/extensions@2.29.0 @x402/svm@2.29.0`.
+In your own project, with the same cutoff:
+`npm install --save-exact --before=2026-11-03 @coinbase/cdp-sdk@1.60.0 @x402/core@2.29.0 @x402/evm@2.29.0 @x402/fetch@2.29.0 @x402/extensions@2.29.0 @x402/svm@2.29.0`.
 `@coinbase/cdp-sdk/x402` loads `@x402/extensions` and `@x402/svm` as soon as it is imported, so
 install them even though only Base is used.
 
@@ -117,6 +119,8 @@ decodes it with `decodePaymentResponseHeader`.
 | `not paid: ...` before any call | the CDP variables or the account are wrong; nothing was paid |
 | `/v1/convert: no payment made: ... filtered out by policies` | the quote is above `--max-usd`; nothing was signed |
 | `/v1/convert: no payment made: ...` (anything else) | CDP refused to sign (credentials, or a CDP policy) |
+| `/v1/convert: no response, nothing paid: ...` | the service did not answer before anything was signed: a wrong `--url`, no network, or a cold start that timed out. Nothing was paid; run it again |
+| `/v1/convert: outcome unknown, a signed payment of 0.02 USDC was sent and may have been settled (...): look up https://basescan.org/address/0x… before paying again` | the paid request went out but its answer was lost (the connection dropped, or no answer came). The service may have settled it: open the link and look for that USDC transfer before you run it again. An authorization that was never settled expires after 300 seconds |
 | `payment rejected, not charged: insufficient_funds` | the account has too little USDC on Base. Other reasons come from the `PAYMENT-REQUIRED` header's `error` |
 | `payment not settled, result withheld: <reason>` | the work ran but the settlement failed: not charged, unless the line names a transaction; then look it up on basescan.org before paying again |
 | `HTTP 4xx, not charged: <message> <hint>` | the call itself failed (bad file, bad SQL); fix what the hint says |

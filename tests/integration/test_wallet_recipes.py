@@ -146,6 +146,7 @@ async def pay(
     *,
     max_usd: str = "0.02",
     sql: str = SQL,
+    network: Callable[[httpx.AsyncBaseTransport], httpx.AsyncBaseTransport] = lambda t: t,
 ) -> dict[str, Any]:
     """Run the recipe's payment part against the app; a NotPaid is raised after the app stops
     (raised inside, the app's task group would wrap it in an ExceptionGroup)."""
@@ -158,7 +159,7 @@ async def pay(
                 base_url=kit.BASE_URL,
                 source=SOURCE,
                 sql=sql,
-                transport=httpx.ASGITransport(app=h.app),
+                transport=network(httpx.ASGITransport(app=h.app)),
             )
         except recipe.NotPaid as error:
             stopped = error
@@ -302,6 +303,73 @@ async def test_a_failed_call_is_not_charged_and_says_why(name: str, settings: Se
     assert [r.amount for _, r in facilitator.settled] == ["20000"]  # only the convert
 
 
+class LostAnswer(httpx.AsyncBaseTransport):
+    """The network under the recipe: a request that carries a signed payment gets no answer,
+    after the service has handled it (settled) or before it arrives."""
+
+    def __init__(self, app: httpx.AsyncBaseTransport, *, delivered: bool) -> None:
+        self.app = app
+        self.delivered = delivered
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if "PAYMENT-SIGNATURE" not in request.headers:
+            return await self.app.handle_async_request(request)
+        if not self.delivered:
+            raise httpx.ReadTimeout("timed out", request=request)
+        await self.app.handle_async_request(request)
+        raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("name", "wallet"), WALLETS)
+@pytest.mark.parametrize("delivered", [True, False], ids=["settled-then-dropped", "timed-out"])
+async def test_a_paid_call_whose_answer_is_lost_never_says_nothing_was_paid(
+    name: str, wallet: Any, delivered: bool, settings: Settings
+) -> None:
+    """x402 wraps any error after the 402 in a PaymentError, the lost answer to the paid
+    request included; the recipe must not call that "no payment made"."""
+    recipe = load(name)
+    signer, _ = wallet(recipe)
+    facilitator = kit.FakeFacilitator()
+    with pytest.raises(recipe.NotPaid) as stopped:
+        await pay(
+            settings,
+            recipe,
+            signer,
+            facilitator,
+            network=lambda app: LostAnswer(app, delivered=delivered),
+        )
+    line = str(stopped.value)
+    assert line.startswith("/v1/convert: outcome unknown, a signed payment of 0.02 USDC was sent")
+    assert f"look up https://sepolia.basescan.org/address/{signer.address} before paying" in line
+    assert "no payment made" not in line
+    assert "nothing paid" not in line
+    assert "\n" not in line
+    assert [r.amount for _, r in facilitator.settled] == (["20000"] if delivered else [])
+
+
+class Unreachable(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("All connection attempts failed", request=request)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("name", "wallet"), WALLETS)
+async def test_a_service_that_does_not_answer_is_one_line_and_nothing_paid(
+    name: str, wallet: Any, settings: Settings
+) -> None:
+    recipe = load(name)
+    signer, signatures = wallet(recipe)
+    facilitator = kit.FakeFacilitator()
+    with pytest.raises(recipe.NotPaid) as stopped:
+        await pay(settings, recipe, signer, facilitator, network=lambda _: Unreachable())
+    assert str(stopped.value) == (
+        "/v1/convert: no response, nothing paid: All connection attempts failed"
+    )
+    assert signatures() == 0
+    assert facilitator.verified == []
+
+
 @pytest.mark.parametrize(
     "headers",
     [
@@ -421,14 +489,14 @@ def test_the_python_pins_on_every_page_are_the_scripts_pins() -> None:
 
 def test_the_npm_pins_on_every_page_are_the_package_json_pins() -> None:
     pins = npm_pins()
-    tools = {"awal": "2.12.1"}
+    tools = {"awal": "2.12.1", "skills": "1.7.5", "@circle-fin/cli": "1.2.2"}
     checked = set()
     for name, text in published_text().items():
         for package, version in re.findall(
             r"(?<![\w/@.-])(@[\w-]+/[\w-]+|[a-z][\w-]*)@(\d+\.\d+\.\d+)", text
         ):
             checked.add(package)
-            # The @x402 packages move together; awal is a CLI the skill runs, not a dependency.
+            # The @x402 packages move together; the tools are CLIs the docs run, not dependencies.
             x402 = package.startswith("@x402/")
             expected = pins["@x402/core"] if x402 else pins.get(package) or tools.get(package)
             assert expected == version, f"{name}: {package}@{version}, pinned {expected}"
@@ -437,6 +505,42 @@ def test_the_npm_pins_on_every_page_are_the_package_json_pins() -> None:
         "@circle-fin/developer-controlled-wallets",
         "@x402/fetch",
     } <= checked
+
+
+CUTOFF = "2026-11-03"  # every locked package was published before it, 14 days before the recipes
+
+
+@pytest.mark.parametrize("script", list(SCRIPTS))
+def test_the_python_scripts_resolve_nothing_newer_than_the_cutoff(script: str) -> None:
+    text = (RECIPES / f"{script}.py").read_text()
+    block = re.search(r"^# /// script\n(.*?)^# ///$", text, re.M | re.S)
+    assert block is not None
+    assert f'# [tool.uv]\n# exclude-newer = "{CUTOFF}T00:00:00Z"' in block.group(1)
+    page = (RECIPES / SCRIPTS[script]).read_text()
+    assert f"--exclude-newer {CUTOFF}" in page
+    assert f'# exclude-newer = "{CUTOFF}T00:00:00Z"' in page  # the short program on the page
+
+
+@pytest.mark.parametrize("folder", list(TS_FOLDERS))
+def test_each_typescript_folder_ships_the_lock_its_pages_install(folder: str) -> None:
+    path = TS_FOLDERS[folder]
+    package = json.loads((path / "package.json").read_text())
+    lock = json.loads((path / "package-lock.json").read_text())
+    pins = {**package["dependencies"], **package["devDependencies"]}
+    assert lock["packages"][""]["dependencies"] == package["dependencies"]
+    assert lock["packages"][""]["devDependencies"] == package["devDependencies"]
+    for name, version in pins.items():
+        assert lock["packages"][f"node_modules/{name}"]["version"] == version, name
+    for entry in lock["packages"].values():
+        if "resolved" in entry:
+            assert entry["resolved"].startswith("https://registry.npmjs.org/"), entry["resolved"]
+    pages = [p for p in PAGES if f"typescript/{folder}" in p.read_text()]
+    assert pages
+    for page in pages:
+        text = page.read_text()
+        assert "\nnpm ci\n" in text, page.name
+        assert "\nnpm install\n" not in text, page.name
+        assert f"--before={CUTOFF}" in text, page.name
 
 
 def test_the_typescript_payment_part_is_one_file() -> None:
@@ -518,14 +622,14 @@ def test_urls_on_every_page_are_live_and_in_the_repo() -> None:
 def test_llms_txt_points_to_the_recipes(settings: Settings) -> None:
     text = llms_txt(settings)
     [line] = [line for line in text.splitlines() if RECIPES_URL in line]
-    assert "npx skills add balogvn/aimart" in line
+    assert "npx skills@1.7.5 add balogvn/aimart" in line
     assert RECIPES_URL == "https://github.com/balogvn/aimart/tree/main/docs/recipes"
     assert (ROOT / "docs" / "recipes" / "README.md").is_file()
 
 
 # ------------------------------------------------------------------------------ the skill
 def test_the_skill_has_the_frontmatter_the_skills_cli_requires() -> None:
-    """vercel-labs/skills 1.9.0 (parseSkillMd): the block between the first two --- lines is
+    """vercel-labs/skills 1.7.5, as the docs pin it (parseSkillMd): the block between the first two --- lines is
     YAML; name and description must be non-empty strings; line breaks are folded into spaces.
     It searches <repo>/skills/<name>/SKILL.md among its first places."""
     text = SKILL.read_text()
