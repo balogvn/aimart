@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/balogvn/aimart/compare/v0.1.3...v0.1.4) (2026-11-17)
+
+
+### Bug fixes
+
+* **deps:** Bump the runtime group with 5 updates ([15c2b68](https://github.com/balogvn/aimart/commit/15c2b68069f54c0cdb26d65bdbe13ca404e62952))
+
 ## [0.1.3](https://github.com/balogvn/aimart/compare/v0.1.2...v0.1.3) (2026-11-17)
 
 
