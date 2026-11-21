@@ -98,6 +98,9 @@ core and 2 GiB, $0.063 an hour awake, and spent the $1 in a day and a half.
    New Token). Modal may show the token inside a `modal token set ...` command; only two pieces
    of it are wanted: `MODAL_TOKEN_ID` (it starts with `ak-`) and `MODAL_TOKEN_SECRET` (it starts
    with `as-`). A Proxy Auth Token (`wk-`/`ws-`) is a different thing and does not work here.
+   Optional, on mainnet: two more environment secrets, `AIMART_CDP_API_KEY_ID` and
+   `AIMART_CDP_API_KEY_SECRET`, put Coinbase's facilitator first for Base and list the service
+   in the CDP Bazaar and on agentic.market (section 2, "List the service in the CDP Bazaar").
 2. **Settings → Secrets and variables → Actions → Variables**:
 
 | Variable | Required | Value |
@@ -454,6 +457,74 @@ npx awal x402 pay https://<workspace>--aimart-parquet.modal.run/v1/convert -X PO
 pay: say what it showed. Whether this tool reads x402 version 2 quotes, which this service
 sends in the `PAYMENT-REQUIRED` header, was not checked.
 
+### List the service in the CDP Bazaar (optional, mainnet)
+
+Coinbase's CDP facilitator lists a service in its **Bazaar** after it settles a payment for it,
+and agentic.market, where agents with Coinbase wallets look for services, shows what the
+Bazaar holds. xpay and Primer settle for free but publish no list, so sales through them list
+the service nowhere ([discovery.md](../docs/discovery.md)). With a CDP key in the `production`
+environment, CDP settles Base first, and xpay, then Primer, take over when CDP does not
+answer or fails to verify a payment. Cost: the first 1,000 settlements a month are free, then $0.001 each
+([economics.md](../docs/economics.md)). Without the key nothing changes.
+
+The key is a **CDP Secret API key**: an ID and a secret. It lets the service ask CDP to verify
+and settle payments; it is not a wallet and cannot move the USDC paid to your payee address.
+Never paste it into a chat, a file in the repository or a GitHub variable: only into the two
+GitHub secrets below.
+
+1. **Create a CDP account.** Open <https://portal.cdp.coinbase.com> and sign up (an email, or
+   your Coinbase account). A project is made for you.
+2. **Create the key.** In the portal's left menu choose **API Keys**, then the **Secret API
+   Keys** tab, then **Create API key**. Give it a name such as `aimart-facilitator`.
+   - Signature algorithm: leave the default, **Ed25519** (ECDSA works too).
+   - Permissions: give it the least the form allows. The facilitator needs no wallet, trade or
+     transfer permission: Coinbase submits the transfer the payer signed and pays the gas. If
+     the form has an IP allowlist, leave it empty: Modal's addresses change.
+   - Click **Create**. The portal shows the **API key ID** and the **API key secret** once (it
+     may also offer a file download). Keep that page open for step 3.
+3. **Put both into GitHub.** In the repository: **Settings → Environments → production →
+   Environment secrets → Add environment secret**.
+   - Name `AIMART_CDP_API_KEY_ID`; Value: paste the API key ID (a short code like
+     `1a2b3c4d-...`). **Add secret**.
+   - Again: Name `AIMART_CDP_API_KEY_SECRET`; Value: paste the API key secret (an Ed25519
+     secret is one line of 88 characters ending in `==`; an ECDSA one is a block from
+     `-----BEGIN EC PRIVATE KEY-----` to `-----END EC PRIVATE KEY-----`: paste all of it).
+     From a downloaded file, paste only the value after `"privateKey":`, without the quotes.
+     **Add secret**.
+
+   Then close the portal's page. GitHub never shows a secret again; to change one, add it
+   again under the same name. Spaces and line breaks around a pasted value are ignored.
+4. **Deploy.** **Actions → Deploy to Modal → Run workflow** on `main` (every release after
+   this deploys with the key by itself). The deploy checks the two values' shape before
+   building (its log says `CDP key (Ed25519) has the right shape: CDP settles Base first`,
+   never the values), and the selftest asks CDP, with the key, for its list of networks, which
+   moves no money. Its line `selftest ok: {...}` then contains `CDP accepted the key; it lists
+   x402 v2 'exact' on eip155:8453`. If CDP refuses the key the run fails at the selftest with
+   `CDP refused the API key (HTTP 401)`: the new version is already serving, with Base on xpay
+   as before, so no sale is lost; check that the two secrets hold the right pieces (not
+   swapped, nothing missing), or create a new key, and run the workflow again.
+5. **Make one paid call** as in "Make one paid test call" above, with
+   `docs/examples/agent_pays.py` (its conversion and inspect go through REST, whose 402 carries
+   the Bazaar description the payer's wallet echoes back). Each REST route is listed after its
+   own first payment settled through CDP: the example lists `/v1/convert` and `/v1/inspect`;
+   `/v1/preview` and `/v1/query` follow with their first customers.
+6. **Confirm the listing**, up to about 15 minutes later. Open, in a browser,
+   `https://api.cdp.coinbase.com/platform/v2/x402/discovery/merchant?payTo=<your payee address>`
+   (public, no key): it lists every resource CDP holds for your address, and the service's
+   `/v1/convert` should be among them. Then search for "parquet" on <https://agentic.market>.
+   Not listed after a day: see "Troubleshooting" (section 5).
+
+In the app's log on modal.com, `facilitator refused this service's API key` (ERROR) means CDP
+answered 401 or 403 to a verify, a settle or `/supported`: the key was deleted, disabled or
+changed. Base then goes to xpay at once (sales continue, unlisted) until the key is fixed and
+the service redeployed; only a call CDP had already verified when it started refusing fails,
+unpaid. `CDP facilitator not used: ...` at start names a key that cannot be read.
+
+To stop using CDP: delete the two secrets and run Deploy to Modal again, and only after that
+deploy is green delete the key in the portal (**API Keys → Secret API Keys**).
+In the other order nothing is lost either, but each running copy of the
+service logs the ERROR line above once.
+
 ### Logs
 
 `gcloud run services logs read aimart-parquet --region us-central1 --project "$PROJECT_ID"`, or
@@ -639,3 +710,5 @@ more memory, and set `AIMART_GCS_BUCKET` so stored artifacts leave the RAM disk.
 | MCP requests rejected with a host error | `AIMART_PUBLIC_BASE_URL` does not match the host being called; the MCP transport allows only that host (and localhost). |
 | Paid calls return 503 "facilitator is unreachable" | No configured facilitator answered `GET /supported` with x402 v2 'exact' on a network you accept; nothing is charged, and the next request asks again. The app's log names each one (`facilitator skipped`). Run the probe in "Switching to mainnet", or name others in `AIMART_FACILITATOR_URLS`. One facilitator down alone does not cause this. |
 | Service paused | The spend cap was reached (1.2 A). Raise it or wait for the next month. |
+| Deploy to Modal fails at the selftest: `CDP refused the API key (HTTP 401)` (or 403) | The two `AIMART_CDP_API_KEY_*` secrets do not hold a key CDP accepts: swapped, a piece missing, or the key deleted in the portal. The new version is serving anyway, with Base on xpay. Add both secrets again, or a new key, and redeploy (section 2, "List the service in the CDP Bazaar"). |
+| Settled through CDP, yet not in the Bazaar after a day | The paying client must echo the 402's `bazaar` extension (the x402 SDKs do); only the paid route is listed, not every route; CDP lists asynchronously. Check `https://api.cdp.coinbase.com/platform/v2/x402/discovery/merchant?payTo=<payee>`, then ask CDP's support with the settlement's transaction. |

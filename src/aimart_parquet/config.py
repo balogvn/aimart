@@ -59,6 +59,23 @@ class Settings(BaseSettings):
             "by the first facilitator that supports it. Default depends on network_mode."
         ),
     )
+    cdp_api_key_id: SecretStr | None = Field(
+        default=None,
+        description=(
+            "ID of a CDP Secret API key (portal.cdp.coinbase.com). With "
+            "AIMART_CDP_API_KEY_SECRET, on mainnet, Coinbase's CDP facilitator settles Base "
+            "first, which lists the service in the CDP Bazaar and on agentic.market; xpay and "
+            "Primer stay behind it. Unset: nothing changes. An API credential for the "
+            "facilitator, not a wallet key: it cannot move the payee's funds."
+        ),
+    )
+    cdp_api_key_secret: SecretStr | None = Field(
+        default=None,
+        description=(
+            "The secret of that key: base64 (Ed25519) or a PEM block (ECDSA). Never logged; a "
+            "key CDP refuses is skipped with one error line, and the deploy's selftest fails."
+        ),
+    )
     payments_enabled: bool = True
     # Floors are set by facilitator economics, not taste: Dexter rejects payments under about
     # $0.0013 on Solana mainnet, and fee-charging facilitators cost $0.001-0.002 per settlement.

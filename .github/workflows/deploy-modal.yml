@@ -12,8 +12,11 @@
 # app's recent log lines are printed, without the access log.
 #
 # Authentication: the production environment's secrets MODAL_TOKEN_ID and MODAL_TOKEN_SECRET (a
-# token from Modal's settings). Modal's Starter plan has no rollbacks: if a deploy fails its
-# checks, fix forward, or run this workflow on the previous release's tag.
+# token from Modal's settings). Optional, in the same environment: AIMART_CDP_API_KEY_ID and
+# AIMART_CDP_API_KEY_SECRET, a CDP Secret API key that puts Coinbase's facilitator first for Base
+# (deploy/README.md, "List the service in the CDP Bazaar"); the selftest fails if CDP refuses it.
+# Modal's Starter plan has no rollbacks: if a deploy fails its checks, fix forward, or run this
+# workflow on the previous release's tag.
 
 name: Deploy to Modal
 
@@ -32,6 +35,10 @@ on:
       MODAL_TOKEN_ID:
         required: false
       MODAL_TOKEN_SECRET:
+        required: false
+      AIMART_CDP_API_KEY_ID:
+        required: false
+      AIMART_CDP_API_KEY_SECRET:
         required: false
   workflow_dispatch:
     inputs:
@@ -78,6 +85,8 @@ jobs:
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          AIMART_CDP_API_KEY_ID: ${{ secrets.AIMART_CDP_API_KEY_ID }}
+          AIMART_CDP_API_KEY_SECRET: ${{ secrets.AIMART_CDP_API_KEY_SECRET }}
           AIMART_PUBLIC_BASE_URL: ${{ vars.AIMART_PUBLIC_BASE_URL }}
           AIMART_NETWORK_MODE: ${{ vars.AIMART_NETWORK_MODE }}
           AIMART_PAY_TO_EVM: ${{ vars.AIMART_PAY_TO_EVM }}

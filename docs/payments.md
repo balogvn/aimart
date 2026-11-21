@@ -162,6 +162,42 @@ default until 2026-11-15: its `/supported` answered 502 for days. The fees and m
 in [economics.md](economics.md), and the choice and the survey behind it are recorded in
 [ADR 0003](adr/0003-facilitators-and-price-floors.md).
 
+**With a CDP key (optional).** When `AIMART_CDP_API_KEY_ID` and `AIMART_CDP_API_KEY_SECRET`
+are both set and the mode is mainnet, Coinbase's CDP facilitator is put before the defaults:
+
+| mode | facilitators | networks |
+|---|---|---|
+| mainnet, with a CDP key | `https://api.cdp.coinbase.com/platform/v2/x402`, then the three defaults | Base `eip155:8453` (CDP; xpay, then Primer, when CDP is skipped or fails a verify) and Solana (Dexter) |
+
+CDP is the one facilitator whose settlements list the service in a catalog other agents
+search: the CDP Bazaar, which agentic.market shows (see [discovery.md](discovery.md)). It
+charges $0.001 per settlement after 1,000 a month ([economics.md](economics.md)). Only Base
+is taken from what its `/supported` lists: Solana stays with Dexter, which is free. Without
+the key, or on testnet, nothing changes; an explicit `AIMART_FACILITATOR_URLS` is the whole
+list, and CDP gets the key wherever that list names it (`payments/cdp.py`).
+
+CDP's `/verify`, `/settle` and `/supported` need the key (its Bazaar lists do not): each request
+carries `Authorization: Bearer <JWT>`, a JWT signed with the key (EdDSA for an Ed25519 key,
+ES256 for ECDSA), valid 120 s and bound to that one request (`uris`: `POST
+api.cdp.coinbase.com/platform/v2/x402/settle`), as Coinbase's own SDKs make it. The settle
+answer is read by the same lenient reading as every facilitator's (`payments/settle.py`). The
+key is never logged, and a key CDP refuses costs the listing, and at most the one call CDP
+had already verified when it started refusing:
+
+- Any 401 or 403 from CDP, on any endpoint, marks the key refused for the life of the process
+  (`CdpFacilitatorClient.refused`): CDP is not asked again, the next quote is built without it
+  (the request that makes it starts a round at once, not after `KEPT_ROUNDS`), and Base goes
+  to xpay, unlisted, until a redeploy starts a process with a key CDP accepts. A key that
+  cannot be read leaves CDP out from the start with `CDP facilitator not used: ...`, which
+  says what is wrong with it, never what it is.
+- A refused verify falls through to the next facilitator, as every failed verify does (see
+  "Verify falls through; settle never does" below), so that call is still sold. A refused
+  settle is that call's unpaid failure: settle never falls through.
+- Each refusal is logged at ERROR, `facilitator refused this service's API key`, naming the
+  facilitator and the endpoint.
+- The deploy's selftest (`deploy/modal_app.py`) asks CDP's `GET /supported` with the key,
+  which moves no money, and fails the deploy on a 401 or 403.
+
 **What a payer on Base needs.** USDC on Base for the price, and nothing else: no ETH and no
 approval. The client signs one EIP-3009 `TransferWithAuthorization` (EIP-712, domain
 `USD Coin` version `2` on chain 8453, the USDC contract) for the quoted amount to the quoted
@@ -204,10 +240,19 @@ warning `facilitator dropped`, until it answers again: its networks go to the ne
 facilitator that lists them, or out of the quote, or, with nothing left, to the 503. A
 facilitator that answers and no longer lists a network loses it at once.
 
-Verify and settle have no failover: once a payment is being verified, its facilitator's
-failure is that call's typed, unpaid failure, as in the tables above. When every facilitator
-answered at the start nobody is asked again, so one that dies afterwards is quoted until the
-process restarts (on Modal, after 60 idle seconds) and its paid calls fail unpaid.
+**Verify falls through; settle never does.** When every facilitator answered nobody is asked
+`/supported` again, so a facilitator that fails afterwards stays first for its networks.
+Its verify failing (a non-200 such as 401, 429 or 503, a timeout, a connection error: not an
+answer that the payment is invalid, which is the payer's) is therefore not the call's end:
+the next facilitator that offers the network verifies the payment instead, once, with the
+warning `facilitator verify failed: the next facilitator verifies and settles`. Verify moves
+no money, so asking another is safe. The facilitator that verified a payment settles it
+(also the SDK's one retry of a `settlement_pending` answer); a settle that fails is the
+call's typed, unpaid failure and is never repeated elsewhere. The facilitator whose verify
+failed is passed over for verify for `VERIFY_REST_S` (60 s) while another offers the network,
+so a host that times out does not cost every call `facilitator_timeout_s`; a refused key is
+passed over for good (above). With nobody behind it, a failed verify is the call's unpaid
+402, as before (`tests/integration/test_fixup_cdp_failover.py`).
 
 ## Price floors
 
@@ -226,7 +271,7 @@ fee-versus-margin arithmetic in [economics.md](economics.md). Do not set
 | `AIMART_NETWORK_MODE` | `testnet` | `mainnet` |
 | Base | Sepolia `eip155:84532`, USDC `0x036CbD53842c5426634e7929541eC2318f3dCF7e` | `eip155:8453`, USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
 | Solana | devnet `solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1` | `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` |
-| facilitators | x402.org | xpay, Primer, Dexter |
+| facilitators | x402.org | xpay, Primer, Dexter (CDP first for Base with a CDP key) |
 | money | test USDC from a faucet | **real** |
 
 To switch, an operator sets `AIMART_NETWORK_MODE=mainnet` plus mainnet `AIMART_PAY_TO_EVM`

@@ -1,6 +1,7 @@
 # 0003: Free keyless facilitators by default; $0.002 price floor
 
-- Status: accepted; the mainnet list was amended on 2026-11-15 (see the end)
+- Status: accepted; the mainnet list was amended on 2026-11-15, and CDP added before it, when
+  the owner configures a key, on 2026-11-17 (see the end)
 - Date: 2026-10-17 (built in commit 40b6380; recorded 2026-10-18)
 
 ## Context and problem statement
@@ -163,3 +164,72 @@ A review of the above reproduced three faults, fixed the same day
 Still true, and accepted: when every facilitator answered at the start nobody is asked
 again, so one that dies afterwards is quoted until the process restarts; its paid calls
 fail unpaid. On Modal a container lives 60 idle seconds, so this is short there.
+
+## Amendment, 2026-11-17: CDP first for Base when the owner configures a key
+
+### Context
+
+Two days of mainnet sales through xpay listed the service in no catalog: xpay and Primer
+publish none, and the catalogs agents search are fed by settlements. Coinbase's CDP
+facilitator indexes a route in its Bazaar once it settles a payment for it whose payload
+echoes the route's `bazaar` extension, and agentic.market (Coinbase's marketplace, where
+agents with Coinbase wallets look for services) shows what the Bazaar holds. This service
+already declares the extension on every paid REST route. The original trade-off (above:
+"no CDP Bazaar listing unless an operator adds CDP and its key") is now worth taking.
+
+### What was verified, and where
+
+- Endpoint: `https://api.cdp.coinbase.com/platform/v2/x402`, with `/verify`, `/settle` and
+  `/supported` (x402 repository's seller quickstart, "Running on Mainnet"; `@coinbase/x402`
+  2.1.0, `createFacilitatorConfig`; cdp-sdk 1.53.0's OpenAPI client, base path
+  `https://api.cdp.coinbase.com/platform`, routes `/v2/x402/...`).
+- Authentication: `/verify`, `/settle` and `/supported` require the API key (`apiKeyAuth` in
+  cdp-sdk's `x402_facilitator_api.py`); the `/discovery/*` lists, `/discovery/merchant` and
+  `/validate` are public (cdp-sdk's `public_operations.py`). `@coinbase/x402` sends a JWT on
+  verify, settle and supported, and none on the Bazaar list.
+- The JWT (cdp-sdk `cdp/auth/utils/jwt.py`; `@coinbase/cdp-sdk` 1.62.0 `auth/utils/jwt.js`):
+  `EdDSA` for an Ed25519 key (base64 of a 32-byte seed and the 32-byte public key) or `ES256`
+  for an ECDSA P-256 key (PEM); header `alg`, `kid` (the key ID), `typ: JWT`, a random
+  `nonce`; claims `sub` (the key ID), `iss: "cdp"`, `nbf`/`iat` now, `exp` now + 120 s, and
+  `uris: ["<METHOD> api.cdp.coinbase.com/platform/v2/x402/<endpoint>"]`, one request each.
+  The x402 Python SDK (2.25.0) makes no JWT; it carries headers per endpoint through
+  `FacilitatorConfig.auth_provider` (`AuthProvider.get_auth_headers()`), which
+  `LenientSettleClient` already sends on settle (`_get_settle_headers`).
+- Fee: the first 1,000 settlements a month free, then $0.001 each (CDP's facilitator page, as
+  reported by search on 2026-11-17: docs.cdp.coinbase.com did not resolve from the build
+  machine, so this was not read first-hand).
+
+### Decision
+
+- With `AIMART_CDP_API_KEY_ID` and `AIMART_CDP_API_KEY_SECRET` both set (secrets, from the
+  `production` environment) and the mode mainnet, the list is
+  `https://api.cdp.coinbase.com/platform/v2/x402`, then the three defaults. Without them,
+  nothing changes. CDP is given Base only: its Solana offer is dropped from its `/supported`
+  answer, so Dexter, free, keeps Solana.
+- The JWT is made per request in `payments/cdp.py` with `cryptography` (no new dependency),
+  and handed to the SDK as an `AuthProvider`. Settle answers keep the lenient reading
+  (`CdpFacilitatorClient` is a `LenientSettleClient`).
+- A key CDP refuses costs the listing, and at most the one call CDP had verified when it
+  started refusing: any 401/403 keeps CDP out for the life of the process (not asked again,
+  dropped from the next quote without `KEPT_ROUNDS`), every 401/403 is logged at ERROR, and
+  the deploy's selftest fails on a refused key with one authenticated `GET /supported`.
+- After review (2026-11-17): CDP failing verify in a warm container (401/403, 429, 5xx, a
+  timeout) made every Base call a 402 with xpay never asked, because a container where every
+  facilitator answered never asks again. Verify now falls through, once, to the next
+  facilitator offering the network, and that one settles; settle never falls through, and a
+  facilitator whose verify failed rests for `VERIFY_REST_S` (docs/payments.md, "Verify falls
+  through; settle never does"). This also amends "Verify and settle are unchanged" above.
+
+### Consequences
+
+- Good: Base sales list the service in the CDP Bazaar and on agentic.market, route by route.
+- Bad: a secret to manage, the first in the deployment that a third party issues. It is an
+  API credential for the facilitator, not a wallet key: it cannot move the payee's USDC.
+- Bad: $0.001 per Base settlement after 1,000 a month: half the margin of a $0.002 call
+  ([economics.md](../economics.md)). Deleting the key and redeploying undoes it.
+- Not verified: a request to CDP with a real key (none exists yet; the deploy's selftest is
+  the first), and CDP's listing behaviour beyond its documentation and other sellers'
+  reports. CDP's verify answers an invalid payment with HTTP 400 and a schema body
+  (`X402VerifyPaymentRejection`, `isValid: false`); `CdpFacilitatorClient` reads that as the
+  payer's answer, so the call is refused before any work, unpaid (a 402 on REST, `isError`
+  on MCP), without asking xpay or resting CDP.
