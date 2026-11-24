@@ -2,6 +2,9 @@
 
 <!-- mcp-name: io.github.balogvn/aimart-parquet -->
 
+[![balogvn/aimart MCP server](https://glama.ai/mcp/servers/balogvn/aimart/badges/score.svg)](https://glama.ai/mcp/servers/balogvn/aimart)
+[![AImart Parquet MCP connector](https://glama.ai/mcp/connectors/io.github.balogvn/aimart-parquet/badges/score.svg)](https://glama.ai/mcp/connectors/io.github.balogvn/aimart-parquet)
+
 Messy data in, clean Parquet out, paid per call by AI agents.
 
 AImart Parquet is an MCP server and REST API that turns messy CSV/TSV, JSON/NDJSON, Excel,
