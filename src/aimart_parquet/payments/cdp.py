@@ -63,7 +63,26 @@ BASE_MAINNET = "eip155:8453"
 BASE_SEPOLIA = "eip155:84532"
 JWT_LIFETIME_S = 120  # what both of Coinbase's SDKs give a request's JWT
 AUTH_REFUSED = frozenset({401, 403})
+# CDP's 402 on settle: ``PaymentMethodRequiredError`` (cdp-sdk openapi.yaml), "A valid payment
+# method is required ... Please add a payment method to your account at
+# https://portal.cdp.coinbase.com", once the account's free settlements are used up. Like a
+# refused key, it does not pass by itself.
+PAYMENT_METHOD_REQUIRED = 402
 SETTINGS_NAMES = "AIMART_CDP_API_KEY_ID and AIMART_CDP_API_KEY_SECRET"
+# Verify answers in which CDP says it could not read the chain (cdp-sdk openapi.yaml,
+# ``x402VerifyInvalidReason``): CDP's failure, not the payer's answer, so the call is verified
+# by the next facilitator and CDP is rested, as for a 5xx. Reasons that may be the payer's
+# doing (``..._failed_to_parse_signature``, ``..._failed_to_verify_signature``,
+# ``..._failed_to_execute_transfer``) stay the payer's answer.
+CHAIN_UNREAD = frozenset(
+    {
+        "invalid_exact_evm_failed_to_get_network_config",
+        "invalid_exact_evm_failed_to_check_nonce",
+        "invalid_exact_evm_failed_to_get_balance",
+        "invalid_exact_evm_failed_to_check_deployment",
+        "invalid_exact_evm_failed_to_get_receipt",
+    }
+)
 
 _UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 # A Secret API key's ID: a bare UUID (Ed25519 keys, as the portal shows them) or the older
@@ -197,7 +216,8 @@ class CdpFacilitatorClient(LenientSettleClient):
     this process, a paid call whose verify CDP refused is verified and settled by the next
     facilitator (xpay), unlisted, and the next quote is built without CDP. A settle CDP refuses
     after verifying is an unpaid failure (settle never falls through). It is logged at ERROR
-    naming the facilitator, never the key or the body.
+    naming the facilitator, never the key or the body. A 402 is CDP asking for a payment method
+    on the account (its free settlements are used up): the same, with a line naming that fix.
     """
 
     refused = False
@@ -224,6 +244,8 @@ class CdpFacilitatorClient(LenientSettleClient):
 
         That is the payer's answer, read as one: the SDK raises on any non-200, which would
         make ``Payments`` ask the next facilitator and rest CDP for a payer's bad signature.
+        But not when the reason says CDP could not read the chain (``CHAIN_UNREAD``), with a
+        400 or a 200: that is raised, so the next facilitator verifies and CDP is rested.
         """
         response = await self._get_async_client().post(
             f"{self._url}/verify",
@@ -239,6 +261,9 @@ class CdpFacilitatorClient(LenientSettleClient):
             msg = f"Facilitator verify failed ({response.status_code})"
             raise ValueError(msg)
         verified = _parse_facilitator_response(response, VerifyResponse, "verify")
+        if _chain_unread(verified):
+            msg = "Facilitator verify failed (200: it could not read the chain)"
+            raise ValueError(msg)
         return _attach_extension_responses(verified, response)
 
     def _get_sync_client(self) -> httpx.Client:
@@ -254,6 +279,11 @@ class CdpFacilitatorClient(LenientSettleClient):
         return client
 
     def _note(self, response: httpx.Response) -> None:
+        where = {
+            "facilitator": self.url,
+            "status": response.status_code,
+            "endpoint": response.request.url.path.rsplit("/", 1)[-1],
+        }
         if response.status_code in AUTH_REFUSED:
             self.refused = True
             log.error(
@@ -261,11 +291,16 @@ class CdpFacilitatorClient(LenientSettleClient):
                 "deleted, disabled or mistyped); Base is served, unlisted, by the next "
                 "facilitator until the service restarts with a key CDP accepts",
                 SETTINGS_NAMES,
-                extra={
-                    "facilitator": self.url,
-                    "status": response.status_code,
-                    "endpoint": response.request.url.path.rsplit("/", 1)[-1],
-                },
+                extra=where,
+            )
+        elif response.status_code == PAYMENT_METHOD_REQUIRED:
+            self.refused = True
+            log.error(
+                "CDP asks for a payment method on the account this service's API key belongs "
+                "to (its free settlements are used up): add one in the CDP portal "
+                "(portal.cdp.coinbase.com), then run Deploy to Modal; until then Base is "
+                "served, unlisted, by the next facilitator",
+                extra=where,
             )
 
     def _refused_sync(self, response: httpx.Response) -> None:
@@ -275,11 +310,18 @@ class CdpFacilitatorClient(LenientSettleClient):
         self._note(response)
 
 
+def _chain_unread(answer: VerifyResponse) -> bool:
+    """Whether CDP says it could not read the chain, rather than that the payment is invalid."""
+    return answer.is_valid is False and answer.invalid_reason in CHAIN_UNREAD
+
+
 def _rejection(response: httpx.Response) -> VerifyResponse | None:
     """A 400 body that says, in the schema, that the payment is invalid; else None."""
     try:
         answer = VerifyResponse.model_validate(response.json())
     except (ValueError, TypeError, ValidationError):
+        return None
+    if _chain_unread(answer):
         return None
     return answer if answer.is_valid is False and answer.invalid_reason else None
 

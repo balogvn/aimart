@@ -464,8 +464,11 @@ and agentic.market, where agents with Coinbase wallets look for services, shows 
 Bazaar holds. xpay and Primer settle for free but publish no list, so sales through them list
 the service nowhere ([discovery.md](../docs/discovery.md)). With a CDP key in the `production`
 environment, CDP settles Base first, and xpay, then Primer, take over when CDP does not
-answer or fails to verify a payment. Cost: the first 1,000 settlements a month are free, then $0.001 each
-([economics.md](../docs/economics.md)). Without the key nothing changes.
+answer, fails to verify a payment, or fails to settle one (for the calls after it: a settle is
+never repeated elsewhere, so that one call is unpaid). Cost: the first 1,000 settlements a month
+are free, then $0.001 each ([economics.md](../docs/economics.md)); past the free ones CDP asks
+for a payment method on the CDP account, so add one in the portal (**Billing**) before sales
+get near 1,000 a month (see the log lines below). Without the key nothing changes.
 
 The key is a **CDP Secret API key**: an ID and a secret. It lets the service ask CDP to verify
 and settle payments; it is not a wallet and cannot move the USDC paid to your payee address.
@@ -518,7 +521,15 @@ In the app's log on modal.com, `facilitator refused this service's API key` (ERR
 answered 401 or 403 to a verify, a settle or `/supported`: the key was deleted, disabled or
 changed. Base then goes to xpay at once (sales continue, unlisted) until the key is fixed and
 the service redeployed; only a call CDP had already verified when it started refusing fails,
-unpaid. `CDP facilitator not used: ...` at start names a key that cannot be read.
+unpaid. `CDP asks for a payment method on the account` (ERROR) means CDP answered 402: the
+account's free settlements are used up. Base goes to xpay the same way; add a payment method in
+the portal, then run Deploy to Modal to bring CDP back. `facilitator settle failed: the next
+facilitator verifies and settles the calls after this one` (WARNING) is a settle CDP did not
+answer (a timeout, a 5xx, a 429): that call is unpaid, the next minute of calls goes to xpay,
+then CDP is asked again. `facilitator refused to settle and named a transaction: check it on
+chain` (WARNING) names a transfer CDP broadcast without confirming it: look the transaction up
+on basescan.org; if it landed, that payer paid for a call that answered "failed", so refund it
+by hand. `CDP facilitator not used: ...` at start names a key that cannot be read.
 
 To stop using CDP: delete the two secrets and run Deploy to Modal again, and only after that
 deploy is green delete the key in the portal (**API Keys → Secret API Keys**).

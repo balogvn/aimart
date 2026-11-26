@@ -26,8 +26,15 @@ The rules, in ``read_settle_answer``:
 * A refusal that names a transaction stays a refusal (the transfer may be pending and still
   land: AGENTS.md, Known gaps) and is logged at WARNING however it was worded.
 
-A non-2xx, a timeout and a connection error are raised, as the SDK raises them. After a 2xx
-nothing here raises: every outcome is a ``SettleResponse``.
+A timeout, a connection error and a non-2xx are raised, as the SDK raises them, but for one
+kind of non-2xx: a JSON object that says ``"success": false`` is the refusal it states
+(``_stated_refusal``). CDP answers every settle it rejects that way, as HTTP 400, with
+``settlement_pending`` among the reasons: a transfer CDP broadcast and whose receipt it could
+not read yet, with the transaction named. Raised, that answer lost the transaction and the SDK's
+one retry of a pending settlement, and the caller was told "failed" while the transfer could
+still land (review of 2026-11-26); read, the retry runs, and the receipt and a WARNING line name
+the transaction. After a 2xx, or such a refusal, nothing here raises: every outcome is a
+``SettleResponse``.
 """
 
 from __future__ import annotations
@@ -259,6 +266,26 @@ def read_settle_answer(status: int, data: Any, network: str) -> tuple[SettleResp
     )
 
 
+def _stated_refusal(response: httpx.Response, network: str) -> SettleResponse | None:
+    """A non-2xx answer whose JSON object says ``"success": false``, read as that; else None.
+
+    CDP's ``X402SettlePaymentRejection`` (cdp-sdk ``openapi.yaml``: POST /v2/x402/settle, '400'):
+    ``{"success": false, "errorReason", "errorMessage", "payer", "transaction", "network"}``,
+    whose ``transaction`` is set when ``errorReason`` is ``settlement_pending``. Coinbase's
+    TypeScript client reads such a body as the refusal it is (``SettleError``) and its server
+    retries a pending one; the SDK's Python client raises on it. Only a JSON ``false`` counts:
+    anything else in a non-2xx stays an error, never a settlement.
+    """
+    try:
+        data = response.json()
+    except ValueError:  # not JSON, or not text
+        return None
+    if not isinstance(data, dict) or data.get("success") is not False:
+        return None
+    refused, _ = read_settle_answer(response.status_code, data, network)
+    return None if refused.success else refused
+
+
 class LenientSettleClient(HTTPFacilitatorClient):
     """The SDK's HTTP facilitator client, with this service's reading of the settle answer.
 
@@ -276,18 +303,39 @@ class LenientSettleClient(HTTPFacilitatorClient):
     ) -> SettleResponse:
         response = await self._post_settle(payload, requirements)
         status = response.status_code
-        if not 200 <= status < 300:
-            # As the SDK: an exception is "not settled" to both paywalls. Its message reaches
-            # the caller as the reason, so it carries a short excerpt, not a whole error page.
-            log.warning(
-                "facilitator refused to settle",
-                extra={"facilitator": self.url, "status": status},
-            )
-            excerpt = " ".join(response.text.split())[:TEXT_LIMIT]
-            msg = f"Facilitator settle failed ({status}): {excerpt}"
-            raise ValueError(msg)
-        # From here on the transfer may have been made: nothing below may raise.
         network = str(getattr(requirements, "network", ""))
+        if not 200 <= status < 300:
+            refused = _stated_refusal(response, network)
+            if refused is None:
+                # As the SDK: an exception is "not settled" to both paywalls. Its message
+                # reaches the caller as the reason, so it carries a short excerpt, not a whole
+                # error page.
+                log.warning(
+                    "facilitator refused to settle",
+                    extra={"facilitator": self.url, "status": status},
+                )
+                excerpt = " ".join(response.text.split())[:TEXT_LIMIT]
+                msg = f"Facilitator settle failed ({status}): {excerpt}"
+                raise ValueError(msg)
+            # The refusal it states (CDP's every rejection): a returned refusal, so the SDK
+            # retries a pending one there, and the receipt keeps the transaction. Its reason
+            # and transaction are logged, never the body.
+            log.warning(
+                "facilitator refused to settle and named a transaction: check it on chain"
+                if refused.transaction
+                else "facilitator refused to settle",
+                extra={
+                    "facilitator": self.url,
+                    "status": status,
+                    "reason": (refused.error_reason or "")[:TEXT_LIMIT],
+                    "transaction": refused.transaction[:TEXT_LIMIT],
+                },
+            )
+            try:
+                return _attach_extension_responses(refused, response)
+            except Exception:  # noqa: BLE001 - a side channel for hooks; the refusal stands
+                return refused
+        # From here on the transfer may have been made: nothing below may raise.
         try:
             settled, reading = read_settle_answer(status, response.json(), network)
         except Exception:  # noqa: BLE001 - a body that is not JSON, or a fault in the reading
