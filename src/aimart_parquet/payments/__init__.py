@@ -108,16 +108,18 @@ VERIFY_REST_S = 60.0
 # job queue lets run at once. One pushed out settles with the facilitator first in line, which
 # did not verify it: that settle fails, and the call is unpaid, never charged twice.
 SETTLERS_KEPT = 1024
-# Settle refusals that state the facilitator's own failure, not the payer's (cdp-sdk
-# openapi.yaml, ``x402SettleErrorReason``; ``cdp.CHAIN_UNREAD``, which CDP also gives at
-# settle): they rest it, as a settle that raised does. Stated as refusals, CDP's node failures
-# used to keep every later Base call on CDP, each run and refused at settle (review 2026-11-26).
-# Not a confirmation that timed out: it names a transfer already broadcast, a slow chain more
-# often than CDP's fault, and it does not keep the next payment from settling there.
+# Settle refusals that may be CDP's own failure (cdp-sdk openapi.yaml, ``x402SettleErrorReason``,
+# and ``cdp.CDP_FAILURES``, which CDP also gives at settle): they rest CDP, as a settle that
+# raised does. Stated as refusals, CDP's node failures used to keep every later Base call on
+# CDP, each run and refused at settle (review 2026-11-26). Resting moves no money, so the list
+# leans generous; the payer's own reasons (insufficient funds, a used nonce, an expired
+# authorization) are not in it. Not a confirmation that timed out: it names a transfer already
+# broadcast, a slow chain more often than CDP's fault.
 SETTLE_FAULTS = frozenset(
     {
         "settle_exact_node_failure",
-        *cdp.CHAIN_UNREAD,
+        "invalid_exact_evm_failed_to_execute_transfer",
+        *cdp.CDP_FAILURES,
     }
 )
 
@@ -311,8 +313,14 @@ class _Answered:
         verified, run and then refused at settle, while xpay stood behind it (review of
         2026-11-26). Any other stated refusal (``"success": false``) does not rest it: that is
         its answer about this payment, often the payer's doing.
+
+        Only CDP is rested this way. xpay, first when CDP is not, keeps its place after a failed
+        settle as before: resting it would hand Base to Primer, whose settle answer has never
+        been seen (AGENTS.md, Known gaps).
         """
         if client is not self.client:  # the one behind, settling what it verified
+            return
+        if not isinstance(client, cdp.CdpFacilitatorClient):
             return
         network = getattr(requirements, "network", None)
         after = next((a for a in self.behind if network and a.offers(network)), None)
@@ -390,6 +398,19 @@ class _Answered:
             other = f" naming {settled.transaction}" if settled.transaction else ""
             settled = self._still_pending(
                 pending, url, f"{settled.error_reason or 'a refusal'}{other}"
+            )
+        if pending is not None and settled.success:
+            # The first answer left a 'named a transaction: check it on chain' line, which the
+            # owner reconciles and refunds from: this one says that payment settled and was
+            # delivered, so nothing is owed (review of 2026-11-26).
+            log.warning(
+                "facilitator settled a pending payment on its second try: no refund is due "
+                "for this transaction",
+                extra={
+                    "facilitator": url,
+                    "transaction": settled.transaction[:TEXT_LIMIT],
+                    "pending_transaction": pending.transaction[:TEXT_LIMIT],
+                },
             )
         # x402 v2 makes the amount optional and xpay leaves it out: the first receipts on
         # mainnet named a transaction and no amount, and the example client crashed on them.

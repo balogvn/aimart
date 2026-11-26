@@ -27,9 +27,13 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import pytest
 from tests.integration.test_cdp_facilitator import BODY, CSV, TX, FakeCdp, cdp_wire, new_secret
+from x402 import SupportedKind, SupportedResponse
+from x402.http import FacilitatorConfig
 
 import aimart_testkit as kit
 from aimart_parquet.payments import VERIFY_REST_S
+from aimart_parquet.payments.cdp import CDP_FAILURES
+from aimart_parquet.payments.settle import LenientSettleClient
 
 if TYPE_CHECKING:
     from aimart_parquet.config import Settings
@@ -108,10 +112,12 @@ def messages(caplog: pytest.LogCaptureFixture, text: str) -> list[logging.LogRec
 # ----------------------------------------------------------------- 1. CDP's 400 settle answer
 @pytest.mark.parametrize("over", ["rest", "mcp"])
 async def test_cdps_pending_settlement_is_asked_once_more_at_cdp_and_the_call_is_served(
-    over: str, settings: Settings, wire: Any
+    over: str, settings: Settings, wire: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
     """400 ``settlement_pending`` naming the transaction, then settled: the SDK's one retry
-    runs, at CDP (which verified it), and the call is delivered with that transaction."""
+    runs, at CDP (which verified it), and the call is delivered with that transaction. The
+    owner's log says so after the first answer's 'check it on chain' line: no refund is due."""
+    caplog.set_level(logging.INFO)
     secret, public = new_secret()
     fake = ScriptedCdp(public, [(400, rejection("settlement_pending", TX))])
     behind = kit.FakeFacilitator()  # xpay's place
@@ -126,9 +132,78 @@ async def test_cdps_pending_settlement_is_asked_once_more_at_cdp_and_the_call_is
             receipt = paid_mcp.meta[RECEIPT]
         payments = app.payments
         assert payments is not None
-        assert payments._failover._settlers == {}  # nothing left behind after the retry
+        assert payments._failover._pending == {}  # the first answer, kept for the retry only
     assert (receipt["success"], receipt["transaction"]) == (True, TX)
     assert (fake.calls("verify"), fake.calls("settle")) == (1, 2)
+    assert (behind.verified, behind.settled) == ([], [])
+    checks = messages(caplog, "named a transaction: check it on chain")
+    settled = messages(caplog, "settled a pending payment on its second try")
+    assert len(checks) == len(settled) == 1
+    assert checks[0].created <= settled[0].created
+    assert settled[0].transaction == TX  # type: ignore[attr-defined]
+
+
+class ScriptedWire(LenientSettleClient):
+    """xpay's place over the wire, the service's own client: each settle answers the next of
+    ``settles`` (a ``(status, body)``), then settled; every verify is valid."""
+
+    def __init__(self, settles: list[tuple[int, Any]]) -> None:
+        self.settles = list(settles)
+        self.requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            if request.url.path.endswith("/verify"):
+                return httpx.Response(200, json={"isValid": True, "payer": kit.PAYER})
+            settled = {"success": True, "transaction": TX, "network": kit.BASE_SEPOLIA}
+            status, body = self.settles.pop(0) if self.settles else (200, settled)
+            return httpx.Response(status, json=body)
+
+        super().__init__(
+            FacilitatorConfig(
+                url="https://xpay.wire.test",
+                http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            )
+        )
+
+    def get_supported(self) -> SupportedResponse:
+        kind = SupportedKind(x402_version=2, scheme="exact", network=kit.BASE_SEPOLIA)
+        return SupportedResponse(kinds=[kind])
+
+    def calls(self, endpoint: str) -> int:
+        return sum(1 for r in self.requests if r.url.path.endswith(f"/{endpoint}"))
+
+
+async def test_a_pending_settlement_at_xpay_is_retried_at_xpay_and_nothing_is_left_behind(
+    settings: Settings, wire: Any
+) -> None:
+    """CDP fails verify, so xpay verifies: its pending answer's retry must go to xpay too (the
+    one that verified), never to CDP, and both maps are empty afterwards."""
+    secret, public = new_secret()
+    down = (503, {"errorType": "service_unavailable", "errorMessage": "Service unavailable."})
+    fake = ScriptedCdp(public, [], verify=down)
+    xpay = ScriptedWire([(400, rejection("settlement_pending", TX))])
+    async with kit.running_app(settings, facilitators=[wire(fake, secret), xpay]) as app:
+        paid = await app.paying.post("/v1/convert", json=BODY)
+        payments = app.payments
+        assert payments is not None
+        assert (payments._failover._settlers, payments._failover._pending) == ({}, {})
+    assert paid.status_code == 200, paid.text
+    assert kit.payment_response(paid)["transaction"] == TX
+    assert (fake.calls("verify"), fake.calls("settle")) == (1, 0)
+    assert (xpay.calls("verify"), xpay.calls("settle")) == (1, 2)
+
+
+async def test_xpay_first_is_not_rested_by_a_failed_settle(settings: Settings) -> None:
+    """Without CDP, xpay keeps Base after a failed settle, as before: resting it would hand Base
+    to Primer, whose settle answer has never been seen (AGENTS.md, Known gaps)."""
+    front = kit.FakeFacilitator(settle_error=RuntimeError("facilitator 503"))
+    behind = kit.FakeFacilitator()  # Primer's place
+    async with kit.running_app(settings, facilitators=[front, behind]) as app:
+        first = await app.paying.post("/v1/convert", json=BODY)
+        second = await app.paying.post("/v1/convert", json=BODY)
+    assert (first.status_code, second.status_code) == (402, 402)
+    assert len(front.verified) == 2
     assert (behind.verified, behind.settled) == ([], [])
 
 
@@ -261,7 +336,13 @@ async def test_cdp_asking_for_a_payment_method_hands_base_to_xpay_until_the_next
 
 
 @pytest.mark.parametrize(
-    "reason", ["settle_exact_node_failure", "invalid_exact_evm_failed_to_check_nonce"]
+    "reason",
+    [
+        "settle_exact_node_failure",
+        "invalid_exact_evm_failed_to_check_nonce",
+        "invalid_exact_evm_failed_to_execute_transfer",
+        "unknown_error",
+    ],
 )
 async def test_cdp_stating_its_own_settle_failure_rests_it_and_xpay_sells_meanwhile(
     reason: str, settings: Settings, wire: Any, caplog: pytest.LogCaptureFixture
@@ -333,17 +414,14 @@ async def test_when_the_retry_of_a_pending_settlement_fails_the_receipt_keeps_it
     assert lines[0].transaction == TX  # type: ignore[attr-defined]
 
 
-# -------------------------------------------------- 3. CDP could not read the chain at verify
+# --------------------------------------------- 3. CDP reporting its own failure at verify
+@pytest.mark.parametrize("reason", sorted(CDP_FAILURES))
 @pytest.mark.parametrize("status", [400, 200])
-async def test_cdp_unable_to_read_the_chain_is_its_failure_and_xpay_verifies(
-    status: int, settings: Settings, wire: Any
+async def test_cdp_reporting_its_own_failure_at_verify_is_not_the_payers_and_xpay_verifies(
+    status: int, reason: str, settings: Settings, wire: Any
 ) -> None:
     secret, public = new_secret()
-    unread = {
-        "isValid": False,
-        "invalidReason": "invalid_exact_evm_failed_to_check_nonce",
-        "payer": kit.PAYER,
-    }
+    unread = {"isValid": False, "invalidReason": reason, "payer": kit.PAYER}
     fake = ScriptedCdp(public, [], verify=(status, unread))
     behind = kit.FakeFacilitator()
     async with kit.running_app(settings, facilitators=[wire(fake, secret), behind]) as app:

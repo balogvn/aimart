@@ -70,18 +70,22 @@ AUTH_REFUSED = frozenset({401, 403})
 # refused key, it does not pass by itself.
 PAYMENT_METHOD_REQUIRED = 402
 SETTINGS_NAMES = "AIMART_CDP_API_KEY_ID and AIMART_CDP_API_KEY_SECRET"
-# Verify answers in which CDP says it could not read the chain (cdp-sdk openapi.yaml,
-# ``x402VerifyInvalidReason``): CDP's failure, not the payer's answer, so the call is verified
-# by the next facilitator and CDP is rested, as for a 5xx. Reasons that may be the payer's
-# doing (``..._failed_to_parse_signature``, ``..._failed_to_verify_signature``,
+# Verify answers in which CDP reports its own failure (cdp-sdk openapi.yaml,
+# ``x402VerifyInvalidReason``): it could not read the chain, its node failed, or an error it
+# cannot name. CDP's failure, not the payer's answer, so the call is verified by the next
+# facilitator and CDP is rested, as for a 5xx (a payer's real fault is refused there too, at
+# the cost of one verify). Reasons that may be the payer's doing
+# (``..._failed_to_parse_signature``, ``..._failed_to_verify_signature``,
 # ``..._failed_to_execute_transfer``) stay the payer's answer.
-CHAIN_UNREAD = frozenset(
+CDP_FAILURES = frozenset(
     {
         "invalid_exact_evm_failed_to_get_network_config",
         "invalid_exact_evm_failed_to_check_nonce",
         "invalid_exact_evm_failed_to_get_balance",
         "invalid_exact_evm_failed_to_check_deployment",
         "invalid_exact_evm_failed_to_get_receipt",
+        "node_failure",
+        "unknown_error",
     }
 )
 
@@ -247,8 +251,8 @@ class CdpFacilitatorClient(LenientSettleClient):
 
         That is the payer's answer, read as one: the SDK raises on any non-200, which would
         make ``Payments`` ask the next facilitator and rest CDP for a payer's bad signature.
-        But not when the reason says CDP could not read the chain (``CHAIN_UNREAD``), with a
-        400 or a 200: that is raised, so the next facilitator verifies and CDP is rested.
+        But not when the reason is CDP's own failure (``CDP_FAILURES``), with a 400 or a 200:
+        that is raised, so the next facilitator verifies and CDP is rested.
         """
         response = await self._get_async_client().post(
             f"{self._url}/verify",
@@ -264,8 +268,8 @@ class CdpFacilitatorClient(LenientSettleClient):
             msg = f"Facilitator verify failed ({response.status_code})"
             raise ValueError(msg)
         verified = _parse_facilitator_response(response, VerifyResponse, "verify")
-        if _chain_unread(verified):
-            msg = "Facilitator verify failed (200: it could not read the chain)"
+        if _cdp_failure(verified):
+            msg = "Facilitator verify failed (200: it reported its own failure)"
             raise ValueError(msg)
         return _attach_extension_responses(verified, response)
 
@@ -314,9 +318,9 @@ class CdpFacilitatorClient(LenientSettleClient):
         self._note(response)
 
 
-def _chain_unread(answer: VerifyResponse) -> bool:
-    """Whether CDP says it could not read the chain, rather than that the payment is invalid."""
-    return answer.is_valid is False and answer.invalid_reason in CHAIN_UNREAD
+def _cdp_failure(answer: VerifyResponse) -> bool:
+    """Whether CDP reports its own failure, rather than that the payment is invalid."""
+    return answer.is_valid is False and answer.invalid_reason in CDP_FAILURES
 
 
 def _rejection(response: httpx.Response) -> VerifyResponse | None:
@@ -325,7 +329,7 @@ def _rejection(response: httpx.Response) -> VerifyResponse | None:
         answer = VerifyResponse.model_validate(response.json())
     except (ValueError, TypeError, ValidationError):
         return None
-    if _chain_unread(answer):
+    if _cdp_failure(answer):
         return None
     return answer if answer.is_valid is False and answer.invalid_reason else None
 

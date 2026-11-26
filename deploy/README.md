@@ -541,13 +541,19 @@ account's free settlements are used up, and the key is fine. Base goes to xpay t
 method in the portal, then run Deploy to Modal to bring CDP back. `facilitator settle failed:
 the next facilitator verifies and settles the calls after this one` (WARNING) is a settle CDP
 did not answer, or one it says failed on its side (a timeout, a 5xx, a 429, its node): that
-call is unpaid, the next minute of calls goes to xpay, then CDP is asked again (after the 402
-above: not until the next deploy). `facilitator refused to settle and named a transaction:
-check it on chain` (WARNING), and `facilitator's second settle of a pending payment did not
-settle it` (WARNING), name a transfer CDP broadcast without confirming it: look the
-transaction up on basescan.org; if it landed, that payer paid for a call that answered
-"failed", so refund it by hand. `CDP facilitator not used: ...` at start names a key that cannot
-be read.
+call is unpaid, the next minute of calls goes to xpay, then CDP is asked again (after one of
+the 401, 403 or 402 ERROR lines above: not until the next deploy).
+
+`facilitator refused to settle and named a transaction: check it on chain` and
+`facilitator's second settle of a pending payment did not settle it` (WARNING) name a transfer
+that was sent but not confirmed. What to do with one:
+- A later `facilitator settled a pending payment on its second try` (WARNING) naming the same
+  transaction means it settled and the call was delivered: nothing to do.
+- Otherwise look the transaction up on basescan.org. If its status is **Success** and it shows
+  the USDC transfer to your payee, that payer paid for a call that answered "failed": refund it
+  by hand. If it **failed** (reverted), nobody was charged.
+
+`CDP facilitator not used: ...` at start names a key that cannot be read.
 
 To stop using CDP: delete the two secrets and run Deploy to Modal again, and only after that
 deploy is green delete the key in the portal (**API Keys → Secret API Keys**).

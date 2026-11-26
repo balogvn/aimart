@@ -704,8 +704,13 @@ paid call is about 170 s against Modal's 150 s (needs CDP to be slow twice while
 near every other limit; at most one $0.02 call charged and not delivered, and beyond 150 s the
 payer gets Modal's 303 and no receipt); a 401, 403 or
 402 from CDP drops it until the next deploy, and with one container kept running that is until
-the owner runs Deploy to Modal; the deploy's selftest passes when CDP is unreachable or its
-`/supported` does not list Base (only `CDP accepted the key; it lists ...` proves the key);
+the owner runs Deploy to Modal (the selftest cannot see the 402, which only settle returns, so
+a deploy before the payment method is added loses the first CDP-verified Base call again); only
+CDP is rested after a failed settle: xpay, first when CDP is not, keeps Base after one (a
+settle-only xpay outage fails every Base call meanwhile), because resting it would hand Base to
+Primer before a Primer settlement has been captured (above); the deploy's selftest passes when
+CDP is unreachable or its `/supported` does not list Base (only `CDP accepted the key; it lists
+...` proves the key);
 `deploy-modal.yml` deploys `github.sha`, not release-please's release commit, so merge a release
 PR alone; whether CDP answers success again to a second settle of an already settled payload
 (two concurrent calls carrying one signed payment) is unverified; and an MCP 402 carries no
