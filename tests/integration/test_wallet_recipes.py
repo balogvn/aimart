@@ -489,7 +489,7 @@ def test_the_python_pins_on_every_page_are_the_scripts_pins() -> None:
 
 def test_the_npm_pins_on_every_page_are_the_package_json_pins() -> None:
     pins = npm_pins()
-    tools = {"awal": "2.12.1", "skills": "1.7.5", "@circle-fin/cli": "1.2.2"}
+    tools = {"skills": "1.7.5", "@circle-fin/cli": "1.2.2"}  # awal: retired by Coinbase 2026-11-20
     checked = set()
     for name, text in published_text().items():
         for package, version in re.findall(

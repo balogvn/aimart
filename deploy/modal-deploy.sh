@@ -134,7 +134,9 @@ else
 fi
 
 echo "modal-deploy: inputs look right: payee ${evm:-$svm}, URL ${url%/}, ${token_note}"
-echo "modal-deploy: ${cdp_note}"
+# Not under --logs: the workflow's failure step runs it without the CDP secrets, and after the
+# selftest's "CDP refused the API key" this line said "no CDP key", the wrong thing to fix.
+if [ "${1:-}" != "--logs" ]; then echo "modal-deploy: ${cdp_note}"; fi
 if [ "${1:-}" = "--check" ]; then exit 0; fi
 
 with_modal=(uv run --no-project --python 3.13 --with "modal==${MODAL_VERSION}")

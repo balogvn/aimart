@@ -691,7 +691,33 @@ submitted but not yet confirmed) is read as a refusal: the SDK asks it once more
 reason is exactly `settlement_pending`, and if it is still pending, or the reason is worded
 otherwise, the caller gets a 402 or `isError` and no result. The receipt and an
 `aimart.payments.settle` WARNING line name the transaction, yet the transfer may still land
-and nothing here follows it up: reconcile that line against the chain and refund by hand. A
+and nothing here follows it up: reconcile that line against the chain and refund by hand. The
+same holds for a non-2xx whose JSON says `"success": false` (CDP's HTTP 400
+`X402SettlePaymentRejection`, `settlement_pending` included): until 2026-11-26 it was raised,
+which skipped the SDK's retry and lost the transaction from both the receipt and the log
+(`integration/test_fix_cdp_settle_failures.py`); and when that retry raises, or refuses naming
+no transaction or another one, the receipt keeps the pending transaction
+(`_Answered._still_pending`), since that is the one that may land. CDP known gaps (review
+2026-11-26, low): a verify that hangs at CDP and then falls through to xpay adds a third
+`facilitator_timeout_s`, and so does the SDK's one retry of a pending settlement, so the worst
+paid call is about 170 s against Modal's 150 s (needs CDP to be slow twice while the call is
+near every other limit; at most one $0.02 call charged and not delivered, and beyond 150 s the
+payer gets Modal's 303 and no receipt); a 401, 403 or
+402 from CDP drops it until the next deploy, and with one container kept running that is until
+the owner runs Deploy to Modal (the selftest cannot see the 402, which only settle returns, so
+a deploy before the payment method is added loses the first CDP-verified Base call again); only
+CDP is rested after a failed settle: xpay, first when CDP is not, keeps Base after one (a
+settle-only xpay outage fails every Base call meanwhile), because resting it would hand Base to
+Primer before a Primer settlement has been captured (above); the deploy's selftest passes when
+CDP is unreachable or its `/supported` does not list Base (only `CDP accepted the key; it lists
+...` proves the key);
+`deploy-modal.yml` deploys `github.sha`, not release-please's release commit, so merge a release
+PR alone; whether CDP answers success again to a second settle of an already settled payload
+(two concurrent calls carrying one signed payment) is unverified; and an MCP 402 carries no
+`bazaar` declaration (`payments/mcp_gate.py`), so MCP sales settled by CDP list nothing (CDP's
+discovery documents only `http` resources today; the SDK's `declare_mcp_discovery_extension`
+would add one). Whether CDP really indexes after a settlement is closed source: confirm the
+first listing as `deploy/README.md` step 6 says. A
 facilitator
 that takes longer than `facilitator_timeout_s` (20 s) to answer `/settle` leaves the outcome
 unknown: the call is answered as failed and unsettled, yet the transfer may still complete

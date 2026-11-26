@@ -73,14 +73,15 @@ LABEL org.opencontainers.image.title="aimart-parquet" \
       io.modelcontextprotocol.server.name="io.github.balogvn/aimart-parquet"
 
 # zlib1g 1:1.3.dfsg+really1.3.1-1+deb13u1 (CVE-2026-85091, a heap overflow in gz_vacate(), and
-# CVE-2026-76844) is in trixie-security, but the newest python:3.13-slim-trixie still ships
-# -1+b1, and Trivy fails the CI on it. Just that package is upgraded, to that exact version.
-# Remove this step once a base image carries it: it is a no-op then, and the build fails loudly
-# when the pin goes stale (apt refuses it as a downgrade under a newer base, and cannot find it
-# once trixie-security supersedes it).
+# CVE-2026-76844) and libzstd1 1.5.7+dfsg-1+deb13u1 (CVE-2026-124851, an information disclosure
+# through uninitialized memory; flagged by Trivy on 2026-11-27) are in trixie-security, but the
+# pinned python:3.13-slim-trixie ships the older builds, and Trivy fails the CI on them. Just
+# those packages are upgraded, to those exact versions. Remove a pin once a base image carries
+# it: it is a no-op then, and the build fails loudly when a pin goes stale (apt refuses it as a
+# downgrade under a newer base, and cannot find it once trixie-security supersedes it).
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
-       --only-upgrade zlib1g=1:1.3.dfsg+really1.3.1-1+deb13u1 \
+       --only-upgrade zlib1g=1:1.3.dfsg+really1.3.1-1+deb13u1 libzstd1=1.5.7+dfsg-1+deb13u1 \
     && rm -rf /var/lib/apt/lists/*
 
 # The official python images ship the stdlib without .pyc files (size), so compile it here for

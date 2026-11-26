@@ -46,7 +46,7 @@ from aimart_parquet.payments.mcp_gate import (
     payments_unavailable,
 )
 from aimart_parquet.payments.pricing import Operation, active_operations, usd_to_atomic
-from aimart_parquet.payments.settle import LenientSettleClient
+from aimart_parquet.payments.settle import TEXT_LIMIT, LenientSettleClient
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -97,15 +97,31 @@ RETRY_SKIPPED_S = 300.0
 # not, and one 502 must not move a network to the next in the list. After them (15 minutes)
 # it is dropped until it answers again, so a host that died is not quoted until a restart.
 KEPT_ROUNDS = 3
-# How long a facilitator whose verify failed (a non-200, a timeout: not an answer that the
-# payment is invalid) is passed over for verify while another facilitator offers the network:
-# CDP failing verify mid-run used to make every Base call a 402 while xpay stood behind it,
-# and a timeout would otherwise cost each call ``facilitator_timeout_s`` before the next.
+# How long a facilitator whose verify or settle failed (a non-200, a timeout: not an answer that
+# the payment is invalid or refused) is passed over for verify while another facilitator offers
+# the network: CDP failing verify mid-run used to make every Base call a 402 while xpay stood
+# behind it, and a timeout would otherwise cost each call ``facilitator_timeout_s`` before the
+# next. A failed settle rests it too (review of 2026-11-26): a CDP whose verify worked and whose
+# settle failed got every later Base call, each run and then refused at settle.
 VERIFY_REST_S = 60.0
 # The most payments remembered between verify and settle (``_Failover``): far above what the
 # job queue lets run at once. One pushed out settles with the facilitator first in line, which
 # did not verify it: that settle fails, and the call is unpaid, never charged twice.
 SETTLERS_KEPT = 1024
+# Settle refusals that may be CDP's own failure (cdp-sdk openapi.yaml, ``x402SettleErrorReason``,
+# and ``cdp.CDP_FAILURES``, which CDP also gives at settle): they rest CDP, as a settle that
+# raised does. Stated as refusals, CDP's node failures used to keep every later Base call on
+# CDP, each run and refused at settle (review 2026-11-26). Resting moves no money, so the list
+# leans generous; the payer's own reasons (insufficient funds, a used nonce, an expired
+# authorization) are not in it. Not a confirmation that timed out: it names a transfer already
+# broadcast, a slow chain more often than CDP's fault.
+SETTLE_FAULTS = frozenset(
+    {
+        "settle_exact_node_failure",
+        "invalid_exact_evm_failed_to_execute_transfer",
+        *cdp.CDP_FAILURES,
+    }
+)
 
 # Where a paying client puts its signed payload (v2, then v1): what the SDK middleware reads.
 PAYMENT_HEADERS = ("payment-signature", "x-payment")
@@ -173,8 +189,8 @@ class _Failover:
     offers the network is asked instead, once. Verify moves no money, so asking another is
     safe; the facilitator that verified a payment is remembered and settles it, so a payment is
     never settled by one that did not verify it, and a settle that fails is never repeated
-    elsewhere (the call is then unpaid, as always). A facilitator whose verify failed is
-    passed over for ``VERIFY_REST_S`` (a refused key: for the life of the process) while
+    elsewhere (the call is then unpaid, as always). A facilitator whose verify or settle failed
+    is passed over for ``VERIFY_REST_S`` (a refused key: for the life of the process) while
     another can take the network.
     """
 
@@ -182,6 +198,7 @@ class _Failover:
         self._clock = clock
         self._resting: dict[int, float] = {}  # id(client) -> when it may verify again
         self._settlers: dict[str, Any] = {}  # payment -> the client that verified it
+        self._pending: dict[str, SettleResponse] = {}  # payment -> its 'settlement_pending'
 
     def usable(self, client: Any) -> bool:
         return not _refused(client) and self._clock() >= self._resting.get(id(client), 0.0)
@@ -197,8 +214,19 @@ class _Failover:
     def settler(self, payload: Any) -> Any | None:
         return self._settlers.get(_payment_key(payload))
 
+    def keep_pending(self, payload: Any, answer: SettleResponse) -> None:
+        """A 'settlement_pending' answer, kept for the SDK's one retry of it."""
+        self._pending[_payment_key(payload)] = answer
+        while len(self._pending) > SETTLERS_KEPT:
+            del self._pending[next(iter(self._pending))]
+
+    def pending(self, payload: Any) -> SettleResponse | None:
+        return self._pending.get(_payment_key(payload))
+
     def forget(self, payload: Any) -> None:
-        self._settlers.pop(_payment_key(payload), None)
+        key = _payment_key(payload)
+        self._settlers.pop(key, None)
+        self._pending.pop(key, None)
 
 
 class _Answered:
@@ -271,20 +299,119 @@ class _Answered:
         self.failover.remember(payload, after.client)
         return verified
 
+    def _rest_after_failed_settle(
+        self, client: Any, requirements: PaymentRequirements, why: str
+    ) -> None:
+        """A settle that raised, or a refusal stating the facilitator's own failure
+        (``SETTLE_FAULTS``), rests the facilitator first in line, as a verify that raised does.
+
+        This call stays unpaid: settle never falls through. The calls after it are verified and
+        settled by the next facilitator offering the network, for ``VERIFY_REST_S``, then this
+        one is asked again. Without it, a CDP whose verify works and whose settle fails (its
+        documented 402 ``payment_method_required`` once the free settlements are used up, a
+        settle-only 429 or 5xx, a timeout, its node failing) got every later Base call, each
+        verified, run and then refused at settle, while xpay stood behind it (review of
+        2026-11-26). Any other stated refusal (``"success": false``) does not rest it: that is
+        its answer about this payment, often the payer's doing.
+
+        Only CDP is rested this way. xpay, first when CDP is not, keeps its place after a failed
+        settle as before: resting it would hand Base to Primer, whose settle answer has never
+        been seen (AGENTS.md, Known gaps).
+        """
+        if client is not self.client:  # the one behind, settling what it verified
+            return
+        if not isinstance(client, cdp.CdpFacilitatorClient):
+            return
+        network = getattr(requirements, "network", None)
+        after = next((a for a in self.behind if network and a.offers(network)), None)
+        if after is None:
+            return
+        if not _refused(client):
+            self.failover.rest(client)
+        # An exception's type or a stated reason only: the SDK and settle.py put the
+        # facilitator's body in an exception's message.
+        log.warning(
+            "facilitator settle failed: the next facilitator verifies and settles the calls "
+            "after this one",
+            extra={
+                "facilitator": self.url,
+                "next": after.url,
+                "network": network,
+                "error": why[:TEXT_LIMIT],
+            },
+        )
+
+    @staticmethod
+    def _still_pending(pending: SettleResponse, url: str, second: str) -> SettleResponse:
+        """The first, 'settlement_pending' answer, as what the payer is told.
+
+        The SDK settles once more after it, and used to pass on whatever that second call gave:
+        an exception (a receipt naming no transaction), a refusal naming none, or another one.
+        The transaction the first answer named was broadcast and may still land, so it is the
+        one the payer must look up before paying again (review of 2026-11-26).
+        """
+        log.warning(
+            "facilitator's second settle of a pending payment did not settle it: the receipt "
+            "names the pending transaction; check it on chain",
+            extra={
+                "facilitator": url,
+                "transaction": pending.transaction[:TEXT_LIMIT],
+                "second": second[:TEXT_LIMIT],
+            },
+        )
+        message = (
+            "The facilitator broadcast this transaction without confirming it, and its second "
+            f"answer was {second}: look the transaction up before paying again."
+        )
+        return pending.model_copy(update={"error_message": message[: 2 * TEXT_LIMIT]})
+
     async def settle(
         self, payload: PaymentPayload, requirements: PaymentRequirements
     ) -> SettleResponse:
         # Whoever verified it, never another: a settle is not repeated elsewhere.
         client = self.failover.settler(payload) or self.client
         url = str(getattr(client, "url", type(client).__name__))
+        # The SDK settles once more after a 'settlement_pending' that names a transaction
+        # (x402.server_base.settle_with_pending_retry_async): this call is that one when the
+        # first answer is kept.
+        pending = self.failover.pending(payload)
         try:
             settled = await client.settle(payload, requirements)
-        except Exception:
+        except Exception as exc:
             self.failover.forget(payload)
-            raise
-        if not is_retryable_settlement_pending(settled):
+            self._rest_after_failed_settle(client, requirements, type(exc).__name__)
+            if pending is None:
+                raise
+            return self._still_pending(pending, url, f"an error ({type(exc).__name__})")
+        if pending is None and is_retryable_settlement_pending(settled):
             # Kept for the SDK's one retry of a pending settlement, which must go there too.
+            self.failover.keep_pending(payload, settled)
+        else:
             self.failover.forget(payload)
+        if not settled.success and settled.error_reason in SETTLE_FAULTS:
+            self._rest_after_failed_settle(client, requirements, settled.error_reason or "")
+        if (
+            pending is not None
+            and not settled.success
+            and settled.transaction != pending.transaction
+        ):
+            other = f" naming {settled.transaction}" if settled.transaction else ""
+            settled = self._still_pending(
+                pending, url, f"{settled.error_reason or 'a refusal'}{other}"
+            )
+        if pending is not None and settled.success:
+            # The first answer left a 'named a transaction: check it on chain' line, which the
+            # owner reconciles and refunds from: this one says that payment settled and was
+            # delivered, so nothing is owed (review of 2026-11-26).
+            log.warning(
+                "facilitator settled a pending payment on its second try: no refund is due "
+                "for this transaction",
+                extra={
+                    "facilitator": url,
+                    "transaction": settled.transaction[:TEXT_LIMIT],
+                    "pending_transaction": pending.transaction[:TEXT_LIMIT],
+                },
+            )
         # x402 v2 makes the amount optional and xpay leaves it out: the first receipts on
         # mainnet named a transaction and no amount, and the example client crashed on them.
         # Under 'exact' the payer signed a transfer of exactly the quoted amount, so that is
@@ -524,7 +651,8 @@ class Payments:
                 # Not KEPT_ROUNDS: a refused key does not come back by itself.
                 del self._answers[index]
                 log.warning(
-                    "facilitator dropped: it refused this service's key",
+                    "facilitator dropped: %s",
+                    getattr(client, "refusal", "it refused this service's key"),
                     extra={"facilitator": getattr(client, "url", type(client).__name__)},
                 )
             elif index in self._answers:

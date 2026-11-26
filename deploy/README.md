@@ -421,18 +421,36 @@ Checking the payment, either way: open `https://basescan.org/address/<your payee
 then "Token Transfers": a USDC transfer of the price (0.02 for a conversion) from the paying
 wallet appears within about a minute.
 
+**From a browser, without handling a key: x402scan** (not yet tried against this service).
+x402scan pays with Coinbase's official x402 client, which sends the 402's Bazaar description
+back with the payment, and its wallet sits behind an email sign-in, so no key or recovery
+phrase is ever shown or typed. The wallet is Coinbase's: use a network that reaches
+coinbase.com.
+
+1. Open the service's page, <https://www.x402scan.com/server/f9a7740c-6797-438e-97fe-e0ed58b456c8>,
+   and choose **POST /v1/convert**.
+2. Connect a wallet with your email (a 6-digit code arrives by email), then send it about
+   $0.10 of USDC on Base, from any wallet or exchange that holds some, to the address it shows.
+3. Set `url` to `https://raw.githubusercontent.com/balogvn/aimart/main/docs/examples/sales.csv`,
+   check that the price shows $0.02 of USDC on Base, and pay. x402scan may not show the
+   receipt: check Basescan as above.
+
 **With this repository's example** (`docs/examples/agent_pays.py`). Verified: its code was
 read, and the test suite runs it against a fake facilitator on testnet. Not verified: a run
-against mainnet (nobody has paid yet). It needs [uv](https://docs.astral.sh/uv/), a small CSV
-file, and the paying wallet's private key in the terminal's environment (it never leaves
-that process, and the service never sees it):
+against mainnet. It needs [uv](https://docs.astral.sh/uv/), a small CSV file, and the paying
+wallet's private key, which it asks for at a hidden prompt: the key is not shown, not saved in
+the shell's history, and never leaves that process (the service never sees it). Run it in your
+computer's own Terminal app, not through a chat's Run button, whose output is recorded:
 
 ```bash
 export AIMART_URL=https://<workspace>--aimart-parquet.modal.run   # your service's address
-export PAYER_PRIVATE_KEY=...                                       # the test wallet's key; type it yourself
 export AIMART_MAINNET_CONFIRM=I_UNDERSTAND_THIS_SPENDS_REAL_USDC
 uv run docs/examples/agent_pays.py small.csv --network mainnet --max-usd 0.02
 ```
+
+Paste the key when it asks (nothing appears as you paste). Do not type
+`export PAYER_PRIVATE_KEY=...`: the shell keeps every typed line, in plain text, in its history
+file (`~/.zsh_history` on a Mac).
 
 It makes three payments, $0.027 in all: a conversion ($0.02), an inspect ($0.002) and a query
 over MCP ($0.005), and prints each quote before paying it and each settlement's transaction.
@@ -441,21 +459,9 @@ sentence; it can sign for Base only; and it refuses any single quote above `--ma
 on each payment, not on their sum). A payment the facilitator rejects ends it with the
 reason, and a failed call is not charged.
 
-**Without handling a key** (not verified against this service; described from the tool's
-documentation). Coinbase's Agentic Wallet command line keeps the wallet behind an email
-sign-in. It needs [Node.js](https://nodejs.org/):
-
-```bash
-npx awal auth login you@example.com      # then: npx awal auth verify <the code from the email>
-npx awal show                            # fund it: a dollar of USDC on Base is plenty
-npx awal x402 details https://<workspace>--aimart-parquet.modal.run/v1/convert   # the price; nothing is paid
-npx awal x402 pay https://<workspace>--aimart-parquet.modal.run/v1/convert -X POST -d '{"content_base64": "YSxiCjEsMgo=", "filename": "t.csv"}' --max-amount 20000
-```
-
-`--max-amount` is in millionths of a USDC: 20000 is $0.02, the price of that one conversion
-(of a two-line CSV). If `details` does not show $0.02 of USDC on Base to your payee, do not
-pay: say what it showed. Whether this tool reads x402 version 2 quotes, which this service
-sends in the `PAYMENT-REQUIRED` header, was not checked.
+Coinbase's Agentic Wallet command line (`npx awal`) and its Payments MCP, which this guide
+used to suggest, were retired by Coinbase on 2026-11-20: they can no longer pay, and Coinbase
+asks that nobody fund them.
 
 ### List the service in the CDP Bazaar (optional, mainnet)
 
@@ -464,8 +470,11 @@ and agentic.market, where agents with Coinbase wallets look for services, shows 
 Bazaar holds. xpay and Primer settle for free but publish no list, so sales through them list
 the service nowhere ([discovery.md](../docs/discovery.md)). With a CDP key in the `production`
 environment, CDP settles Base first, and xpay, then Primer, take over when CDP does not
-answer or fails to verify a payment. Cost: the first 1,000 settlements a month are free, then $0.001 each
-([economics.md](../docs/economics.md)). Without the key nothing changes.
+answer, fails to verify a payment, or fails to settle one (for the calls after it: a settle is
+never repeated elsewhere, so that one call is unpaid). Cost: the first 1,000 settlements a month
+are free, then $0.001 each ([economics.md](../docs/economics.md)); past the free ones CDP asks
+for a payment method on the CDP account, so add one in the portal (**Billing**) before sales
+get near 1,000 a month (see the log lines below). Without the key nothing changes.
 
 The key is a **CDP Secret API key**: an ID and a secret. It lets the service ask CDP to verify
 and settle payments; it is not a wallet and cannot move the USDC paid to your payee address.
@@ -503,22 +512,48 @@ GitHub secrets below.
    `CDP refused the API key (HTTP 401)`: the new version is already serving, with Base on xpay
    as before, so no sale is lost; check that the two secrets hold the right pieces (not
    swapped, nothing missing), or create a new key, and run the workflow again.
-5. **Make one paid call** as in "Make one paid test call" above, with
-   `docs/examples/agent_pays.py` (its conversion and inspect go through REST, whose 402 carries
-   the Bazaar description the payer's wallet echoes back). Each REST route is listed after its
-   own first payment settled through CDP: the example lists `/v1/convert` and `/v1/inspect`;
-   `/v1/preview` and `/v1/query` follow with their first customers.
+5. **Make one paid call** as in "Make one paid test call" above: on x402scan (no key to
+   handle) or with `docs/examples/agent_pays.py`. A REST call's 402 carries the Bazaar
+   description, which the payer's x402 client sends back with the payment; an MCP call's 402
+   carries none (and CDP lists only web resources today), so pay a REST route. Each REST route
+   is listed after its own first payment settled through CDP: a convert lists `/v1/convert`
+   (the example also lists `/v1/inspect`); `/v1/preview` and `/v1/query` follow with their first
+   customers. Then, in the app's log on modal.com, search for `extension responses`: a line
+   `[x402] extension responses: {"bazaar": ...}` means CDP settled the payment and took the
+   description (its `status` says how it went). No such line, but a `facilitator skipped` or
+   `facilitator verify failed` WARNING, means the payment went to xpay, unlisted: pay once
+   more after 5 minutes.
 6. **Confirm the listing**, up to about 15 minutes later. Open, in a browser,
    `https://api.cdp.coinbase.com/platform/v2/x402/discovery/merchant?payTo=<your payee address>`
-   (public, no key): it lists every resource CDP holds for your address, and the service's
-   `/v1/convert` should be among them. Then search for "parquet" on <https://agentic.market>.
+   (public, no key; the address exactly as `/pricing` shows it): it lists every resource CDP
+   holds for your address, and the service's `/v1/convert` should be among them.
+   `https://api.cdp.coinbase.com/platform/v2/x402/discovery/search?urlSubstring=aimart-parquet`
+   finds it by its address instead. Then search for "parquet" on <https://agentic.market>.
    Not listed after a day: see "Troubleshooting" (section 5).
 
 In the app's log on modal.com, `facilitator refused this service's API key` (ERROR) means CDP
 answered 401 or 403 to a verify, a settle or `/supported`: the key was deleted, disabled or
 changed. Base then goes to xpay at once (sales continue, unlisted) until the key is fixed and
 the service redeployed; only a call CDP had already verified when it started refusing fails,
-unpaid. `CDP facilitator not used: ...` at start names a key that cannot be read.
+unpaid. `CDP asks for a payment method on the account` (ERROR) means CDP answered 402: the
+account's free settlements are used up, and the key is fine. Base goes to xpay the same way
+(the next line, `facilitator dropped: it asks for a payment method`, says so); add a payment
+method in the portal, then run Deploy to Modal to bring CDP back. `facilitator settle failed:
+the next facilitator verifies and settles the calls after this one` (WARNING) is a settle CDP
+did not answer, or one it says failed on its side (a timeout, a 5xx, a 429, its node): that
+call is unpaid, the next minute of calls goes to xpay, then CDP is asked again (after one of
+the 401, 403 or 402 ERROR lines above: not until the next deploy).
+
+`facilitator refused to settle and named a transaction: check it on chain` and
+`facilitator's second settle of a pending payment did not settle it` (WARNING) name a transfer
+that was sent but not confirmed. What to do with one:
+- A later `facilitator settled a pending payment on its second try` (WARNING) naming the same
+  transaction means it settled and the call was delivered: nothing to do.
+- Otherwise look the transaction up on basescan.org. If its status is **Success** and it shows
+  the USDC transfer to your payee, that payer paid for a call that answered "failed": refund it
+  by hand. If it **failed** (reverted), nobody was charged.
+
+`CDP facilitator not used: ...` at start names a key that cannot be read.
 
 To stop using CDP: delete the two secrets and run Deploy to Modal again, and only after that
 deploy is green delete the key in the portal (**API Keys → Secret API Keys**).
