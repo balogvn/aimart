@@ -247,10 +247,90 @@ async def test_cdp_asking_for_a_payment_method_hands_base_to_xpay_until_the_next
     assert statuses == [402, 200, 200]
     assert (fake.calls("verify"), fake.calls("settle")) == (1, 1)
     assert (len(behind.verified), len(behind.settled)) == (2, 2)
-    errors = messages(caplog, "asks for a payment method")
+    errors = [
+        r for r in messages(caplog, "asks for a payment method") if r.levelno == logging.ERROR
+    ]
     assert len(errors) == 1
     assert errors[0].levelno == logging.ERROR
     assert "Deploy to Modal" in errors[0].getMessage()
+    # The next quote drops CDP, and says why: not the key, which a reader would rotate.
+    drops = messages(caplog, "facilitator dropped")
+    assert drops
+    assert all("payment method" in r.getMessage() for r in drops)
+    assert not [r for r in drops if "key" in r.getMessage().replace("not a key", "")]
+
+
+@pytest.mark.parametrize(
+    "reason", ["settle_exact_node_failure", "invalid_exact_evm_failed_to_check_nonce"]
+)
+async def test_cdp_stating_its_own_settle_failure_rests_it_and_xpay_sells_meanwhile(
+    reason: str, settings: Settings, wire: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A refusal whose reason is CDP's own failure (its node, reading the chain) is not the
+    payer's doing: it rests CDP as a settle that raised does, or every Base call after it would
+    be verified, run and refused at settle while xpay stands behind it."""
+    caplog.set_level(logging.INFO)
+    secret, public = new_secret()
+    fake = ScriptedCdp(public, [(400, rejection(reason))])
+    behind = kit.FakeFacilitator()
+    async with kit.running_app(settings, facilitators=[wire(fake, secret), behind]) as app:
+        first = await app.paying.post("/v1/convert", json=BODY)
+        second = await app.paying.post("/v1/convert", json=BODY)
+    assert (first.status_code, second.status_code) == (402, 200)
+    assert (fake.calls("verify"), fake.calls("settle")) == (1, 1)
+    assert (len(behind.verified), len(behind.settled)) == (1, 1)
+    lines = messages(caplog, "settle failed: the next facilitator")
+    assert len(lines) == 1
+    assert lines[0].error == reason  # type: ignore[attr-defined]
+
+
+# ----------------------------------- 1b. the SDK's one retry of a pending settlement fails too
+OTHER_TX = "0x" + "12" * 32
+PENDING_THEN = [
+    httpx.ReadTimeout("slow"),
+    (503, {"errorType": "service_unavailable", "errorMessage": "Service unavailable."}),
+    (402, PAYMENT_METHOD),
+    (400, rejection("invalid_exact_evm_nonce_already_used")),
+    (400, rejection("settle_exact_failed_onchain", OTHER_TX)),
+]
+
+
+@pytest.mark.parametrize("over", ["rest", "mcp"])
+@pytest.mark.parametrize(
+    "second", PENDING_THEN, ids=["timeout", "s503", "s402", "nonce-used", "other-tx"]
+)
+async def test_when_the_retry_of_a_pending_settlement_fails_the_receipt_keeps_its_transaction(
+    over: str, second: Any, settings: Settings, wire: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """CDP answers 'settlement_pending' naming TX, and the SDK's immediate retry raises, or
+    refuses naming no transaction or another one. TX may still land: the payer is told TX,
+    never "" or the other one (the receipt used to be whatever the retry gave)."""
+    caplog.set_level(logging.INFO)
+    secret, public = new_secret()
+    fake = ScriptedCdp(public, [(400, rejection("settlement_pending", TX)), second])
+    behind = kit.FakeFacilitator()
+    async with kit.running_app(settings, facilitators=[wire(fake, secret), behind]) as app:
+        if over == "rest":
+            refused = await app.paying.post("/v1/convert", json=BODY)
+            assert refused.status_code == 402, refused.text
+            receipt = kit.payment_response(refused)
+        else:
+            refused_mcp = await paid_mcp_call(app)
+            assert refused_mcp.is_error
+            receipt = refused_mcp.structured_content[RECEIPT]
+        payments = app.payments
+        assert payments is not None
+        assert (payments._failover._settlers, payments._failover._pending) == ({}, {})
+    assert (receipt["success"], receipt["transaction"]) == (False, TX)
+    assert receipt["errorReason"] == "settlement_pending"
+    assert "look the transaction up" in receipt["errorMessage"]
+    if isinstance(second, tuple) and second[1].get("transaction"):
+        assert OTHER_TX in receipt["errorMessage"]  # the other one is named, as the second
+    assert fake.calls("settle") == 2
+    assert behind.settled == []
+    lines = messages(caplog, "second settle of a pending payment")
+    assert len(lines) == 1
+    assert lines[0].transaction == TX  # type: ignore[attr-defined]
 
 
 # -------------------------------------------------- 3. CDP could not read the chain at verify

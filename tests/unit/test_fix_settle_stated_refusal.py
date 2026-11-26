@@ -8,6 +8,7 @@ nothing else in a non-2xx is ever read as a settlement.
 
 from __future__ import annotations
 
+import json
 import logging
 
 import httpx
@@ -68,10 +69,53 @@ async def test_a_stated_refusal_without_a_network_gets_the_quoted_one() -> None:
         httpx.Response(400, json=[{"success": False}]),
         httpx.Response(400, text="<html>bad request</html>"),
         httpx.Response(502, content=b"\xff\xfe\x00"),
+        # The facilitator's own trouble, with no transaction to keep: raised, so it is rested.
+        httpx.Response(503, json={"success": False, "error": "overloaded"}),
+        httpx.Response(429, json={"success": False, "message": "slow down"}),
     ],
-    ids=["success-true", "string-false", "null", "cdp-error", "cdp-402", "list", "html", "bytes"],
+    ids=[
+        "success-true",
+        "string-false",
+        "null",
+        "cdp-error",
+        "cdp-402",
+        "list",
+        "html",
+        "bytes",
+        "503-stated",
+        "429-stated",
+    ],
 )
 async def test_any_other_non_2xx_is_still_an_error(answer: httpx.Response) -> None:
     client = client_over(LenientSettleClient, answer, [])
     with pytest.raises(ValueError, match="Facilitator settle failed"):
         await client.settle(PAYLOAD, REQUIREMENTS)
+
+
+async def test_a_stated_refusal_reaches_the_payer_as_its_documented_fields_only_capped() -> None:
+    """The receipt is built from a third party's body: a 20 KB ``extra`` once made a 70 KB
+    PAYMENT-RESPONSE header. Only the documented fields pass, each capped."""
+    body = {
+        "success": False,
+        "errorReason": "settlement_pending",
+        "errorMessage": "m" * 5000,
+        "payer": "p" * 3000,
+        "transaction": TX,
+        "network": "n" * 3000,
+        "amount": "9" * 3000,
+        "extra": {"x": "y" * 20000},
+        "extensions": {"bazaar": {"z": "w" * 20000}},
+    }
+    client = client_over(LenientSettleClient, httpx.Response(400, json=body), [])
+    settled = await client.settle(PAYLOAD, REQUIREMENTS)
+    receipt = settled.model_dump(by_alias=True, exclude_none=True)
+    assert set(receipt) <= {
+        "success",
+        "errorReason",
+        "errorMessage",
+        "payer",
+        "transaction",
+        "network",
+    }
+    assert (receipt["transaction"], receipt["network"]) == (TX, N)
+    assert len(json.dumps(receipt)) < 1000

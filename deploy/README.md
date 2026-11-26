@@ -536,14 +536,18 @@ answered 401 or 403 to a verify, a settle or `/supported`: the key was deleted, 
 changed. Base then goes to xpay at once (sales continue, unlisted) until the key is fixed and
 the service redeployed; only a call CDP had already verified when it started refusing fails,
 unpaid. `CDP asks for a payment method on the account` (ERROR) means CDP answered 402: the
-account's free settlements are used up. Base goes to xpay the same way; add a payment method in
-the portal, then run Deploy to Modal to bring CDP back. `facilitator settle failed: the next
-facilitator verifies and settles the calls after this one` (WARNING) is a settle CDP did not
-answer (a timeout, a 5xx, a 429): that call is unpaid, the next minute of calls goes to xpay,
-then CDP is asked again. `facilitator refused to settle and named a transaction: check it on
-chain` (WARNING) names a transfer CDP broadcast without confirming it: look the transaction up
-on basescan.org; if it landed, that payer paid for a call that answered "failed", so refund it
-by hand. `CDP facilitator not used: ...` at start names a key that cannot be read.
+account's free settlements are used up, and the key is fine. Base goes to xpay the same way
+(the next line, `facilitator dropped: it asks for a payment method`, says so); add a payment
+method in the portal, then run Deploy to Modal to bring CDP back. `facilitator settle failed:
+the next facilitator verifies and settles the calls after this one` (WARNING) is a settle CDP
+did not answer, or one it says failed on its side (a timeout, a 5xx, a 429, its node): that
+call is unpaid, the next minute of calls goes to xpay, then CDP is asked again (after the 402
+above: not until the next deploy). `facilitator refused to settle and named a transaction:
+check it on chain` (WARNING), and `facilitator's second settle of a pending payment did not
+settle it` (WARNING), name a transfer CDP broadcast without confirming it: look the
+transaction up on basescan.org; if it landed, that payer paid for a call that answered
+"failed", so refund it by hand. `CDP facilitator not used: ...` at start names a key that cannot
+be read.
 
 To stop using CDP: delete the two secrets and run Deploy to Modal again, and only after that
 deploy is green delete the key in the portal (**API Keys → Secret API Keys**).

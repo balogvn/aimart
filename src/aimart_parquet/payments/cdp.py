@@ -222,6 +222,8 @@ class CdpFacilitatorClient(LenientSettleClient):
     """
 
     refused = False
+    # Why, for the line that drops it from the next quote (``Payments._initialize``).
+    refusal = "it refused this service's key"
 
     def __init__(
         self, config: FacilitatorConfig, *, networks: frozenset[str] = frozenset({BASE_MAINNET})
@@ -296,6 +298,7 @@ class CdpFacilitatorClient(LenientSettleClient):
             )
         elif response.status_code == PAYMENT_METHOD_REQUIRED:
             self.refused = True
+            self.refusal = "it asks for a payment method on its account (not a key problem)"
             log.error(
                 "CDP asks for a payment method on the account this service's API key belongs "
                 "to (its free settlements are used up): add one in the CDP portal "

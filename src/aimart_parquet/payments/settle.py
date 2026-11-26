@@ -275,6 +275,11 @@ def _stated_refusal(response: httpx.Response, network: str) -> SettleResponse | 
     TypeScript client reads such a body as the refusal it is (``SettleError``) and its server
     retries a pending one; the SDK's Python client raises on it. Only a JSON ``false`` counts:
     anything else in a non-2xx stays an error, never a settlement.
+
+    A 429 or a 5xx that names no transaction is raised all the same: the facilitator's own
+    trouble, with nothing to keep, and raised it rests the facilitator (``payments._Answered``).
+    What reaches the payer is the documented fields only, each capped: the receipt is built from
+    a third party's body (a 20 KB ``extra`` once made a 70 KB PAYMENT-RESPONSE header).
     """
     try:
         data = response.json()
@@ -283,7 +288,19 @@ def _stated_refusal(response: httpx.Response, network: str) -> SettleResponse | 
     if not isinstance(data, dict) or data.get("success") is not False:
         return None
     refused, _ = read_settle_answer(response.status_code, data, network)
-    return None if refused.success else refused
+    if refused.success:
+        return None
+    status = response.status_code
+    if not refused.transaction and (status == 429 or status >= 500):
+        return None
+    return SettleResponse(
+        success=False,
+        error_reason=refused.error_reason,  # capped by the reading, as the message is
+        error_message=refused.error_message,
+        payer=(refused.payer or "")[:TEXT_LIMIT] or None,
+        transaction=refused.transaction[:TEXT_LIMIT],
+        network=network,  # the quoted one: the refusal is of this payment
+    )
 
 
 class LenientSettleClient(HTTPFacilitatorClient):

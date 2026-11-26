@@ -695,10 +695,14 @@ and nothing here follows it up: reconcile that line against the chain and refund
 same holds for a non-2xx whose JSON says `"success": false` (CDP's HTTP 400
 `X402SettlePaymentRejection`, `settlement_pending` included): until 2026-11-26 it was raised,
 which skipped the SDK's retry and lost the transaction from both the receipt and the log
-(`integration/test_fix_cdp_settle_failures.py`). CDP known gaps (review 2026-11-26, low): a
-verify that hangs at CDP and then falls through to xpay adds a third `facilitator_timeout_s`,
-so the worst paid call is about 170 s against Modal's 150 s (needs CDP to hang while the call
-is near every other limit; at most one $0.02 call charged and not delivered); a 401, 403 or
+(`integration/test_fix_cdp_settle_failures.py`); and when that retry raises, or refuses naming
+no transaction or another one, the receipt keeps the pending transaction
+(`_Answered._still_pending`), since that is the one that may land. CDP known gaps (review
+2026-11-26, low): a verify that hangs at CDP and then falls through to xpay adds a third
+`facilitator_timeout_s`, and so does the SDK's one retry of a pending settlement, so the worst
+paid call is about 170 s against Modal's 150 s (needs CDP to be slow twice while the call is
+near every other limit; at most one $0.02 call charged and not delivered, and beyond 150 s the
+payer gets Modal's 303 and no receipt); a 401, 403 or
 402 from CDP drops it until the next deploy, and with one container kept running that is until
 the owner runs Deploy to Modal; the deploy's selftest passes when CDP is unreachable or its
 `/supported` does not list Base (only `CDP accepted the key; it lists ...` proves the key);
