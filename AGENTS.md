@@ -703,8 +703,12 @@ is near every other limit; at most one $0.02 call charged and not delivered); a 
 the owner runs Deploy to Modal; the deploy's selftest passes when CDP is unreachable or its
 `/supported` does not list Base (only `CDP accepted the key; it lists ...` proves the key);
 `deploy-modal.yml` deploys `github.sha`, not release-please's release commit, so merge a release
-PR alone; and whether CDP answers success again to a second settle of an already settled
-payload (two concurrent calls carrying one signed payment) is unverified. A
+PR alone; whether CDP answers success again to a second settle of an already settled payload
+(two concurrent calls carrying one signed payment) is unverified; and an MCP 402 carries no
+`bazaar` declaration (`payments/mcp_gate.py`), so MCP sales settled by CDP list nothing (CDP's
+discovery documents only `http` resources today; the SDK's `declare_mcp_discovery_extension`
+would add one). Whether CDP really indexes after a settlement is closed source: confirm the
+first listing as `deploy/README.md` step 6 says. A
 facilitator
 that takes longer than `facilitator_timeout_s` (20 s) to answer `/settle` leaves the outcome
 unknown: the call is answered as failed and unsettled, yet the transfer may still complete

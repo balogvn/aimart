@@ -82,25 +82,11 @@ these HTTP wrappers: in TypeScript wrap the MCP client with `@x402/mcp@2.29.0`
 (`wrapMCPClientWithPayment`); in Python sign the `PaymentRequired` a tool returns with
 `create_payment_payload` and call again with `_meta["x402/payment"]`.
 
-### Coinbase Agentic Wallet CLI (not yet confirmed)
+### Coinbase Agentic Wallet CLI and Payments MCP: retired
 
-Pays the REST calls only, not MCP tools. Its signing runs in Coinbase's hosted wallet and has
-not been checked against this service, so make the first call a $0.002 inspect:
-
-```bash
-npx awal@2.12.1 x402 pay https://balogvn--aimart-parquet.us-east.modal.run/v1/inspect -X POST \
-  -d '{"url":"https://raw.githubusercontent.com/balogvn/aimart/main/docs/examples/sales.parquet"}' \
-  --max-amount 2000 --json
-npx awal@2.12.1 x402 pay https://balogvn--aimart-parquet.us-east.modal.run/v1/convert -X POST \
-  -d '{"url":"https://raw.githubusercontent.com/balogvn/aimart/main/docs/examples/sales.csv"}' \
-  --max-amount 20000 --json
-npx awal@2.12.1 x402 pay https://balogvn--aimart-parquet.us-east.modal.run/v1/query -X POST \
-  -d '{"artifact_id":"<artifact.id>","sql":"SELECT count(*) AS n FROM data"}' --max-amount 5000 --json
-```
-
-`--max-amount` is in atomic USDC. In this CLI `-h` means headers, not help. The Coinbase
-Payments MCP's `make_http_request_with_x402` tool takes the same values (`baseURL`, `path`,
-`method` POST, `body`, `maxAmountPerRequest`) and has the same status.
+Coinbase retired its Agentic Wallet command line (`awal`) and its Payments MCP on 2026-11-20 in
+favor of Wallet MCP, which uses a different wallet. Their x402 payments no longer work, so do
+not fund them; Wallet MCP has not been checked against this service.
 
 ### Circle CLI agent wallet (not yet confirmed)
 

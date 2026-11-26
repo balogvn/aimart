@@ -71,10 +71,9 @@ whether the facilitator settles those has not been checked.
 
 ## Other wallet tools, honestly
 
-- **Coinbase Agentic Wallet** (`npx awal x402 pay ...`) and **Coinbase Payments MCP**
-  (`make_http_request_with_x402`): they likely work for the REST calls, but their signing runs
-  in Coinbase's hosted wallet page and could not be checked. They do not pay MCP tool calls. The
-  [skill](../../skills/aimart-parquet/SKILL.md) shows the exact command.
+- **Coinbase Agentic Wallet** (`npx awal`) and **Coinbase Payments MCP**: retired by Coinbase
+  on 2026-11-20 in favor of Wallet MCP, which uses a different wallet. Their x402 payments no
+  longer work, so do not fund them. Wallet MCP has not been checked against this service.
 - **Circle CLI agent wallets** (`circle services pay`): agent wallets are smart accounts, so the
   same open question as above applies. REST only.
 - **Coinbase for Agents** (`agents.coinbase.com/mcp`, `coinbase x402`): pays only services in

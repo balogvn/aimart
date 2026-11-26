@@ -1,9 +1,10 @@
 """Coinbase's CDP facilitator: the one route into the CDP Bazaar and agentic.market.
 
 CDP indexes a resource in its Bazaar when it settles a payment for it whose 402 carried the
-``bazaar`` extension (this service's always does), and agentic.market lists what the Bazaar
-holds. xpay and Primer settle as well and charge nothing, but publish no catalog, so real
-sales through them listed the service nowhere (docs/discovery.md). CDP charges $0.001 per
+``bazaar`` extension (this service's REST 402s do; its MCP 402s carry none, and CDP lists only
+web resources today), and agentic.market lists what the Bazaar holds. xpay and Primer settle
+as well and charge nothing, but publish no catalog, so real sales through them listed the
+service nowhere (docs/discovery.md). CDP charges $0.001 per
 settlement after 1,000 a month (docs/economics.md) and needs a CDP Secret API key, so it is
 used only when the owner configured one, on mainnet, and only for Base: xpay and Primer stay
 behind it, and Dexter keeps Solana.

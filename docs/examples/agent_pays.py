@@ -9,6 +9,9 @@
     export PAYER_PRIVATE_KEY=0x...                        # a Base Sepolia TEST wallet with test USDC
     uv run docs/examples/agent_pays.py sales.csv
 
+Leave PAYER_PRIVATE_KEY unset to be asked for the key at a hidden prompt instead: an ``export``
+line stays in the shell's history file in plain text, which matters for a wallet with real USDC.
+
 What it does, in the order an agent should do it:
 
 1. REST: POST /v1/convert unpaid, decode the base64 PAYMENT-REQUIRED header and print the quote.
@@ -29,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import getpass
 import hashlib
 import json
 import os
@@ -259,8 +263,16 @@ def main() -> int:
     if not args.url:
         parser.error("set AIMART_URL or pass --url")
     key = os.environ.get("PAYER_PRIVATE_KEY")
+    if not key and sys.stdin.isatty():
+        # A hidden prompt: the key is neither shown nor saved in the shell's history, where an
+        # `export PAYER_PRIVATE_KEY=...` line stays in plain text (~/.zsh_history on a Mac).
+        prompt = "Paying wallet's private key (hidden; it never leaves this process): "
+        key = getpass.getpass(prompt).strip()
     if not key:
-        parser.error("set PAYER_PRIVATE_KEY to a test wallet's key (it never leaves this process)")
+        parser.error(
+            "set PAYER_PRIVATE_KEY to a test wallet's key, or run this in a terminal to be "
+            "asked for it (it never leaves this process)"
+        )
     network = BASE_SEPOLIA
     if args.network == "mainnet":
         if os.environ.get("AIMART_MAINNET_CONFIRM") != MAINNET_CONFIRM:
