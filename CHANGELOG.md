@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/balogvn/aimart/compare/v0.2.0...v0.2.1) (2026-11-27)
+
+
+### Bug fixes
+
+* **docker:** Bump astral-sh/uv from 0.13.7 to 0.13.9 in the docker-base-images group across 1 directory ([dfc7ad0](https://github.com/balogvn/aimart/commit/dfc7ad0e3c08eb91741285578469cf34b36bb329))
+
 ## [0.2.0](https://github.com/balogvn/aimart/compare/v0.1.4...v0.2.0) (2026-11-26)
 
 
