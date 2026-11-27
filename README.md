@@ -26,6 +26,8 @@ Prices, limits and data handling, as that service applies them, are at
 [`/llms.txt`](https://balogvn--aimart-parquet.us-east.modal.run/llms.txt). The package is on
 [PyPI](https://pypi.org/project/aimart-parquet/) (`uvx aimart-parquet mcp` runs the free local
 server), and the server is in the official MCP Registry as `io.github.balogvn/aimart-parquet`.
+Paying by card instead? The same converter is on Apify Store as
+[AImart Parquet](https://apify.com/kingofthejunes/aimart-parquet), billed per file through Apify.
 
 **Your data:** inputs are deleted when the call ends. Converted files become unreachable after
 60 minutes and are deleted by a cleanup that runs when the service starts and once a minute
