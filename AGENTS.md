@@ -681,8 +681,12 @@ layouts before letting DuckDB read a gzip of more than one member again. Capacit
 `deploy/README.md` are macOS measurements; re-measure on Linux/Cloud Run before raising caps.
 xpay has verified and settled this service's EIP-3009 payloads on mainnet without a key
 (two paid conversions on 2026-11-15, each 0.02 USDC, transactions 0xf8415eae… and
-0xb0865212…); Primer, the fallback, and paid inspect, preview and query calls have not been
-exercised with real money yet. Primer's real answer to `/settle` has never been seen: the
+0xb0865212…). CDP, first for Base since 0.2.0, settled one paid call to each REST route on
+2026-11-27, paid from an AgentCash wallet (convert 0x132ffe60…, inspect 0x880452a6…, preview
+0x6edb1003…, query 0x34ffbe7b…; four different Coinbase relayer addresses submitted them), and
+CDP's merchant discovery list then held all four routes. Primer, the fallback, and paid MCP
+calls have not been exercised with real money yet. Primer's real answer to `/settle` has never
+been seen: the
 lenient reading (`payments/settle.py`) is built from the x402 v2 schema and from the variants
 a review imagined, not from a capture, so capture one Primer settlement (status and body) and
 add it to `integration/test_fix_settle_answers.py` before relying on Primer. A facilitator

@@ -182,8 +182,12 @@ list us"); Dexter's and PayAI's are at `/discovery/resources`, and CDP's Bazaar 
 resources settled through CDP.
 
 **CDP Bazaar and agentic.market.** Set up by the owner with a CDP key
-([deploy/README.md](../deploy/README.md), "List the service in the CDP Bazaar"); status: not
-listed until the owner adds the key and one paid call settles through CDP. CDP's discovery
+([deploy/README.md](../deploy/README.md), "List the service in the CDP Bazaar"); status:
+**listed since 2026-11-27.** The owner's key went live with release 0.2.0; that evening one
+paid call to each REST route settled through CDP, and `/discovery/merchant?payTo=<payee>` held
+all four (`/v1/convert`, `/v1/inspect`, `/v1/preview`, `/v1/query`) with their Bazaar
+descriptions, examples and schemas within minutes of each payment. agentic.market reviews and
+ranks what the Bazaar holds, so it may show them later. CDP's discovery
 endpoints are public (no key): `GET
 https://api.cdp.coinbase.com/platform/v2/x402/discovery/merchant?payTo=<payee>` lists what
 CDP holds for our payee, `.../discovery/resources` and `.../discovery/search?query=parquet`
