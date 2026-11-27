@@ -570,7 +570,34 @@ by default), so Cloud Logging indexes the fields.
 
 Demand signals (rejected file extensions, `request_capability` requests) are always logged as
 `demand_signal` lines; without a token, those log lines are the interface
-([docs/discovery.md](../docs/discovery.md)). To also serve the counters at `GET /v1/demand`:
+([docs/discovery.md](../docs/discovery.md)): on modal.com, open the app's **Logs** and search for
+`demand_signal`. The report holds what agents wrote, in their own words, so it stays private:
+never in a GitHub Actions log, which is public for this repository.
+
+**On Modal**, to also serve the counters at `GET /v1/demand`:
+
+1. On your Mac, in the Terminal app, make a random token, keep it in your Keychain and copy it,
+   without it ever being shown:
+
+   ```sh
+   TOKEN="$(openssl rand -hex 32)" && security add-generic-password -U -a "$USER" -s aimart-admin-token -w "$TOKEN" && printf %s "$TOKEN" | pbcopy; unset TOKEN
+   ```
+
+2. In the repository: **Settings → Environments → production → Add environment secret**. Name
+   `AIMART_ADMIN_TOKEN`; Value: paste (⌘V). **Add secret**. Then empty the clipboard:
+   `pbcopy < /dev/null`.
+3. Deploy (**Actions → Deploy to Modal → Run workflow**, or the next release). Its log says
+   `admin token set: GET /v1/demand is on`, never the token.
+4. Read the report, with the token taken from the Keychain, not typed or shown:
+
+   ```sh
+   curl -s -H "Authorization: Bearer $(security find-generic-password -s aimart-admin-token -w)" https://<workspace>--aimart-parquet.us-east.modal.run/v1/demand | python3 -m json.tool
+   ```
+
+   With one container kept running, the counters cover the time since the last deploy; each
+   deploy starts them again, and the `demand_signal` log lines keep the older ones.
+
+**On Cloud Run**, to also serve the counters at `GET /v1/demand`:
 
 1. Create the secret: `PROJECT_ID=... SECRET_ADMIN_TOKEN=aimart-admin-token deploy/setup-gcp.sh`
    generates a random token, stores it in Secret Manager and grants the runtime SA access.

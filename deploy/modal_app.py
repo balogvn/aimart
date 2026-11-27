@@ -29,9 +29,10 @@ Shape, mirroring the Cloud Run service (deploy.yml):
   allowance, the operation, verify and settle) inside it, well inside the 300 s payment window;
   ``tests/unit/test_modal_deploy.py`` checks the arithmetic.
 * Secrets: ``aimart-parquet-keys`` (the ML-DSA signing seed and the download-link HMAC key, made
-  once by ``deploy/modal_keys.py``, never printed), and the CDP API key when the deploying
-  environment has one (``SECRET_KEYS``: GitHub secrets, never variables, kept apart from the
-  configuration so nothing that shows the configuration can show them). Everything else is
+  once by ``deploy/modal_keys.py``, never printed), and the CDP API key and the admin token for
+  ``GET /v1/demand`` when the deploying environment has them (``SECRET_KEYS``: GitHub secrets,
+  never variables, kept apart from the configuration so nothing that shows the configuration can
+  show them). Everything else is
   deploy-time configuration
   from the deploying environment (GitHub variables in CI), passed whole on every deploy: a value
   changed by hand in Modal is replaced by the next deploy, as on Cloud Run.
@@ -88,9 +89,10 @@ CONFIG_KEYS = (
 )
 
 # Deploy-time secrets, from the production environment's secrets (deploy-modal.yml): the CDP
-# Secret API key that puts CDP's facilitator first for Base (payments/cdp.py). Both or neither;
-# modal-deploy.sh checks their shape without printing them.
-SECRET_KEYS = ("AIMART_CDP_API_KEY_ID", "AIMART_CDP_API_KEY_SECRET")
+# Secret API key that puts CDP's facilitator first for Base (payments/cdp.py), both or neither;
+# and the admin token that switches on GET /v1/demand, the owner's report of what agents asked
+# for (demand.py). modal-deploy.sh checks their shape without printing them.
+SECRET_KEYS = ("AIMART_CDP_API_KEY_ID", "AIMART_CDP_API_KEY_SECRET", "AIMART_ADMIN_TOKEN")
 
 DIST = Path(__file__).resolve().parent.parent / "dist" / "modal"
 

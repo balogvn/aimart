@@ -101,7 +101,7 @@ def test_the_deploy_workflow_declares_the_cdp_key_and_hands_it_to_the_script() -
 
 def test_the_app_passes_the_cdp_key_as_a_secret_apart_from_the_configuration() -> None:
     values = constants()
-    assert values["SECRET_KEYS"] == NAMES
+    assert values["SECRET_KEYS"][: len(NAMES)] == NAMES  # type: ignore[index]
     assert not set(NAMES) & set(values["CONFIG_KEYS"])  # type: ignore[arg-type]
     assert not set(NAMES) & set(values["RUNTIME_ENV"])  # type: ignore[arg-type]
     source = APP.read_text(encoding="utf-8")
