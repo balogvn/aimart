@@ -169,7 +169,9 @@ users and agents (through Apify's MCP server, mcp.apify.com) run it and pay thro
 account per event: `file-converted` and `query-run`, priced like the hosted service. Apify keeps
 20% and deducts platform usage from the payout. It reaches callers who pay by card instead of
 USDC. The owner creates, prices and publishes it in Apify Console: step by step in
-[apify.md](apify.md).
+[apify.md](apify.md). Status: **published 2026-11-27** at
+<https://apify.com/kingofthejunes/aimart-parquet>, with both events priced ($0.02 and $0.005),
+Limited permissions, and a paid test run that charged `file-converted` and `query-run`.
 
 ### 6. Facilitator catalogs (Bazaar)
 
