@@ -15,6 +15,7 @@
 # token from Modal's settings). Optional, in the same environment: AIMART_CDP_API_KEY_ID and
 # AIMART_CDP_API_KEY_SECRET, a CDP Secret API key that puts Coinbase's facilitator first for Base
 # (deploy/README.md, "List the service in the CDP Bazaar"); the selftest fails if CDP refuses it.
+# And AIMART_ADMIN_TOKEN, which switches on GET /v1/demand (deploy/README.md, "Demand report").
 # Modal's Starter plan has no rollbacks: if a deploy fails its checks, fix forward, or run this
 # workflow on the previous release's tag.
 
@@ -39,6 +40,8 @@ on:
       AIMART_CDP_API_KEY_ID:
         required: false
       AIMART_CDP_API_KEY_SECRET:
+        required: false
+      AIMART_ADMIN_TOKEN:
         required: false
   workflow_dispatch:
     inputs:
@@ -87,6 +90,7 @@ jobs:
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           AIMART_CDP_API_KEY_ID: ${{ secrets.AIMART_CDP_API_KEY_ID }}
           AIMART_CDP_API_KEY_SECRET: ${{ secrets.AIMART_CDP_API_KEY_SECRET }}
+          AIMART_ADMIN_TOKEN: ${{ secrets.AIMART_ADMIN_TOKEN }}
           AIMART_PUBLIC_BASE_URL: ${{ vars.AIMART_PUBLIC_BASE_URL }}
           AIMART_NETWORK_MODE: ${{ vars.AIMART_NETWORK_MODE }}
           AIMART_PAY_TO_EVM: ${{ vars.AIMART_PAY_TO_EVM }}

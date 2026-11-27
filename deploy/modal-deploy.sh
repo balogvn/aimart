@@ -133,10 +133,30 @@ else
   cdp_note="no CDP key: Base settles through xpay, then Primer"
 fi
 
+# The admin token that switches on GET /v1/demand (optional; demand.py). The report holds what
+# agents wrote to request_capability, so the token must not be guessable: one line of at least
+# 32 characters. Like the keys above, never printed: only what is wrong with it, and its length.
+admin_token="${AIMART_ADMIN_TOKEN:-}"
+if [ -n "$admin_token" ]; then
+  case "$admin_token" in
+    *[[:space:]]* | *\"* | *\'*)
+      fail "AIMART_ADMIN_TOKEN holds a space, a line break or a quote inside it: paste only the token itself (it has ${#admin_token} characters)"
+      ;;
+  esac
+  [ "${#admin_token}" -ge 32 ] \
+    || fail "AIMART_ADMIN_TOKEN is too short to keep the demand report private: use at least 32 characters (it has ${#admin_token})"
+  demand_note="admin token set: GET /v1/demand is on"
+else
+  demand_note="no admin token: GET /v1/demand is off (demand_signal log lines still record demand)"
+fi
+
 echo "modal-deploy: inputs look right: payee ${evm:-$svm}, URL ${url%/}, ${token_note}"
 # Not under --logs: the workflow's failure step runs it without the CDP secrets, and after the
 # selftest's "CDP refused the API key" this line said "no CDP key", the wrong thing to fix.
-if [ "${1:-}" != "--logs" ]; then echo "modal-deploy: ${cdp_note}"; fi
+if [ "${1:-}" != "--logs" ]; then
+  echo "modal-deploy: ${cdp_note}"
+  echo "modal-deploy: ${demand_note}"
+fi
 if [ "${1:-}" = "--check" ]; then exit 0; fi
 
 with_modal=(uv run --no-project --python 3.13 --with "modal==${MODAL_VERSION}")
